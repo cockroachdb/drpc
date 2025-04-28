@@ -119,6 +119,13 @@ func (d *drpc) ClientStreamIface(method *protogen.Method) string {
 		"Client"
 }
 
+func (d *drpc) ClientStreamRPCIface(method *protogen.Method) string {
+	return "RPC" +
+		strings.ReplaceAll(method.Parent.GoName, "_", "__") + "_" +
+		strings.ReplaceAll(method.GoName, "_", "__") +
+		"Client"
+}
+
 func (d *drpc) ClientStreamImpl(method *protogen.Method) string {
 	return "drpc" +
 		strings.ReplaceAll(method.Parent.GoName, "_", "__") + "_" +
@@ -128,6 +135,13 @@ func (d *drpc) ClientStreamImpl(method *protogen.Method) string {
 
 func (d *drpc) ServerStreamIface(method *protogen.Method) string {
 	return "DRPC" +
+		strings.ReplaceAll(method.Parent.GoName, "_", "__") + "_" +
+		strings.ReplaceAll(method.GoName, "_", "__") +
+		"Stream"
+}
+
+func (d *drpc) ServerStreamRPCIface(method *protogen.Method) string {
+	return "RPC" +
 		strings.ReplaceAll(method.Parent.GoName, "_", "__") + "_" +
 		strings.ReplaceAll(method.GoName, "_", "__") +
 		"Stream"
@@ -373,6 +387,8 @@ func (d *drpc) generateClientMethod(method *protogen.Method) {
 	d.P("}")
 	d.P()
 
+	d.generateRPCClientInterface(method)
+
 	d.P("type ", d.ClientStreamImpl(method), " struct {")
 	d.P(d.Ident("storj.io/drpc", "Stream"))
 	d.P("}")
@@ -494,6 +510,8 @@ func (d *drpc) generateServerMethod(method *protogen.Method) {
 	d.P("}")
 	d.P()
 
+	d.generateRPCServerInterface(method)
+
 	d.P("type ", d.ServerStreamImpl(method), " struct {")
 	d.P(d.Ident("storj.io/drpc", "Stream"))
 	d.P("}")
@@ -532,4 +550,48 @@ func (d *drpc) generateServerMethod(method *protogen.Method) {
 		d.P("}")
 		d.P()
 	}
+}
+
+func (d *drpc) generateRPCServerInterface(method *protogen.Method) {
+	genSend := method.Desc.IsStreamingServer()
+	genSendAndClose := !method.Desc.IsStreamingServer()
+	genRecv := method.Desc.IsStreamingClient()
+
+	// Stream auxiliary types and methods.
+	d.P("type ", d.ServerStreamRPCIface(method), " interface {")
+	d.P("Context() context.Context")
+	if genSend {
+		d.P("Send(*", d.OutputType(method), ") error")
+	}
+	if genSendAndClose {
+		d.P("SendAndClose(*", d.OutputType(method), ") error")
+	}
+	if genRecv {
+		d.P("Recv() (*", d.InputType(method), ", error)")
+		d.P("RecvMsg(interface{}) error")
+	}
+	d.P("}")
+	d.P()
+}
+
+func (d *drpc) generateRPCClientInterface(method *protogen.Method) {
+	genSend := method.Desc.IsStreamingClient()
+	genRecv := method.Desc.IsStreamingServer()
+	genCloseAndRecv := !method.Desc.IsStreamingServer()
+
+	// Stream auxiliary types and methods.
+	d.P("type ", d.ClientStreamRPCIface(method), " interface {")
+	d.P("Context() context.Context")
+	d.P("CloseSend() error")
+	if genSend {
+		d.P("Send(*", d.InputType(method), ") error")
+	}
+	if genRecv {
+		d.P("Recv() (*", d.OutputType(method), ", error)")
+	}
+	if genCloseAndRecv {
+		d.P("CloseAndRecv() (*", d.OutputType(method), ", error)")
+	}
+	d.P("}")
+	d.P()
 }
