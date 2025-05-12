@@ -92,8 +92,26 @@ func (d *drpc) ClientIface(service *protogen.Service) string {
 	return "DRPC" + service.GoName + "Client"
 }
 
+func (d *drpc) RPCClientIface(service *protogen.Service) string {
+	return "RPC" + service.GoName + "Client"
+}
+
+func (d *drpc) GRPCClientAdapter(service *protogen.Service) string {
+	return "grpc" + service.GoName + "ClientAdapter"
+}
+
+func (d *drpc) DRPCClientAdapter(service *protogen.Service) string {
+	return "drpc" + service.GoName + "ClientAdapter"
+}
+
 func (d *drpc) ClientImpl(service *protogen.Service) string {
 	return "drpc" + service.GoName + "Client"
+}
+
+func unexport(s string) string { return strings.ToLower(s[:1]) + s[1:] }
+
+func (d *drpc) GRPCClientImpl(service *protogen.Service) string {
+	return unexport(service.GoName) + "Client"
 }
 
 func (d *drpc) ServerIface(service *protogen.Service) string {
@@ -323,6 +341,9 @@ func (d *drpc) generateService(service *protogen.Service) {
 	for _, method := range service.Methods {
 		d.generateServerMethod(method)
 	}
+
+	d.generateServiceRPCInterfaces(service)
+	d.generateServiceAdapters(service)
 }
 
 //
@@ -593,5 +614,88 @@ func (d *drpc) generateRPCClientInterface(method *protogen.Method) {
 		d.P("CloseAndRecv() (*", d.OutputType(method), ", error)")
 	}
 	d.P("}")
+	d.P()
+}
+
+func (d *drpc) generateServiceRPCInterfaces(service *protogen.Service) {
+	// Client interface
+	d.P("type ", d.RPCClientIface(service), " interface {")
+	d.P()
+	for _, method := range service.Methods {
+		d.P(d.generateRPCClientSignature(method))
+	}
+	d.P("}")
+	d.P()
+}
+
+func (d *drpc) generateRPCClientSignature(method *protogen.Method) string {
+	reqArg := ", in *" + d.InputType(method)
+	if method.Desc.IsStreamingClient() {
+		reqArg = ""
+	}
+	respName := "*" + d.OutputType(method)
+	if method.Desc.IsStreamingServer() || method.Desc.IsStreamingClient() {
+		respName = d.ClientStreamRPCIface(method)
+	}
+	return fmt.Sprintf("%s(ctx %s%s) (%s, error)", method.GoName, d.Ident("context", "Context"), reqArg, respName)
+}
+func (d *drpc) generateServiceAdapters(service *protogen.Service) {
+	d.generateGRPCAdapter(service)
+	d.generateDRPCAdapter(service)
+}
+
+func (d *drpc) generateGRPCAdapter(service *protogen.Service) {
+	adapter := d.GRPCClientAdapter(service)
+	grpcClientImpl := d.GRPCClientImpl(service)
+	rpcIface := d.RPCClientIface(service)
+
+	d.P("// ", service.GoName, " gRPC -> RPC adapter")
+	d.P("type ", adapter, " ", grpcClientImpl)
+	d.P()
+	d.P("func NewGRPC", service.GoName, "ClientAdapter(conn *", d.Ident("google.golang.org/grpc", "ClientConn"), ") ", rpcIface, " {")
+	d.P("return (*", adapter, ")(&", grpcClientImpl, "{conn})")
+	d.P("}")
+	d.P()
+
+	for _, m := range service.Methods {
+		d.P("func (a *", adapter, ") ", d.generateRPCClientSignature(m), " {")
+		if m.Desc.IsStreamingClient() {
+			d.P("return (*", grpcClientImpl, ")(a).", m.GoName, "(ctx)")
+		} else {
+			d.P("return (*", grpcClientImpl, ")(a).", m.GoName, "(ctx, in)")
+		}
+		d.P("}")
+		d.P()
+	}
+	d.P("// compile-time assertion")
+	d.P("var _ ", rpcIface, " = (*", adapter, ")(nil)")
+	d.P()
+}
+
+func (d *drpc) generateDRPCAdapter(service *protogen.Service) {
+	adapter := d.DRPCClientAdapter(service)
+	drpcClientImpl := d.ClientImpl(service)
+	rpcIface := d.RPCClientIface(service)
+
+	d.P("// ", service.GoName, " DRPC -> RPC adapter")
+	d.P("type ", adapter, " ", drpcClientImpl)
+	d.P()
+	d.P("func NewDRPC", service.GoName, "ClientAdapter(conn ", d.Ident("storj.io/drpc", "Conn"), ") ", rpcIface, " {")
+	d.P("return (*", adapter, ")(&", drpcClientImpl, "{conn})")
+	d.P("}")
+	d.P()
+
+	for _, m := range service.Methods {
+		d.P("func (a *", adapter, ") ", d.generateRPCClientSignature(m), " {")
+		if m.Desc.IsStreamingClient() {
+			d.P("return (*", drpcClientImpl, ")(a).", m.GoName, "(ctx)")
+		} else {
+			d.P("return (*", drpcClientImpl, ")(a).", m.GoName, "(ctx, in)")
+		}
+		d.P("}")
+		d.P()
+	}
+	d.P("// compile-time assertion")
+	d.P("var _ ", rpcIface, " = (*", adapter, ")(nil)")
 	d.P()
 }
