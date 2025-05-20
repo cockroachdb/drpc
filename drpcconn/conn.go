@@ -5,6 +5,7 @@ package drpcconn
 
 import (
 	"context"
+	"storj.io/drpc/drpcinterceptors"
 	"sync"
 
 	"github.com/zeebo/errs"
@@ -27,6 +28,10 @@ type Options struct {
 	// CollectStats controls whether the server should collect stats on the
 	// rpcs it creates.
 	CollectStats bool
+
+	// DialOptions controls options like the interceptors which we apply on
+	// the connection.
+	dopts drpcinterceptors.DialOptions
 }
 
 // Conn is a drpc client connection.
@@ -36,7 +41,9 @@ type Conn struct {
 	mu   sync.Mutex
 	wbuf []byte
 
-	stats map[string]*drpcstats.Stats
+	stats     map[string]*drpcstats.Stats
+	unaryInt  drpcinterceptors.UnaryClientInterceptor
+	streamInt drpcinterceptors.StreamClientInterceptor
 }
 
 var _ drpc.Conn = (*Conn)(nil)
@@ -58,7 +65,15 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 
 	c.man = drpcmanager.NewWithOptions(tr, opts.Manager)
 
+	c.initInterceptors(opts.dopts)
 	return c
+}
+
+func (c *Conn) initInterceptors(dopts drpcinterceptors.DialOptions) {
+	dopts.ChainUnaryClientInterceptors()
+	dopts.ChainStreamClientInterceptors()
+	c.unaryInt = dopts.UnaryInt
+	c.streamInt = dopts.StreamInt
 }
 
 // Stats returns the collected stats grouped by rpc.
@@ -100,9 +115,19 @@ func (c *Conn) Unblocked() <-chan struct{} { return c.man.Unblocked() }
 // Close closes the connection.
 func (c *Conn) Close() (err error) { return c.man.Close() }
 
-// Invoke issues the rpc on the transport serializing in, waits for a response, and
+func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in drpc.Message, out drpc.Message) (err error) {
+	next := func(ctx context.Context, rpc string, in, out drpc.Message, enc drpc.Encoding) error {
+		return c.invoke(ctx, rpc, enc, in, out)
+	}
+	if c.unaryInt != nil {
+		return c.unaryInt(ctx, rpc, in, out, c, enc, next)
+	}
+	return next(ctx, rpc, in, out, enc)
+}
+
+// invoke issues the rpc on the transport serializing in, waits for a response, and
 // deserializes it into out. Only one Invoke or Stream may be open at a time.
-func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
+func (c *Conn) invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
 	var metadata []byte
 	if md, ok := drpcmetadata.Get(ctx); ok {
 		metadata, err = drpcmetadata.Encode(metadata, md)
@@ -155,9 +180,19 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 	return nil
 }
 
-// NewStream begins a streaming rpc on the connection. Only one Invoke or Stream may
-// be open at a time.
 func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
+	next := func(ctx context.Context, method string) (drpc.Stream, error) {
+		return c.newStream(ctx, rpc, enc)
+	}
+	if c.streamInt != nil {
+		return c.streamInt(ctx, rpc, c, next)
+	}
+	return next(ctx, rpc)
+}
+
+// newStream begins a streaming rpc on the connection. Only one Invoke or Stream may
+// be open at a time.
+func (c *Conn) newStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
 	var metadata []byte
 	if md, ok := drpcmetadata.Get(ctx); ok {
 		metadata, err = drpcmetadata.Encode(metadata, md)
