@@ -489,6 +489,7 @@ func (d *drpc) generateServerMethod(method *protogen.Method) {
 	}
 	if genRecv {
 		d.P("Recv() (*", d.InputType(method), ", error)")
+		d.P("RecvMsg (interface{}) error")
 	}
 	d.P("}")
 	d.P()
@@ -526,7 +527,7 @@ func (d *drpc) generateServerMethod(method *protogen.Method) {
 		d.P("}")
 		d.P()
 
-		d.P("func (x *", d.ServerStreamImpl(method), ") RecvMsg(m *", d.InputType(method), ") error {")
+		d.P("func (x *", d.ServerStreamImpl(method), ") RecvMsg(m interface{}) error {")
 		d.P("return x.MsgRecv(m, ", d.EncodingName(), "{})")
 		d.P("}")
 		d.P()
