@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package drpcserver.chatpb;
+
+option go_package = "github.com/cockroach/drpc/drpcserver/chatpb;chatpb";
+
+
+service ChatService {
+  rpc ChatStream (stream ChatMessage) returns (stream ChatMessage);
+}
+
+message ChatMessage {
+  string sender = 1;
+  string text = 2;
+}
