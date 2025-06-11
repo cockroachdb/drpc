@@ -174,9 +174,8 @@ const testCtxKey = contextKey("testKey")
 
 func TestServer_handleRPC_InterceptorContextPropagation(t *testing.T) {
 	var (
-		valFromCtx1       interface{}
-		valFromCtx2       interface{}
-		valFromCtxHandler interface{}
+		valFromCtx1 interface{}
+		valFromCtx2 interface{}
 	)
 
 	interceptor1 := func(ctx context.Context, rpc string, stream drpc.Stream, handler drpc.Handler) error {
@@ -193,8 +192,6 @@ func TestServer_handleRPC_InterceptorContextPropagation(t *testing.T) {
 	mockRPCHandler := &mockHandler{
 		fn: func(stream drpc.Stream, rpc string) error {
 			valFromCtx2 = stream.Context().Value(testCtxKey) // This should be "value2"
-			// Simulate handler using the context from the stream
-			valFromCtxHandler = stream.Context().Value(testCtxKey)
 			return nil
 		},
 	}
@@ -217,9 +214,6 @@ func TestServer_handleRPC_InterceptorContextPropagation(t *testing.T) {
 	}
 	if valFromCtx2 != "value2" {
 		t.Errorf("expected value 'value2' from context in handler (set by interceptor2), got '%v'", valFromCtx2)
-	}
-	if valFromCtxHandler != "value2" {
-		t.Errorf("expected value 'value2' from context in handler (final value), got '%v'", valFromCtxHandler)
 	}
 }
 
