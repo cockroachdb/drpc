@@ -77,3 +77,62 @@ func TestDecode(t *testing.T) {
 		assert.DeepEqual(t, metadata, map[string]string{"test": "a"})
 	})
 }
+
+func TestMetadataImmutability(t *testing.T) {
+	ctx := context.Background()
+	ctx = Add(ctx, "foo", "bar")
+
+	metadata1, ok := Get(ctx)
+	assert.That(t, ok)
+	assert.Equal(t, metadata1["foo"], "bar")
+
+	metadata1["foo"] = "modified"
+	metadata1["new"] = "value"
+
+	metadata2, ok := Get(ctx)
+	assert.That(t, ok)
+	assert.Equal(t, metadata2["foo"], "bar")
+	assert.Equal(t, len(metadata2), 1)
+}
+
+func TestAddImmutability(t *testing.T) {
+	ctx := context.Background()
+	ctx = Add(ctx, "original", "value")
+
+	originalCtx := ctx
+	newCtx := Add(ctx, "new", "key")
+
+	originalMd, ok := Get(originalCtx)
+	assert.That(t, ok)
+	assert.Equal(t, len(originalMd), 1)
+	assert.Equal(t, originalMd["original"], "value")
+
+	newMd, ok := Get(newCtx)
+	assert.That(t, ok)
+	assert.Equal(t, len(newMd), 2)
+	assert.Equal(t, newMd["original"], "value")
+	assert.Equal(t, newMd["new"], "key")
+}
+
+func TestAddPairsImmutability(t *testing.T) {
+	ctx := context.Background()
+	ctx = Add(ctx, "existing", "value")
+
+	originalCtx := ctx
+	newCtx := AddPairs(ctx, map[string]string{
+		"key1": "val1",
+		"key2": "val2",
+	})
+
+	originalMd, ok := Get(originalCtx)
+	assert.That(t, ok)
+	assert.Equal(t, len(originalMd), 1)
+	assert.Equal(t, originalMd["existing"], "value")
+
+	newMd, ok := Get(newCtx)
+	assert.That(t, ok)
+	assert.Equal(t, len(newMd), 3)
+	assert.Equal(t, newMd["existing"], "value")
+	assert.Equal(t, newMd["key1"], "val1")
+	assert.Equal(t, newMd["key2"], "val2")
+}

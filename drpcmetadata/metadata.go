@@ -11,10 +11,15 @@ import (
 
 // AddPairs attaches metadata onto a context and return the context.
 func AddPairs(ctx context.Context, metadata map[string]string) context.Context {
-	for key, val := range metadata {
-		ctx = Add(ctx, key, val)
+	// Get returns a copy of metadata
+	newMetadata, ok := Get(ctx)
+	if !ok {
+		newMetadata = make(map[string]string)
 	}
-	return ctx
+	for k, v := range metadata {
+		newMetadata[k] = v
+	}
+	return context.WithValue(ctx, metadataKey{}, newMetadata)
 }
 
 // Encode generates byte form of the metadata and appends it onto the passed in buffer.
@@ -74,19 +79,27 @@ func ClearContextExcept(ctx context.Context, key string) context.Context {
 
 // Add associates a key/value pair on the context.
 func Add(ctx context.Context, key, value string) context.Context {
+	// Get returns a copy of metadata
 	metadata, ok := Get(ctx)
 	if !ok {
 		metadata = make(map[string]string)
-		ctx = context.WithValue(ctx, metadataKey{}, metadata)
 	}
 	metadata[key] = value
-	return ctx
+	return context.WithValue(ctx, metadataKey{}, metadata)
 }
 
 // Get returns all key/value pairs on the given context.
 func Get(ctx context.Context) (map[string]string, bool) {
 	metadata, ok := ctx.Value(metadataKey{}).(map[string]string)
-	return metadata, ok
+	if !ok {
+		return nil, false
+	}
+	// Return a copy to prevent mutation of the original map
+	copy := make(map[string]string)
+	for k, v := range metadata {
+		copy[k] = v
+	}
+	return copy, true
 }
 
 // GetValue retrieves a specific value by key from the context's metadata.
