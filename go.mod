@@ -1,8 +1,11 @@
 module storj.io/drpc
 
-go 1.19
+go 1.23.0
+
+toolchain go1.24.9
 
 require (
+	github.com/hashicorp/yamux v0.1.2
 	github.com/stretchr/testify v1.10.0
 	github.com/zeebo/assert v1.3.0
 	github.com/zeebo/errs v1.2.2
