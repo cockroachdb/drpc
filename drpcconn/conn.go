@@ -5,8 +5,11 @@ package drpcconn
 
 import (
 	"context"
+	"fmt"
+	"runtime/pprof"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/zeebo/errs"
 
 	"storj.io/drpc"
@@ -32,6 +35,7 @@ type Options struct {
 // Conn is a drpc client connection.
 type Conn struct {
 	tr   drpc.Transport
+	id   string
 	man  *drpcmanager.Manager
 	mu   sync.Mutex
 	wbuf []byte
@@ -49,6 +53,7 @@ func New(tr drpc.Transport) *Conn { return NewWithOptions(tr, Options{}) }
 func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 	c := &Conn{
 		tr: tr,
+		id: uuid.New().String(),
 	}
 
 	if opts.CollectStats {
@@ -102,12 +107,23 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
 // deserializes it into out. Only one Invoke or Stream may be open at a time.
-func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
+func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) error {
+	var connID string = fmt.Sprintf("conn-id: %s", c.id)
+	var managerErr error
+
+	pprof.Do(ctx, pprof.Labels("drpc-client", connID), func(ctx context.Context) {
+		managerErr = c.invoke(ctx, rpc, enc, in, out)
+	})
+
+	return managerErr
+}
+
+func (c *Conn) invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (invokeErr error) {
 	var metadata []byte
 	if md, ok := drpcmetadata.Get(ctx); ok {
-		metadata, err = drpcmetadata.Encode(metadata, md)
-		if err != nil {
-			return err
+		metadata, invokeErr = drpcmetadata.Encode(metadata, md)
+		if invokeErr != nil {
+			return invokeErr
 		}
 	}
 
@@ -115,7 +131,7 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	if err != nil {
 		return err
 	}
-	defer func() { err = errs.Combine(err, stream.Close()) }()
+	defer func() { invokeErr = errs.Combine(invokeErr, stream.Close()) }()
 
 	// we have to protect c.wbuf here even though the manager only allows one
 	// stream at a time because the stream may async close allowing another
@@ -123,15 +139,19 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.wbuf, err = drpcenc.MarshalAppend(in, enc, c.wbuf[:0])
+	c.wbuf, invokeErr = drpcenc.MarshalAppend(in, enc, c.wbuf[:0])
 	if err != nil {
-		return err
+		return invokeErr
 	}
 
-	if err := c.doInvoke(stream, enc, rpc, c.wbuf, metadata, out); err != nil {
-		return err
-	}
-	return nil
+	streamID := fmt.Sprintf("stream-id: %d", stream.ID())
+	pprof.Do(ctx, pprof.Labels(streamID, rpc), func(ctx context.Context) {
+		if err := c.doInvoke(stream, enc, rpc, c.wbuf, metadata, out); err != nil {
+			invokeErr = err
+		}
+	})
+
+	return invokeErr
 }
 
 func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string, data []byte, metadata []byte, out drpc.Message) (err error) {

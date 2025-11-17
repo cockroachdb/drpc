@@ -1,8 +1,9 @@
 module storj.io/drpc
 
-go 1.19
+go 1.23.0
 
 require (
+	github.com/google/uuid v1.3.0
 	github.com/stretchr/testify v1.10.0
 	github.com/zeebo/assert v1.3.0
 	github.com/zeebo/errs v1.2.2

@@ -6,10 +6,13 @@ package drpcserver
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
+	"runtime/pprof"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/zeebo/errs"
 	"storj.io/drpc"
 	"storj.io/drpc/drpccache"
@@ -91,7 +94,7 @@ func (s *Server) getStats(rpc string) *drpcstats.Stats {
 }
 
 // ServeOne serves a single set of rpcs on the provided transport.
-func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
+func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) error {
 	// Check if the transport is a TLS connection
 	if tlsConn, ok := tr.(*tls.Conn); ok {
 		// Manually perform the TLS handshake to access peer certificate
@@ -118,23 +121,46 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		}
 	}
 
-	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
-	defer func() { err = errs.Combine(err, man.Close()) }()
+	var connErr error
+	var connID string = fmt.Sprintf("conn-id: %s", uuid.New().String())
 
-	cache := drpccache.New()
-	defer cache.Clear()
+	pprof.Do(ctx, pprof.Labels("drpc-server", connID), func(ctx context.Context) {
+		man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
+		defer func() { connErr = errs.Combine(connErr, man.Close()) }()
 
-	ctx = drpccache.WithContext(ctx, cache)
+		cache := drpccache.New()
+		defer cache.Clear()
 
-	for {
-		stream, rpc, err := man.NewServerStream(ctx)
-		if err != nil {
-			return errs.Wrap(err)
+		ctx = drpccache.WithContext(ctx, cache)
+
+		for {
+			stream, rpc, err := man.NewServerStream(ctx)
+			if err != nil {
+				connErr = errs.Wrap(err)
+				return
+			}
+
+			if err := s.doHandleRPC(ctx, stream, rpc); err != nil {
+				connErr = err
+				return
+			}
 		}
+	})
+
+	return connErr
+}
+
+func (s *Server) doHandleRPC(ctx context.Context, stream *drpcstream.Stream, rpc string) (err error) {
+	var rpcErr error
+
+	streamID := fmt.Sprintf("stream-id: %d", stream.ID())
+	pprof.Do(ctx, pprof.Labels("drpc-server-stream", streamID), func(ctx context.Context) {
 		if err := s.handleRPC(stream, rpc); err != nil {
-			return errs.Wrap(err)
+			rpcErr = errs.Wrap(err)
 		}
-	}
+	})
+
+	return rpcErr
 }
 
 var temporarySleep = 500 * time.Millisecond
@@ -175,6 +201,11 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) (err error) {
 			}
 
 			return errs.Wrap(err)
+		}
+
+		if cc, ok := conn.(*net.TCPConn); ok {
+			_ = cc.SetKeepAlive(true)
+			_ = cc.SetKeepAlivePeriod(2 * time.Second)
 		}
 
 		// TODO(jeff): connection limits?
