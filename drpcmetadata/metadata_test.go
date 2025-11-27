@@ -20,27 +20,32 @@ func TestAddGet(t *testing.T) {
 	}
 
 	ctx = Add(ctx, "foo", "bar")
+	ctx = Add(ctx, "Akey", "Avalue")
 
 	{
 		metadata, ok := Get(ctx)
 		assert.That(t, ok)
 		assert.Equal(t, metadata, map[string]string{
-			"foo": "bar",
+			"foo":  "bar",
+			"akey": "Avalue",
 		})
 	}
 
 	ctx = AddPairs(ctx, map[string]string{
 		"ak": "av",
 		"bk": "bv",
+		"Ck": "Cv",
 	})
 
 	{
 		metadata, ok := Get(ctx)
 		assert.That(t, ok)
 		assert.Equal(t, metadata, map[string]string{
-			"foo": "bar",
-			"ak":  "av",
-			"bk":  "bv",
+			"foo":  "bar",
+			"akey": "Avalue",
+			"ak":   "av",
+			"bk":   "bv",
+			"ck":   "Cv",
 		})
 	}
 }
@@ -135,4 +140,113 @@ func TestAddPairsImmutability(t *testing.T) {
 	assert.Equal(t, newMd["existing"], "value")
 	assert.Equal(t, newMd["key1"], "val1")
 	assert.Equal(t, newMd["key2"], "val2")
+}
+
+func TestNewIncomingContext(t *testing.T) {
+	ctx := context.Background()
+
+	ctx = Add(ctx, "existing", "value")
+
+	ctx = NewIncomingContext(ctx, map[string]string{
+		"key1": "value1",
+		"Key2": "Value2",
+	})
+	md, ok := Get(ctx)
+	assert.That(t, ok)
+	assert.Equal(t, md, map[string]string{
+		"key1": "value1",
+		"key2": "Value2",
+	})
+}
+
+func TestClearContext(t *testing.T) {
+	ctx := context.Background()
+	ctx = Add(ctx, "existing", "value")
+
+	ctx = ClearContext(ctx)
+	newMd, ok := Get(ctx)
+	assert.False(t, ok)
+	assert.Equal(t, newMd, map[string]string(nil))
+}
+
+func TestClearContextExcept(t *testing.T) {
+	ctx := context.Background()
+	ctx = AddPairs(ctx, map[string]string{
+		"key1": "value1", "key2": "value2",
+	})
+
+	ctx = ClearContextExcept(ctx, "key1")
+	md, ok := Get(ctx)
+	assert.That(t, ok)
+	assert.Equal(t, md, map[string]string{
+		"key1": "value1",
+	})
+
+	ctx = ClearContextExcept(ctx, "non-existent-key")
+	md, ok = Get(ctx)
+	assert.False(t, ok)
+	assert.Equal(t, md, map[string]string(nil))
+}
+
+func TestGetValue(t *testing.T) {
+	ctx := context.Background()
+
+	val, ok := GetValue(ctx, "non-existent-key")
+	assert.False(t, ok)
+	assert.Equal(t, val, "")
+
+	ctx = context.WithValue(ctx, metadataKey{},
+		map[string]string{
+			"External-mixed-case-key": "value",
+		})
+	ctx = AddPairs(ctx, map[string]string{
+		"key": "value1", "Mixed-case-key": "value2",
+	})
+
+	val, ok = GetValue(ctx, "external-mixed-case-key")
+	assert.That(t, ok)
+	assert.Equal(t, val, "value")
+
+	val, ok = GetValue(ctx, "key")
+	assert.That(t, ok)
+	assert.Equal(t, val, "value1")
+
+	val, ok = GetValue(ctx, "mixed-case-key")
+	assert.That(t, ok)
+	assert.Equal(t, val, "value2")
+
+	val, ok = GetValue(ctx, "Mixed-case-key")
+	assert.False(t, ok)
+}
+
+func TestFastFromIncomingContext(t *testing.T) {
+	ctx := context.Background()
+
+	// Add some metadata external to the package to test key normalization
+	ctx = context.WithValue(ctx, metadataKey{},
+		map[string]string{"External-mixed-case-key": "external-value"})
+
+	ctx = Add(ctx, "key", "value")
+	md, ok := FastFromIncomingContext(ctx)
+	assert.That(t, ok)
+	assert.Equal(t, md,
+		map[string]string{"External-mixed-case-key": "external-value",
+			"key": "value"})
+}
+
+func TestNewOutgoingContext(t *testing.T) {
+	ctx := context.Background()
+
+	ctx = Add(ctx, "existing", "value")
+
+	ctx = NewOutgoingContext(ctx, map[string]string{
+		"key1": "value1",
+		"Key2": "Value2",
+	})
+	md, ok := Get(ctx)
+	assert.That(t, ok)
+	assert.Equal(t, md, map[string]string{
+		"key1": "value1",
+		"key2": "Value2",
+	})
 }
