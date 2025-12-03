@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/zeebo/errs"
-
+	grpcmetadata "google.golang.org/grpc/metadata"
 	"storj.io/drpc"
 	"storj.io/drpc/drpcenc"
 	"storj.io/drpc/drpcmanager"
@@ -104,11 +104,9 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 // deserializes it into out. Only one Invoke or Stream may be open at a time.
 func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
 	var metadata []byte
-	if md, ok := drpcmetadata.Get(ctx); ok {
-		metadata, err = drpcmetadata.Encode(metadata, md)
-		if err != nil {
-			return err
-		}
+	metadata, err = c.encodeMetadata(ctx)
+	if err != nil {
+		return err
 	}
 
 	stream, err := c.man.NewClientStream(ctx, rpc)
@@ -159,11 +157,9 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 // be open at a time.
 func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
 	var metadata []byte
-	if md, ok := drpcmetadata.Get(ctx); ok {
-		metadata, err = drpcmetadata.Encode(metadata, md)
-		if err != nil {
-			return nil, err
-		}
+	metadata, err = c.encodeMetadata(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	stream, err := c.man.NewClientStream(ctx, rpc)
@@ -188,4 +184,35 @@ func (c *Conn) doNewStream(stream *drpcstream.Stream, rpc string, metadata []byt
 		return err
 	}
 	return nil
+}
+
+// encodeMetadata retrieves and encodes metadata from the provided
+// (outgoing/client) context.
+func (c *Conn) encodeMetadata(ctx context.Context) (metadata []byte, err error) {
+	md, _ := drpcmetadata.Get(ctx)
+	// Look for grpc metadata in the context and merge them with the drpc metadata,
+	// prioritizing drpc values when keys overlap. This is a short-term fix
+	// that will enable us to send and receive metadata when DRPC is enabled,
+	// without any changes in the calling code (which can continue to use
+	// the grpc metadata package to send and receive metadata).
+	if grpcMd, ok := grpcmetadata.FromOutgoingContext(ctx); ok {
+		if md == nil {
+			md = make(map[string]string)
+		}
+		for k, v := range grpcMd {
+			// If a key is present in both, we keep the drpc metadata.
+			if _, ok := md[k]; !ok && len(v) > 0 {
+				// When a key has multiple values, only the first value
+				// is used.
+				md[k] = v[0]
+			}
+		}
+	}
+	if len(md) > 0 {
+		metadata, err = drpcmetadata.Encode(metadata, md)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return metadata, nil
 }

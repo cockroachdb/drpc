@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/zeebo/errs"
+	grpcmetadata "google.golang.org/grpc/metadata"
 
 	"storj.io/drpc"
 	"storj.io/drpc/drpcdebug"
@@ -477,7 +478,18 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 				m.pdone.Send()
 
 				if metaID == pkt.ID.Stream {
+					// Add metadata to the incoming context.
 					ctx = drpcmetadata.AddPairs(ctx, meta)
+					// In addition to drpc metadata, we also populate grpc metadata
+					// in the context here. This is a short-term fix that will enable us
+					// to send and receive metadata when DRPC is enabled,
+					// without/any/changes in the calling code (which can continue to use
+					// the grpc metadata package to send and receive metadata).
+					grpcMeta := make(map[string][]string, len(meta))
+					for k, v := range meta {
+						grpcMeta[k] = []string{v}
+					}
+					ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
 				}
 
 				stream, err := m.newStream(ctx, pkt.ID.Stream, "srv", rpc)
