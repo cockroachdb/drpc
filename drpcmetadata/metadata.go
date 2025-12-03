@@ -10,7 +10,7 @@ import (
 	"github.com/zeebo/errs"
 )
 
-// AddPairs attaches metadata onto a context and return the context.
+// AddPairs attaches metadata onto an incoming context and returns the context.
 func AddPairs(ctx context.Context, metadata map[string]string) context.Context {
 	// Get returns a copy of metadata
 	newMetadata, ok := Get(ctx)
@@ -18,9 +18,27 @@ func AddPairs(ctx context.Context, metadata map[string]string) context.Context {
 		newMetadata = make(map[string]string)
 	}
 	for k, v := range metadata {
-		newMetadata[strings.ToLower(k)] = v
+		newMetadata[k] = v
 	}
 	return context.WithValue(ctx, metadataKey{}, newMetadata)
+}
+
+// AddPairsToOutgoingContext attaches metadata onto an outgoing context and return
+// the context.
+func AddPairsToOutgoingContext(ctx context.Context, metadata map[string]string) context.Context {
+	// Get existing metadata
+	existingMd, ok := ctx.Value(outgoingMetadataKey{}).(map[string]string)
+	if !ok {
+		return ctx
+	}
+	newMetadata := make(map[string]string)
+	for k, v := range existingMd {
+		newMetadata[k] = v
+	}
+	for k, v := range metadata {
+		newMetadata[k] = v
+	}
+	return context.WithValue(ctx, outgoingMetadataKey{}, newMetadata)
 }
 
 // NewIncomingContext attaches new metadata onto a context and returns the
@@ -29,7 +47,7 @@ func NewIncomingContext(ctx context.Context,
 	metadata map[string]string) context.Context {
 	newMetadata := make(map[string]string)
 	for k, v := range metadata {
-		newMetadata[strings.ToLower(k)] = v
+		newMetadata[k] = v
 	}
 	return context.WithValue(ctx, metadataKey{}, newMetadata)
 }
@@ -66,6 +84,7 @@ func Decode(buf []byte) (map[string]string, error) {
 }
 
 type metadataKey struct{}
+type outgoingMetadataKey struct{}
 
 // ClearContext removes all metadata from the context and returns a new context
 // with no metadata attached.
@@ -155,14 +174,25 @@ func FastFromIncomingContext(ctx context.Context) (map[string]string, bool) {
 }
 
 // NewOutgoingContext attaches new metadata onto an outgoing context and returns
-// the context. Same as NewIncomingContext for now,
-// as we don't have separate keys for incoming and outgoing metadata.
-// Will be fixed as part https://github.com/cockroachdb/cockroach/i`ssues/156444
+// the context.
 func NewOutgoingContext(ctx context.Context,
 	metadata map[string]string) context.Context {
 	newMetadata := make(map[string]string)
 	for k, v := range metadata {
 		newMetadata[strings.ToLower(k)] = v
 	}
-	return context.WithValue(ctx, metadataKey{}, newMetadata)
+	return context.WithValue(ctx, outgoingMetadataKey{}, newMetadata)
+}
+
+func FromOutgoingContext(ctx context.Context) (map[string]string, bool) {
+	// Get existing metadata
+	existingMd, ok := ctx.Value(outgoingMetadataKey{}).(map[string]string)
+	if !ok {
+		return nil, false
+	}
+	newMetadata := make(map[string]string)
+	for k, v := range existingMd {
+		newMetadata[k] = v
+	}
+	return newMetadata, true
 }

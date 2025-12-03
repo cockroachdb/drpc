@@ -20,34 +20,47 @@ func TestAddGet(t *testing.T) {
 	}
 
 	ctx = Add(ctx, "foo", "bar")
-	ctx = Add(ctx, "Akey", "Avalue")
 
 	{
 		metadata, ok := Get(ctx)
 		assert.That(t, ok)
 		assert.Equal(t, metadata, map[string]string{
-			"foo":  "bar",
-			"akey": "Avalue",
+			"foo": "bar",
 		})
 	}
 
 	ctx = AddPairs(ctx, map[string]string{
 		"ak": "av",
 		"bk": "bv",
-		"Ck": "Cv",
 	})
 
 	{
 		metadata, ok := Get(ctx)
 		assert.That(t, ok)
 		assert.Equal(t, metadata, map[string]string{
-			"foo":  "bar",
-			"akey": "Avalue",
-			"ak":   "av",
-			"bk":   "bv",
-			"ck":   "Cv",
+			"foo": "bar",
+			"ak":  "av",
+			"bk":  "bv",
 		})
 	}
+}
+
+func TestFromOutgoingContext(t *testing.T) {
+	ctx := context.Background()
+
+	ctx = context.WithValue(ctx, outgoingMetadataKey{}, map[string]string{
+		"foo": "bar",
+		"ak":  "av",
+		"bk":  "bv",
+	})
+
+	metadata, ok := FromOutgoingContext(ctx)
+	assert.That(t, ok)
+	assert.Equal(t, metadata, map[string]string{
+		"foo": "bar",
+		"ak":  "av",
+		"bk":  "bv",
+	})
 }
 
 func TestEncode(t *testing.T) {
@@ -143,19 +156,22 @@ func TestAddPairsImmutability(t *testing.T) {
 }
 
 func TestNewIncomingContext(t *testing.T) {
-	ctx := context.Background()
+	originalCtx := context.Background()
+	originalCtx = Add(originalCtx, "existing", "value")
 
-	ctx = Add(ctx, "existing", "value")
-
-	ctx = NewIncomingContext(ctx, map[string]string{
+	newCtx := NewIncomingContext(originalCtx, map[string]string{
 		"key1": "value1",
-		"Key2": "Value2",
+		"key2": "value2",
 	})
-	md, ok := Get(ctx)
+	originalMd, ok := Get(originalCtx)
 	assert.That(t, ok)
-	assert.Equal(t, md, map[string]string{
+	assert.Equal(t, originalMd, map[string]string{"existing": "value"})
+
+	newMd, ok := Get(newCtx)
+	assert.That(t, ok)
+	assert.Equal(t, newMd, map[string]string{
 		"key1": "value1",
-		"key2": "Value2",
+		"key2": "value2",
 	})
 }
 
@@ -191,62 +207,58 @@ func TestClearContextExcept(t *testing.T) {
 func TestGetValue(t *testing.T) {
 	ctx := context.Background()
 
+	ctx = AddPairs(ctx, map[string]string{
+		"key1": "value1", "key2": "value2",
+	})
+
 	val, ok := GetValue(ctx, "non-existent-key")
 	assert.False(t, ok)
 	assert.Equal(t, val, "")
 
-	ctx = context.WithValue(ctx, metadataKey{},
-		map[string]string{
-			"External-mixed-case-key": "value",
-		})
-	ctx = AddPairs(ctx, map[string]string{
-		"key": "value1", "Mixed-case-key": "value2",
-	})
-
-	val, ok = GetValue(ctx, "external-mixed-case-key")
-	assert.That(t, ok)
-	assert.Equal(t, val, "value")
-
-	val, ok = GetValue(ctx, "key")
+	val, ok = GetValue(ctx, "key1")
 	assert.That(t, ok)
 	assert.Equal(t, val, "value1")
 
-	val, ok = GetValue(ctx, "mixed-case-key")
+	val, ok = GetValue(ctx, "key2")
 	assert.That(t, ok)
 	assert.Equal(t, val, "value2")
 
-	val, ok = GetValue(ctx, "Mixed-case-key")
+	val, ok = GetValue(ctx, "Key1") // case-sensitivity test
 	assert.False(t, ok)
+	assert.Equal(t, val, "")
 }
 
 func TestFastFromIncomingContext(t *testing.T) {
 	ctx := context.Background()
 
-	// Add some metadata external to the package to test key normalization
-	ctx = context.WithValue(ctx, metadataKey{},
-		map[string]string{"External-mixed-case-key": "external-value"})
-
 	ctx = Add(ctx, "key", "value")
 	md, ok := FastFromIncomingContext(ctx)
 	assert.That(t, ok)
 	assert.Equal(t, md,
-		map[string]string{"External-mixed-case-key": "external-value",
-			"key": "value"})
+		map[string]string{"key": "value"})
 }
 
 func TestNewOutgoingContext(t *testing.T) {
-	ctx := context.Background()
+	originalCtx := context.Background()
 
-	ctx = Add(ctx, "existing", "value")
+	originalCtx = context.WithValue(originalCtx, outgoingMetadataKey{},
+		map[string]string{"existing-key": "existing-value"})
 
-	ctx = NewOutgoingContext(ctx, map[string]string{
+	newCtx := NewOutgoingContext(originalCtx, map[string]string{
 		"key1": "value1",
-		"Key2": "Value2",
+		"key2": "value2",
 	})
-	md, ok := Get(ctx)
+	
+	originalMd, ok := FromOutgoingContext(originalCtx)
 	assert.That(t, ok)
-	assert.Equal(t, md, map[string]string{
+	assert.Equal(t, originalMd, map[string]string{
+		"existing-key": "existing-value",
+	})
+
+	newMd, ok := FromOutgoingContext(newCtx)
+	assert.That(t, ok)
+	assert.Equal(t, newMd, map[string]string{
 		"key1": "value1",
-		"key2": "Value2",
+		"key2": "value2",
 	})
 }
