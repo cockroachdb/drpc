@@ -51,7 +51,9 @@ func TestDrpcMetadata(t *testing.T) {
 	cman := New(cconn)
 	defer func() { _ = cman.Close() }()
 
-	sman := New(sconn)
+	sman := NewWithOptions(sconn, Options{
+		GRPCMetadataCompatMode: false,
+	})
 	defer func() { _ = sman.Close() }()
 
 	ctx.Run(func(ctx context.Context) {
@@ -77,13 +79,76 @@ func TestDrpcMetadata(t *testing.T) {
 		stream, _, err := sman.NewServerStream(ctx)
 		assert.NoError(t, err)
 		streamCtx := stream.Context()
+
+		drpcMd, ok := drpcmetadata.Get(streamCtx)
+		assert.That(t, ok)
+		assert.Equal(t, drpcMd, map[string]string{"key": "value", "multi-value-key": "value1,value2"})
+
+		grpcMd, ok := grpcmetadata.FromIncomingContext(streamCtx)
+		assert.False(t, ok)
+		assert.Nil(t, grpcMd)
+
+		defer func() { _ = stream.Close() }()
+
+		_, err = stream.RawRecv()
+		assert.NoError(t, err)
+
+		_, err = stream.RawRecv()
+		assert.That(t, errors.Is(err, io.EOF))
+	})
+
+	ctx.Wait()
+}
+
+func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	sman := NewWithOptions(sconn, Options{
+		GRPCMetadataCompatMode: true,
+	})
+	defer func() { _ = sman.Close() }()
+
+	ctx.Run(func(ctx context.Context) {
+		stream, err := cman.NewClientStream(ctx, "rpc")
+		assert.NoError(t, err)
+		defer func() { _ = stream.Close() }()
+
+		md := map[string]string{"key": "value", "multi-value-key": "value1,value2"}
+		var buf []byte
+		buf, err = drpcmetadata.Encode(buf, md)
+		assert.NoError(t, err)
+		assert.NoError(t, stream.RawWrite(drpcwire.KindInvokeMetadata, buf))
+		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
+		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
+		assert.NoError(t, stream.RawFlush())
+		assert.That(t, !closed(cman.Unblocked()))
+
+		assert.NoError(t, stream.Close())
+		assert.That(t, closed(cman.Unblocked()))
+	})
+
+	ctx.Run(func(ctx context.Context) {
+		stream, _, err := sman.NewServerStream(ctx)
+		assert.NoError(t, err)
+		streamCtx := stream.Context()
+
+		drpcMd, ok := drpcmetadata.Get(streamCtx)
+		assert.False(t, ok)
+		assert.Nil(t, drpcMd)
+
 		grpcMd, ok := grpcmetadata.FromIncomingContext(streamCtx)
 		assert.That(t, ok)
 		assert.Equal(t, grpcMd, grpcmetadata.MD{"key": []string{"value"},
 			"multi-value-key": []string{"value1,value2"}})
-		drpcMd, ok := drpcmetadata.Get(streamCtx)
-		assert.That(t, ok)
-		assert.Equal(t, drpcMd, map[string]string{"key": "value", "multi-value-key": "value1,value2"})
+
 		defer func() { _ = stream.Close() }()
 
 		_, err = stream.RawRecv()

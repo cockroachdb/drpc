@@ -55,6 +55,11 @@ type Options struct {
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
+
+	// GRPCMetadataCompatMode enables/disable gRPC compatibility for metadata
+	// handling. When enabled, the server stream will decode incoming metadata
+	// into grpc metadata in the context.
+	GRPCMetadataCompatMode bool
 }
 
 // Manager handles the logic of managing a transport for a drpc client or
@@ -478,20 +483,21 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 				m.pdone.Send()
 
 				if metaID == pkt.ID.Stream {
-					// Add metadata to the incoming context.
-					ctx = drpcmetadata.AddPairs(ctx, meta)
-					// In addition to drpc metadata, we also populate grpc metadata
-					// in the context here. This is a short-term fix that will enable us
-					// to send and receive metadata when DRPC is enabled,
-					// without/any/changes in the calling code (which can continue to use
-					// the grpc metadata package to send and receive metadata).
-					grpcMeta := make(map[string][]string, len(meta))
-					for k, v := range meta {
-						grpcMeta[k] = []string{v}
+					if m.opts.GRPCMetadataCompatMode {
+						// Populate incoming metadata as grpc metadata in the
+						// context. This is a short-term fix that will enable us
+						// to send and receive grpc metadata when DRPC is enabled,
+						// without any changes in the calling code.
+						grpcMeta := make(map[string][]string, len(meta))
+						for k, v := range meta {
+							grpcMeta[k] = []string{v}
+						}
+						ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
+					} else {
+						// Add metadata to the incoming context.
+						ctx = drpcmetadata.AddPairs(ctx, meta)
 					}
-					ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
 				}
-
 				stream, err := m.newStream(ctx, pkt.ID.Stream, "srv", rpc)
 				return stream, rpc, err
 
