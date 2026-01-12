@@ -1,0 +1,105 @@
+sequenceDiagram
+    autonumber
+
+    box DRPC Client
+        participant CRFStream as RangeFeed <br/>(Server) Stream
+        participant CBSStream as BatchStream <br/>(Server) Stream
+        participant CWriter as Writer
+        participant CReader as Reader
+    end
+
+    participant TCP as Network<br/>(TPC Connection)
+
+    box DRPC Server
+        participant SReader as Reader
+        participant SWriter as Writer
+        participant SRFStream as RangeFeed <br/>(Server) Stream
+        participant SBSStream as BatchStream <br/>(Server) Stream
+    end
+
+    CRFStream-)CWriter:  Create RangeFeed stream <br/>Enqueue [1, Invoke]
+    activate CRFStream
+    Note over CWriter: Queue: [1, Invoke]
+    CBSStream-)CWriter: Create BatchStream stream <br/>Enqueue [2, Invoke]
+    activate CBSStream
+    Note over CWriter: Queue:<br/> [1, Invoke]<br/>[2, Invoke]
+
+    CBSStream-)CWriter: Send <br/>[2, Message, <data>]
+    Note over CWriter: Queue:<br/> [1, Invoke]<br/>[2, Invoke]<br/>[2, Message, <data>]
+
+    CWriter->>TCP: [1, Invoke], [2, Invoke], [2, Message, <data>]
+
+    TCP->>SReader: [1, Invoke], [2, Invoke], [2, Message, <data>]
+    Note over SReader: Queue:<br/> [1, Invoke],<br/>[2, Invoke],<br/>[2, Message, <data>]
+    
+    SReader-)SRFStream: create RangeFeed stream
+    activate SRFStream
+    SReader-)SBSStream: create BatchStream stream
+    activate SBSStream
+
+    Note over CWriter: Queue:Empty
+
+    Note over SReader: Queue:<br/>[2, Message, <data>]
+
+    CRFStream-)CWriter: Send [1, Message, <data>]
+    Note over CWriter: Queue: [1, Message, <data>]
+
+    CWriter->>TCP: [1, Message, <data>]
+    TCP->>SReader: [1, Message, <data>]
+    Note over SReader: Queue: <br/>[2, Message, <data>]<br/>[1, Message, <data>]
+
+    SBSStream->>SReader: Recv
+    SReader-->>SBSStream: handle [2, Message, <data>]
+
+    Note over SReader: Queue: [1, Message, <data>]
+
+    SRFStream->>SReader: Recv
+    SReader-->>SRFStream: handle [1, Message, <data>]
+    Note over SReader: Queue:Empty
+
+    SRFStream-)SWriter: Send [1, Message, <data>]
+
+    SWriter->>TCP: [1, Message, <data>]
+    TCP->>CReader: [1, Message, <data>]
+
+    CRFStream->>CReader: Recv
+    CReader-->>CRFStream: handle [1, Message, <data>]
+
+    CBSStream->>CWriter: Send [2, CloseSend]
+    Note over CBSStream: Future 'Sends' disallowed
+
+    CWriter->>TCP: [2, CloseSend]
+    TCP->>SReader: [2, CloseSend]
+
+    SBSStream->>SReader: Recv
+    SReader-->>SBSStream: handle io.EOF
+
+    SBSStream-)SWriter: Send [2, Message, <data>]
+    
+    SWriter->>TCP: [2, Message, <data>]
+    TCP->>CReader: [2, Message, <data>]
+    
+    SBSStream-)SWriter: Send [2, CloseSend]
+    deactivate SBSStream
+    Note over SBSStream: stream terminated
+
+    SWriter->>TCP: [2, CloseSend]
+    TCP->>CReader: [2, CloseSend]
+    
+    CBSStream->>CReader: Recv
+    CReader-->>CBSStream: handle [2, Message, <data>]
+    CBSStream->>CReader: Recv
+    CReader-->>CBSStream: handle [2, CloseSend]
+    deactivate CBSStream
+    Note over CBSStream: stream terminated
+    
+    Note over SRFStream: stream context cancelled
+    SRFStream->>SWriter: Send [1, KindCancel]
+    Note over SRFStream: stream terminated
+    deactivate SRFStream
+
+    SWriter->>CReader: [1, KindCancel]
+    CRFStream->>CReader: Recv
+    CReader-->>CRFStream: terminate stream
+    Note over CRFStream: stream terminated
+    deactivate CRFStream
