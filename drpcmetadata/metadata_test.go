@@ -45,7 +45,7 @@ func TestAddGet(t *testing.T) {
 	}
 }
 
-func TestFromOutgoingContext(t *testing.T) {
+func TestGetFromOutgoingContext(t *testing.T) {
 	ctx := context.Background()
 
 	ctx = context.WithValue(ctx, outgoingMetadataKey{}, map[string]string{
@@ -54,7 +54,7 @@ func TestFromOutgoingContext(t *testing.T) {
 		"bk":  "bv",
 	})
 
-	metadata, ok := FromOutgoingContext(ctx)
+	metadata, ok := GetFromOutgoingContext(ctx)
 	assert.That(t, ok)
 	assert.Equal(t, metadata, map[string]string{
 		"foo": "bar",
@@ -228,16 +228,6 @@ func TestGetValue(t *testing.T) {
 	assert.Equal(t, val, "")
 }
 
-func TestFastFromIncomingContext(t *testing.T) {
-	ctx := context.Background()
-
-	ctx = Add(ctx, "key", "value")
-	md, ok := FastFromIncomingContext(ctx)
-	assert.That(t, ok)
-	assert.Equal(t, md,
-		map[string]string{"key": "value"})
-}
-
 func TestNewOutgoingContext(t *testing.T) {
 	originalCtx := context.Background()
 
@@ -248,14 +238,14 @@ func TestNewOutgoingContext(t *testing.T) {
 		"key1": "value1",
 		"key2": "value2",
 	})
-	
-	originalMd, ok := FromOutgoingContext(originalCtx)
+
+	originalMd, ok := GetFromOutgoingContext(originalCtx)
 	assert.That(t, ok)
 	assert.Equal(t, originalMd, map[string]string{
 		"existing-key": "existing-value",
 	})
 
-	newMd, ok := FromOutgoingContext(newCtx)
+	newMd, ok := GetFromOutgoingContext(newCtx)
 	assert.That(t, ok)
 	assert.Equal(t, newMd, map[string]string{
 		"key1": "value1",
