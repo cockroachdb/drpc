@@ -35,7 +35,7 @@ func finalInvoker(ctx context.Context, rpc string, enc drpc.Encoding, in, out dr
 
 func (c *ClientConn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) error {
 	if c.dopts.perRPCMetadata != nil {
-		ctx = drpcmetadata.AddPairs(ctx, c.dopts.perRPCMetadata)
+		ctx = drpcmetadata.AppendToOutgoingContext(ctx, c.dopts.perRPCMetadata)
 	}
 	if c.dopts.unaryInt != nil {
 		return c.dopts.unaryInt(ctx, rpc, enc, in, out, c, finalInvoker)
@@ -50,7 +50,7 @@ func finalStreamer(ctx context.Context, rpc string, enc drpc.Encoding, cc *Clien
 
 func (c *ClientConn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (drpc.Stream, error) {
 	if c.dopts.perRPCMetadata != nil {
-		ctx = drpcmetadata.AddPairs(ctx, c.dopts.perRPCMetadata)
+		ctx = drpcmetadata.AppendToOutgoingContext(ctx, c.dopts.perRPCMetadata)
 	}
 	if c.dopts.streamInt != nil {
 		return c.dopts.streamInt(ctx, rpc, enc, c, finalStreamer)

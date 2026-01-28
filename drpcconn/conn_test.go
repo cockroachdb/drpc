@@ -134,7 +134,7 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"common-key":           []string{"common-value1"},
 		},
 	)
-	ctx.Context = drpcmetadata.AddPairs(ctx.Context,
+	ctx.Context = drpcmetadata.AppendToOutgoingContext(ctx.Context,
 		map[string]string{
 			"drpc-key":   "drpc-value",
 			"common-key": "common-value2",
@@ -175,7 +175,7 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"grpc-key": []string{"grpc-value"},
 		},
 	)
-	ctx.Context = drpcmetadata.AddPairs(ctx.Context, map[string]string{
+	ctx.Context = drpcmetadata.AppendToOutgoingContext(ctx.Context, map[string]string{
 		"drpc-key": "drpc-value",
 	})
 	s, err := conn.NewStream(ctx, "/com.example.Foo/Bar", testEncoding{})
@@ -226,7 +226,7 @@ func TestConn_encodeMetadata(t *testing.T) {
 	t.Run("drpc-only", func(t *testing.T) {
 		ctx := context.Background()
 
-		ctx = drpcmetadata.AddPairs(ctx,
+		ctx = drpcmetadata.AppendToOutgoingContext(ctx,
 			map[string]string{
 				"drpc-key":                   "drpc-value",
 				"drpc-key-with-empty-string": "",
@@ -252,7 +252,7 @@ func TestConn_encodeMetadata(t *testing.T) {
 				"common-key2":          []string{"common-value"},
 			},
 		)
-		ctx = drpcmetadata.AddPairs(ctx,
+		ctx = drpcmetadata.AppendToOutgoingContext(ctx,
 			map[string]string{
 				"drpc-key":    "drpc-value",
 				"common-key1": "common-value2",

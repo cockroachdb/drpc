@@ -189,7 +189,7 @@ func (c *Conn) doNewStream(stream *drpcstream.Stream, rpc string, metadata []byt
 // encodeMetadata retrieves and encodes metadata from the provided
 // (outgoing/client) context.
 func (c *Conn) encodeMetadata(ctx context.Context) (metadata []byte, err error) {
-	md, _ := drpcmetadata.Get(ctx)
+	md, _ := drpcmetadata.GetFromOutgoingContext(ctx)
 	// Look for grpc metadata in the context and merge them with the drpc metadata,
 	// prioritizing drpc values when keys overlap. This is a short-term fix
 	// that will enable us to send and receive metadata when DRPC is enabled,

@@ -495,7 +495,7 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 						ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
 					} else {
 						// Add metadata to the incoming context.
-						ctx = drpcmetadata.AddPairs(ctx, meta)
+						ctx = drpcmetadata.NewIncomingContext(ctx, meta)
 					}
 				}
 				stream, err := m.newStream(ctx, pkt.ID.Stream, "srv", rpc)

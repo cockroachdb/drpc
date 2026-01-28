@@ -80,7 +80,7 @@ func TestDrpcMetadata(t *testing.T) {
 		assert.NoError(t, err)
 		streamCtx := stream.Context()
 
-		drpcMd, ok := drpcmetadata.Get(streamCtx)
+		drpcMd, ok := drpcmetadata.GetFromIncomingContext(streamCtx)
 		assert.That(t, ok)
 		assert.Equal(t, drpcMd, map[string]string{"key": "value", "multi-value-key": "value1,value2"})
 
@@ -140,7 +140,7 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 		assert.NoError(t, err)
 		streamCtx := stream.Context()
 
-		drpcMd, ok := drpcmetadata.Get(streamCtx)
+		drpcMd, ok := drpcmetadata.GetFromIncomingContext(streamCtx)
 		assert.False(t, ok)
 		assert.Nil(t, drpcMd)
 

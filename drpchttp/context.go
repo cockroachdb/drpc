@@ -27,6 +27,7 @@ func Context(req *http.Request) (context.Context, error) {
 // buildContext adds key/value pairs in entries that are of the form
 // `urlencode(key)=urlencode(value)` to the passed in context.
 func buildContext(ctx context.Context, entries []string) (context.Context, error) {
+	md := make(map[string]string)
 	for _, entry := range entries {
 		var key, value string
 		var err error
@@ -44,10 +45,11 @@ func buildContext(ctx context.Context, entries []string) (context.Context, error
 		if err != nil {
 			return nil, err
 		}
-
-		ctx = drpcmetadata.Add(ctx, key, value)
+		md[key] = value
 	}
-
+	if len(md) > 0 {
+		ctx = drpcmetadata.AppendToOutgoingContext(ctx, md)
+	}
 	return ctx, nil
 }
 

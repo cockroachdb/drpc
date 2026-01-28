@@ -27,7 +27,7 @@ func TestBuildContext(t *testing.T) {
 		})
 		assert.NoError(t, err)
 
-		metadata, ok := drpcmetadata.Get(ctx)
+		metadata, ok := drpcmetadata.GetFromOutgoingContext(ctx)
 		assert.That(t, ok)
 		assert.DeepEqual(t, metadata, map[string]string{
 			"key1":   "val1",
@@ -44,7 +44,7 @@ func TestBuildContext(t *testing.T) {
 	{ // no entries associates no metadata
 		ctx, err := buildContext(context.Background(), nil)
 		assert.NoError(t, err)
-		_, ok := drpcmetadata.Get(ctx)
+		_, ok := drpcmetadata.GetFromOutgoingContext(ctx)
 		assert.That(t, !ok)
 	}
 
