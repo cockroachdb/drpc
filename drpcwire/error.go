@@ -29,7 +29,7 @@ func MarshalError(err error) []byte {
 	if err == nil {
 		return []byte{}
 	}
-	st, ok := status.FromError(errs.Unwrap(err))
+	st, ok := status.FromError(errs.Unwrap(err)) //lint:ignore SA1019 errs.Unwrap returns original error for non-wrapped errors, unlike errors.Unwrap which returns nil
 	if !ok {
 		st = status.FromContextError(err)
 	}

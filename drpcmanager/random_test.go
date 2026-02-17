@@ -250,10 +250,7 @@ func expectedError(err error) bool {
 	}
 	// Wire format errors are expected when random data is sent as error frames
 	errMsg := err.Error()
-	if strings.HasPrefix(errMsg, "drpcwire:") {
-		return true
-	}
-	return false
+	return strings.HasPrefix(errMsg, "drpcwire:")
 }
 
 func parseOp(op byte) (cmd byte, arg int, done bool) {

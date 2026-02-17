@@ -2,8 +2,9 @@
 .vscode
 .idea/*
 vendor
-result
+cmd/protoc-gen-go-drpc/protoc-gen-go-drpc
 
 # Bazel files, generated with 'make gen-bazel'.
 /WORKSPACE
 BUILD.bazel
+MODULE.bazel*

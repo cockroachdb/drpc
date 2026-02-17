@@ -2,10 +2,11 @@ package drpcclient
 
 import (
 	"context"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"storj.io/drpc"
 	"storj.io/drpc/drpctest"
-	"testing"
 )
 
 // Dummy encoding, which assumes the drpc.Message is a *string.

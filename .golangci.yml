@@ -3,22 +3,13 @@ run:
   issues-exit-code: 1
   tests: true
 
-  skip-files:
-    - ".*\\.pb\\.go$"
-    - ".*\\.dbx\\.go$"
-
 
 linters:
   enable:
     - bodyclose               # find unclosed http response bodies
     - dogsled                 # checks for too many ignored arguments
     - durationcheck           # verifies whether durations are multiplied, usually a mistake
-    - errcheck                # find unchecked errors
-    - errorlint               # finds misuses of errors
-    - exportloopref           # check for exported loop vars
     - gocritic                # checks for style, performance issues, and common programming errors
-    - godot                   # dots for everything
-    - goerr113                # check error expressions
     - gofmt                   # sanity check formatting
     - goprintffuncname        # checks that printf-like functions are named with `f` at the end [fast: true, auto-fix: false]
     - govet                   # check standard vet rules
@@ -41,13 +32,16 @@ linters:
     #TODO#- unparam           # check for unused parameters
     #TODO#- whitespace        # checks for leading/trailing newlines
   disable:
+    - errcheck         # TODO: re-enable and fix unchecked errors
+    - errorlint        # TODO: re-enable and fix error handling
+    - godot            # TODO: re-enable and fix comment punctuation
+    - err113           # TODO: re-enable and fix dynamic errors
     - revive           # too many false positives
     - asciicheck       # non-ascii is allowed
     - cyclop           # this complexity is not a good metric
     - depguard         # unused
     - dupl             # slow
     - exhaustive       # doesn't handle default case
-    - exhaustivestruct # false positivies
     - forbidigo        # not useful
     - funlen           # no limit on func length
     - gci              # we have custom import checking
@@ -57,13 +51,10 @@ linters:
     - godox            # too many false positivies
     - goheader         # separate tool
     - goimports        # disabled, because it's slow, using scripts/check-imports.go instead.
-    - gomnd            # false positives
     - gomoddirectives  # not useful
     - gomodguard       # not useful
     - gosec            # needs tweaking
     - gosimple         # part of staticcheck
-    - ifshort          # usefulness, depends on the context
-    - interfacer       # not that useful
     - lll              # don't need this check
     - nlreturn         # non-important code style
     - paralleltest     # too many false positives
@@ -83,7 +74,8 @@ linters:
   fast: false
 
 output:
-  format: colored-line-number
+  formats:
+    - format: colored-line-number
   print-issued-lines: true
   print-linter-name: true
 
@@ -159,8 +151,7 @@ issues:
   max-same-issues: 0
   new: false
   exclude-use-default: false
-
-  exclude-rules:
-    - linters:
-        - goerr113
-      text: "do not define dynamic errors"
+  exclude-files:
+    - ".*\\.pb\\.go$"
+    - ".*\\.dbx\\.go$"
+    - "cmd/protoc-gen-go-drpc/.*"

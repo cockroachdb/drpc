@@ -180,7 +180,7 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	})
 	s, err := conn.NewStream(ctx, "/com.example.Foo/Bar", testEncoding{})
 	assert.NoError(t, err)
-	s.CloseSend()
+	_ = s.CloseSend()
 }
 
 func TestConn_encodeMetadata(t *testing.T) {
@@ -262,6 +262,7 @@ func TestConn_encodeMetadata(t *testing.T) {
 		metadata, err := conn.encodeMetadata(ctx)
 		assert.NoError(t, err)
 		decodedMd, err := drpcmetadata.Decode(metadata)
+		assert.NoError(t, err)
 		assert.Equal(t, decodedMd, map[string]string{
 			"grpc-key":             "grpc-value",
 			"drpc-key":             "drpc-value",

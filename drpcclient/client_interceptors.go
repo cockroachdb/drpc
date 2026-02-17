@@ -1,3 +1,5 @@
+// Package drpcclient provides client-side functionality for DRPC connections,
+// including connection management, dial options, and interceptors.
 package drpcclient
 
 import (
