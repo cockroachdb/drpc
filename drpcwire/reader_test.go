@@ -154,6 +154,51 @@ func TestReader(t *testing.T) {
 			Frames: []Frame{{ID: ID{Stream: 0, Message: 1}}},
 			Error:  "id monotonicity violation",
 		},
+
+		{ // cross-stream: frames from a lower stream after a higher stream are allowed (multiplexing)
+			Packets: []Packet{
+				{Data: []byte("a"), ID: ID{Stream: 1, Message: 1}, Kind: KindMessage},
+				{Data: []byte("b"), ID: ID{Stream: 2, Message: 1}, Kind: KindMessage},
+				{Data: nil, ID: ID{Stream: 1, Message: 2}, Kind: KindClose},
+			},
+			Frames: []Frame{
+				{Data: []byte("a"), ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: true},
+				{Data: []byte("b"), ID: ID{Stream: 2, Message: 1}, Kind: KindMessage, Done: true},
+				{Data: nil, ID: ID{Stream: 1, Message: 2}, Kind: KindClose, Done: true},
+			},
+		},
+
+		{ // cross-stream: interleaved single-frame packets from multiple streams
+			Packets: []Packet{
+				{Data: []byte("s1m1"), ID: ID{Stream: 1, Message: 1}, Kind: KindInvoke},
+				{Data: []byte("s2m1"), ID: ID{Stream: 2, Message: 1}, Kind: KindInvoke},
+				{Data: []byte("s1m2"), ID: ID{Stream: 1, Message: 2}, Kind: KindMessage},
+				{Data: []byte("s2m2"), ID: ID{Stream: 2, Message: 2}, Kind: KindMessage},
+				{Data: nil, ID: ID{Stream: 1, Message: 3}, Kind: KindCloseSend},
+				{Data: nil, ID: ID{Stream: 2, Message: 3}, Kind: KindCloseSend},
+			},
+			Frames: []Frame{
+				{Data: []byte("s1m1"), ID: ID{Stream: 1, Message: 1}, Kind: KindInvoke, Done: true},
+				{Data: []byte("s2m1"), ID: ID{Stream: 2, Message: 1}, Kind: KindInvoke, Done: true},
+				{Data: []byte("s1m2"), ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Done: true},
+				{Data: []byte("s2m2"), ID: ID{Stream: 2, Message: 2}, Kind: KindMessage, Done: true},
+				{Data: nil, ID: ID{Stream: 1, Message: 3}, Kind: KindCloseSend, Done: true},
+				{Data: nil, ID: ID{Stream: 2, Message: 3}, Kind: KindCloseSend, Done: true},
+			},
+		},
+
+		{ // cross-stream: within-stream monotonicity is still enforced
+			Packets: []Packet{
+				{Data: []byte("a"), ID: ID{Stream: 1, Message: 1}, Kind: KindMessage},
+				{Data: []byte("b"), ID: ID{Stream: 2, Message: 1}, Kind: KindMessage},
+			},
+			Frames: []Frame{
+				{Data: []byte("a"), ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: true},
+				{Data: []byte("b"), ID: ID{Stream: 2, Message: 1}, Kind: KindMessage, Done: true},
+				{Data: []byte("c"), ID: ID{Stream: 2, Message: 1}, Kind: KindMessage, Done: true}, // replay on stream 2
+			},
+			Error: "id monotonicity violation",
+		},
 	}
 
 	for _, tc := range cases {

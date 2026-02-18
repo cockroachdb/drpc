@@ -8,3 +8,4 @@ cmd/protoc-gen-go-drpc/protoc-gen-go-drpc
 /WORKSPACE
 BUILD.bazel
 MODULE.bazel*
+debug/*

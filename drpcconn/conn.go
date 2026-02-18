@@ -31,10 +31,9 @@ type Options struct {
 
 // Conn is a drpc client connection.
 type Conn struct {
-	tr   drpc.Transport
-	man  *drpcmanager.Manager
-	mu   sync.Mutex
-	wbuf []byte
+	tr  drpc.Transport
+	man *drpcmanager.Manager
+	mu  sync.Mutex // protects stats
 
 	stats map[string]*drpcstats.Stats
 }
@@ -92,16 +91,16 @@ func (c *Conn) Transport() drpc.Transport { return c.tr }
 // Closed returns a channel that is closed once the connection is closed.
 func (c *Conn) Closed() <-chan struct{} { return c.man.Closed() }
 
-// Unblocked returns a channel that is closed once the connection is no longer
-// blocked by a previously canceled Invoke or NewStream call. It should not
-// be called concurrently with Invoke or NewStream.
+// Unblocked returns a channel that is closed when the connection is available
+// for new streams. With multiplexing enabled, this always returns an
+// already-closed channel.
 func (c *Conn) Unblocked() <-chan struct{} { return c.man.Unblocked() }
 
 // Close closes the connection.
 func (c *Conn) Close() (err error) { return c.man.Close() }
 
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
-// deserializes it into out. Only one Invoke or Stream may be open at a time.
+// deserializes it into out. Multiple Invoke or Stream calls may be open concurrently.
 func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
@@ -117,18 +116,13 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	}
 	defer func() { err = errs.Combine(err, stream.Close()) }()
 
-	// we have to protect c.wbuf here even though the manager only allows one
-	// stream at a time because the stream may async close allowing another
-	// concurrent call to Invoke to proceed.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.wbuf, err = drpcenc.MarshalAppend(in, enc, c.wbuf[:0])
+	// Per-call buffer allocation for concurrent access.
+	data, err := drpcenc.MarshalAppend(in, enc, nil)
 	if err != nil {
 		return err
 	}
 
-	if err := c.doInvoke(stream, enc, rpc, c.wbuf, metadata, out); err != nil {
+	if err := c.doInvoke(stream, enc, rpc, data, metadata, out); err != nil {
 		return err
 	}
 	return nil
@@ -155,8 +149,8 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 	return nil
 }
 
-// NewStream begins a streaming rpc on the connection. Only one Invoke or Stream may
-// be open at a time.
+// NewStream begins a streaming rpc on the connection. Multiple Invoke or Stream calls
+// may be open concurrently.
 func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 

@@ -12,6 +12,13 @@ import (
 	"storj.io/drpc/drpcdebug"
 )
 
+// StreamWriter is the interface for writing frames to a stream.
+type StreamWriter interface {
+	WriteFrame(fr Frame) error
+	Flush() error
+	Empty() bool
+}
+
 //
 // Writer
 //

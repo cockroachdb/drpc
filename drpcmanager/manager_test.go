@@ -20,15 +20,6 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
-func closed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
-
 func TestTimeout(t *testing.T) {
 	tr := make(blockingTransport)
 	man := NewWithOptions(tr, Options{
@@ -69,10 +60,8 @@ func TestDrpcMetadata(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
 		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
 
 		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
 	})
 
 	ctx.Run(func(ctx context.Context) {
@@ -129,10 +118,8 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
 		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
 
 		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
 	})
 
 	ctx.Run(func(ctx context.Context) {
@@ -159,6 +146,103 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 	})
 
 	ctx.Wait()
+}
+
+func TestDrpcMetadataInterleavedAcrossStreams(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	sman := NewWithOptions(sconn, Options{
+		GRPCMetadataCompatMode: false,
+	})
+	defer func() { _ = sman.Close() }()
+
+	stream1, err := cman.NewClientStream(ctx, "rpc-1")
+	assert.NoError(t, err)
+	defer func() { _ = stream1.Close() }()
+
+	stream2, err := cman.NewClientStream(ctx, "rpc-2")
+	assert.NoError(t, err)
+	defer func() { _ = stream2.Close() }()
+
+	metadata1 := map[string]string{"stream": "one"}
+	metadata2 := map[string]string{"stream": "two"}
+
+	buf1, err := drpcmetadata.Encode(nil, metadata1)
+	assert.NoError(t, err)
+	buf2, err := drpcmetadata.Encode(nil, metadata2)
+	assert.NoError(t, err)
+
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindInvokeMetadata, buf1))
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindInvokeMetadata, buf2))
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindInvoke, []byte("rpc-1")))
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindInvoke, []byte("rpc-2")))
+
+	srvStream1, rpc1, err := sman.NewServerStream(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "rpc-1", rpc1)
+	defer func() { _ = srvStream1.Close() }()
+
+	got1, ok := drpcmetadata.GetFromIncomingContext(srvStream1.Context())
+	assert.That(t, ok)
+	assert.Equal(t, metadata1, got1)
+
+	srvStream2, rpc2, err := sman.NewServerStream(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "rpc-2", rpc2)
+	defer func() { _ = srvStream2.Close() }()
+
+	got2, ok := drpcmetadata.GetFromIncomingContext(srvStream2.Context())
+	assert.That(t, ok)
+	assert.Equal(t, metadata2, got2)
+}
+
+func TestNewServerStreamUnreadMessageDoesNotBlockOtherStreams(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	sman := New(sconn)
+	defer func() { _ = sman.Close() }()
+
+	stream1, err := cman.NewClientStream(ctx, "rpc-1")
+	assert.NoError(t, err)
+	defer func() { _ = stream1.Close() }()
+
+	stream2, err := cman.NewClientStream(ctx, "rpc-2")
+	assert.NoError(t, err)
+	defer func() { _ = stream2.Close() }()
+
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindInvoke, []byte("rpc-1")))
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindMessage, []byte("message-1")))
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindInvoke, []byte("rpc-2")))
+
+	srvStream1, rpc1, err := sman.NewServerStream(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "rpc-1", rpc1)
+	defer func() { _ = srvStream1.Close() }()
+
+	// Do not read the first stream's message. The manager must still be able to
+	// accept and register additional streams.
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	srvStream2, rpc2, err := sman.NewServerStream(timeoutCtx)
+	assert.NoError(t, err)
+	assert.Equal(t, "rpc-2", rpc2)
+	defer func() { _ = srvStream2.Close() }()
 }
 
 type blockingTransport chan struct{}
@@ -189,10 +273,8 @@ func TestUnblocked_NoCancel(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
 		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
 
 		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
 	})
 
 	ctx.Run(func(ctx context.Context) {
@@ -230,17 +312,20 @@ func TestUnblocked_SoftCancel(t *testing.T) {
 				if softCancel {
 					assert.NoError(t, err)
 				} else if i > 0 {
+					// Hard cancel terminates the connection, so subsequent streams fail.
 					assert.Error(t, err)
 					return
+				} else {
+					assert.NoError(t, err)
 				}
 				defer func() { _ = stream.Close() }()
 
-				assert.That(t, !closed(man.Unblocked()))
 				cancel()
 
 				// temporary unblock writing to allow the stream to finish soft cancel
 				tr.setWriteOpen(true)
-				<-man.Unblocked()
+				// With multiplexing, we wait for the stream to finish instead of Unblocked().
+				<-stream.Finished()
 				tr.setWriteOpen(false)
 			}()
 		}

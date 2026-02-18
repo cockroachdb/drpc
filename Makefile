@@ -25,6 +25,10 @@ lint:
 	staticcheck $(PKG)
 	golangci-lint run
 
+.PHONY: install-protoc-plugin
+install-protoc-plugin:
+	$(GO) install ./cmd/protoc-gen-go-drpc/
+
 .PHONY: gen-bazel
 gen-bazel:
 	@echo "Generating WORKSPACE"

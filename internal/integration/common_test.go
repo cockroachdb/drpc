@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 	"google.golang.org/grpc/codes"
@@ -40,16 +41,84 @@ func in(n int64) *In   { return &In{In: n} }
 func out(n int64) *Out { return &Out{Out: n} }
 
 func createRawConnection(t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker) *drpcconn.Conn {
-	c1, c2 := net.Pipe()
+	return createRawConnectionWithWriteDelay(t, server, ctx, 0)
+}
+
+func createRawConnectionWithWriteDelay(
+	t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker, writeDelay time.Duration,
+) *drpcconn.Conn {
+	return createConnectionWithTransport(t, server, ctx, writeDelay, false)
+}
+
+func createTCPConnectionWithWriteDelay(
+	t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker, writeDelay time.Duration,
+) *drpcconn.Conn {
+	return createConnectionWithTransport(t, server, ctx, writeDelay, true)
+}
+
+func createConnectionWithTransport(
+	t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker,
+	writeDelay time.Duration, useTCP bool,
+) *drpcconn.Conn {
+	var serverConn, clientConn net.Conn
+	if useTCP {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { lis.Close() })
+
+		type result struct {
+			conn net.Conn
+			err  error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			c, err := lis.Accept()
+			ch <- result{c, err}
+		}()
+
+		c, err := net.Dial("tcp", lis.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := <-ch
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		serverConn, clientConn = r.conn, c
+		t.Cleanup(func() {
+			serverConn.Close()
+			clientConn.Close()
+		})
+	} else {
+		c1, c2 := net.Pipe()
+		serverConn, clientConn = c1, c2
+	}
+
+	if writeDelay > 0 {
+		serverConn = &writeLatencyConn{Conn: serverConn, writeDelay: writeDelay}
+		clientConn = &writeLatencyConn{Conn: clientConn, writeDelay: writeDelay}
+	}
 	mux := drpcmux.New()
 	assert.NoError(t, DRPCRegisterService(mux, server))
 	srv := drpcserver.New(mux)
-	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
-	return drpcconn.NewWithOptions(c2, drpcconn.Options{
+	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, serverConn) })
+	return drpcconn.NewWithOptions(clientConn, drpcconn.Options{
 		Manager: drpcmanager.Options{
 			SoftCancel: true,
 		},
 	})
+}
+
+type writeLatencyConn struct {
+	net.Conn
+	writeDelay time.Duration
+}
+
+func (c *writeLatencyConn) Write(p []byte) (int, error) {
+	time.Sleep(c.writeDelay)
+	return c.Conn.Write(p)
 }
 
 func createConnection(t testing.TB, server DRPCServiceServer) (DRPCServiceClient, func()) {

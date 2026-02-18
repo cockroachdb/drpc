@@ -180,7 +180,10 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	})
 	s, err := conn.NewStream(ctx, "/com.example.Foo/Bar", testEncoding{})
 	assert.NoError(t, err)
-	_ = s.CloseSend()
+
+	assert.NoError(t, s.CloseSend())
+
+	ctx.Wait()
 }
 
 func TestConn_encodeMetadata(t *testing.T) {

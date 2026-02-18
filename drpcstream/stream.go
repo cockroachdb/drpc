@@ -53,7 +53,7 @@ type Stream struct {
 	flush sync.Once
 
 	id   drpcwire.ID
-	wr   *drpcwire.Writer
+	wr   drpcwire.StreamWriter
 	pbuf packetBuffer
 	wbuf []byte
 
@@ -72,7 +72,7 @@ var _ drpc.Stream = (*Stream)(nil)
 // New returns a new stream bound to the context with the given stream id and
 // will use the writer to write messages on. It is important use monotonically
 // increasing stream ids within a single transport.
-func New(ctx context.Context, sid uint64, wr *drpcwire.Writer) *Stream {
+func New(ctx context.Context, sid uint64, wr drpcwire.StreamWriter) *Stream {
 	return NewWithOptions(ctx, sid, wr, Options{})
 }
 
@@ -80,7 +80,7 @@ func New(ctx context.Context, sid uint64, wr *drpcwire.Writer) *Stream {
 // stream id and will use the writer to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts Options) *Stream {
+func NewWithOptions(ctx context.Context, sid uint64, wr drpcwire.StreamWriter, opts Options) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -99,7 +99,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		task: task,
 
 		id: drpcwire.ID{Stream: sid},
-		wr: wr.Reset(),
+		wr: wr,
 	}
 
 	// initialize the packet buffer
@@ -221,16 +221,18 @@ func (s *Stream) HandlePacket(pkt drpcwire.Packet) (err error) {
 
 	drpcopts.GetStreamStats(&s.opts.Internal).AddRead(uint64(len(pkt.Data)))
 
+	// Put must always be called for message packets to manage buffer
+	// ownership. Put returns the buffer to the pool if the stream is closed.
+	if pkt.Kind == drpcwire.KindMessage {
+		s.pbuf.Put(pkt.Data)
+		return nil
+	}
+
 	if s.sigs.term.IsSet() {
 		return nil
 	}
 
 	s.log("HANDLE", pkt.String)
-
-	if pkt.Kind == drpcwire.KindMessage {
-		s.pbuf.Put(pkt.Data)
-		return nil
-	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -457,8 +459,7 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	data = append([]byte(nil), data...)
-	s.pbuf.Done()
+	// Transfer buffer ownership to the caller without recycling.
 
 	return data, nil
 }
@@ -510,7 +511,7 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 		return err
 	}
 	err = enc.Unmarshal(data, msg)
-	s.pbuf.Done()
+	s.pbuf.recycle(data)
 
 	return err
 }

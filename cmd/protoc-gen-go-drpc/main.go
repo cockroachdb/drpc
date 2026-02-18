@@ -16,8 +16,9 @@ import (
 )
 
 type config struct {
-	protolib string
-	json     bool
+	protolib         string
+	json             bool
+	generateAdapters bool
 }
 
 func main() {
@@ -25,6 +26,7 @@ func main() {
 	var conf config
 	flags.StringVar(&conf.protolib, "protolib", "google.golang.org/protobuf", "which protobuf library to use for encoding")
 	flags.BoolVar(&conf.json, "json", true, "generate encoders with json support")
+	flags.BoolVar(&conf.generateAdapters, "generate-adapters", true, "generate gRPC/DRPC adapter and RPC interface code")
 
 	protogen.Options{
 		ParamFunc: flags.Set,
@@ -55,7 +57,7 @@ func generateFile(plugin *protogen.Plugin, file *protogen.File, conf config) {
 
 	d.generateEncoding(conf)
 	for _, service := range file.Services {
-		d.generateService(service)
+		d.generateService(service, conf)
 	}
 }
 
@@ -267,7 +269,7 @@ func (d *drpc) generateEncoding(conf config) {
 // service generation
 //
 
-func (d *drpc) generateService(service *protogen.Service) {
+func (d *drpc) generateService(service *protogen.Service, conf config) {
 	// Client interface
 	d.P("type ", d.ClientIface(service), " interface {")
 	d.P("DRPCConn() ", d.Ident("storj.io/drpc", "Conn"))
@@ -294,7 +296,7 @@ func (d *drpc) generateService(service *protogen.Service) {
 	d.P("func (c *", d.ClientImpl(service), ") DRPCConn() ", d.Ident("storj.io/drpc", "Conn"), "{ return c.cc }")
 	d.P()
 	for _, method := range service.Methods {
-		d.generateClientMethod(method)
+		d.generateClientMethod(method, conf)
 	}
 
 	// Server interface
@@ -339,11 +341,13 @@ func (d *drpc) generateService(service *protogen.Service) {
 
 	// Server methods
 	for _, method := range service.Methods {
-		d.generateServerMethod(method)
+		d.generateServerMethod(method, conf)
 	}
 
-	d.generateServiceRPCInterfaces(service)
-	d.generateServiceAdapters(service)
+	if conf.generateAdapters {
+		d.generateServiceRPCInterfaces(service)
+		d.generateServiceAdapters(service)
+	}
 }
 
 //
@@ -362,7 +366,7 @@ func (d *drpc) generateClientSignature(method *protogen.Method) string {
 	return fmt.Sprintf("%s(ctx %s%s) (%s, error)", method.GoName, d.Ident("context", "Context"), reqArg, respName)
 }
 
-func (d *drpc) generateClientMethod(method *protogen.Method) {
+func (d *drpc) generateClientMethod(method *protogen.Method, conf config) {
 	recvType := d.ClientImpl(method.Parent)
 	outType := d.OutputType(method)
 	inType := d.InputType(method)
@@ -408,7 +412,9 @@ func (d *drpc) generateClientMethod(method *protogen.Method) {
 	d.P("}")
 	d.P()
 
-	d.generateRPCClientInterface(method)
+	if conf.generateAdapters {
+		d.generateRPCClientInterface(method)
+	}
 
 	d.P("type ", d.ClientStreamImpl(method), " struct {")
 	d.P(d.Ident("storj.io/drpc", "Stream"))
@@ -510,7 +516,7 @@ func (d *drpc) generateServerReceiver(method *protogen.Method) {
 	d.P(")")
 }
 
-func (d *drpc) generateServerMethod(method *protogen.Method) {
+func (d *drpc) generateServerMethod(method *protogen.Method, conf config) {
 	genSend := method.Desc.IsStreamingServer()
 	genSendAndClose := !method.Desc.IsStreamingServer()
 	genRecv := method.Desc.IsStreamingClient()
@@ -531,7 +537,9 @@ func (d *drpc) generateServerMethod(method *protogen.Method) {
 	d.P("}")
 	d.P()
 
-	d.generateRPCServerInterface(method)
+	if conf.generateAdapters {
+		d.generateRPCServerInterface(method)
+	}
 
 	d.P("type ", d.ServerStreamImpl(method), " struct {")
 	d.P(d.Ident("storj.io/drpc", "Stream"))

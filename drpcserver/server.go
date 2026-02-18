@@ -119,7 +119,12 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 	}
 
 	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
-	defer func() { err = errs.Combine(err, man.Close()) }()
+
+	var wg sync.WaitGroup
+	defer func() {
+		wg.Wait()
+		err = errs.Combine(err, man.Close())
+	}()
 
 	cache := drpccache.New()
 	defer cache.Clear()
@@ -131,9 +136,15 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		if err != nil {
 			return errs.Wrap(err)
 		}
-		if err := s.handleRPC(stream, rpc); err != nil {
-			return errs.Wrap(err)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.handleRPC(stream, rpc); err != nil {
+				if s.opts.Log != nil {
+					s.opts.Log(err)
+				}
+			}
+		}()
 	}
 }
 
