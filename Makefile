@@ -1,5 +1,5 @@
 GO ?= go
-PKG = $(shell $(GO) list ./... | grep -v -e '/drpchttp' -e '/internal/' -e '/cmd/')
+PKG = $(shell $(GO) list ./... | grep -v -e '/internal/' -e '/cmd/')
 
 .PHONY: all
 all: build test vet lint
