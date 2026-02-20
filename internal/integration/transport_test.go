@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpctest"
@@ -67,7 +69,10 @@ func TestTransport_Blocked(t *testing.T) {
 
 	// we should always get a canceled error from issuing the rpc: not
 	// the error returned by the transport due to a read/write.
-	assert.Equal(t, <-errch, context.Canceled)
+	err := <-errch
+	st, ok := status.FromError(err)
+	assert.That(t, ok)
+	assert.Equal(t, st.Code(), codes.Canceled)
 }
 
 func TestTransport_ErrorCausesCancel(t *testing.T) {
@@ -112,16 +117,23 @@ func TestTransport_ErrorCausesCancel(t *testing.T) {
 	{
 		err := <-serr
 		t.Log("server error:", err)
-		assert.That(t, errors.Is(err, context.Canceled))
+		st, ok := status.FromError(err)
+		assert.That(t, ok)
+		assert.Equal(t, st.Code(), codes.Canceled)
 	}
 
 	// net.Pipe has a nondeterministic select inside of the read call on the local
 	// side and remote side being closed, and in some rare cases it will see the
 	// remote side closed first, returning io.EOF instead of io.ErrClosedPipe, so
-	// we have to check that as well.
+	// we have to check that as well. The error may be wrapped as a gRPC status
+	// error with codes.Canceled or codes.Unavailable.
 	{
 		err := <-cerr
 		t.Log("client error:", err)
-		assert.That(t, errors.Is(err, io.ErrClosedPipe) || errors.Is(err, context.Canceled))
+		isExpectedError := errors.Is(err, io.ErrClosedPipe)
+		if st, ok := status.FromError(err); ok {
+			isExpectedError = isExpectedError || st.Code() == codes.Canceled || st.Code() == codes.Unavailable
+		}
+		assert.That(t, isExpectedError)
 	}
 }

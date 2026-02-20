@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/zeebo/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"storj.io/drpc"
 	"storj.io/drpc/drpcconn"
@@ -32,7 +34,9 @@ func TestCancel(t *testing.T) {
 
 		out, err := cli.Method1(ctx, in(1))
 		assert.Nil(t, out)
-		assert.Equal(t, err, context.Canceled)
+		st, ok := status.FromError(err)
+		assert.That(t, ok)
+		assert.Equal(t, st.Code(), codes.Canceled)
 	}
 
 	{ // ensure that if we cancel after rpc is done, transport stays valid

@@ -12,9 +12,10 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"storj.io/drpc/drpcconn"
-	"storj.io/drpc/drpcerr"
 	"storj.io/drpc/drpcmux"
 	"storj.io/drpc/drpcserver"
 	"storj.io/drpc/drpcstats"
@@ -78,7 +79,9 @@ func TestSimple(t *testing.T) {
 	{
 		_, err := cli.Method1(ctx, &In{In: 5})
 		assert.Error(t, err)
-		assert.Equal(t, drpcerr.Code(err), 5)
+		st, ok := status.FromError(err)
+		assert.That(t, ok)
+		assert.Equal(t, st.Code(), codes.Code(5))
 	}
 }
 
@@ -136,14 +139,14 @@ func TestServerStats(t *testing.T) {
 	assert.Error(t, err)
 
 	assert.Equal(t, srv.Stats(), map[string]drpcstats.Stats{
-		"/service.Service/Method1": {Read: 2, Written: 12},
+		"/service.Service/Method1": {Read: 2, Written: 9},
 	})
 
 	_, err = cli.Method1(ctx, in(1))
 	assert.NoError(t, err)
 
 	assert.Equal(t, srv.Stats(), map[string]drpcstats.Stats{
-		"/service.Service/Method1": {Read: 2 + 2, Written: 12 + 2},
+		"/service.Service/Method1": {Read: 2 + 2, Written: 9 + 2},
 	})
 
 	stream, err := cli.Method3(ctx, in(3))
@@ -157,7 +160,7 @@ func TestServerStats(t *testing.T) {
 	assert.NoError(t, stream.Close())
 
 	assert.Equal(t, srv.Stats(), map[string]drpcstats.Stats{
-		"/service.Service/Method1": {Read: 2 + 2, Written: 12 + 2},
+		"/service.Service/Method1": {Read: 2 + 2, Written: 9 + 2},
 		"/service.Service/Method3": {Read: 2, Written: 6},
 	})
 }
@@ -185,14 +188,14 @@ func TestClientStats(t *testing.T) {
 	assert.Error(t, err)
 
 	assert.Equal(t, conn.Stats(), map[string]drpcstats.Stats{
-		"/service.Service/Method1": {Read: 12, Written: 26},
+		"/service.Service/Method1": {Read: 9, Written: 26},
 	})
 
 	_, err = cli.Method1(ctx, in(1))
 	assert.NoError(t, err)
 
 	assert.Equal(t, conn.Stats(), map[string]drpcstats.Stats{
-		"/service.Service/Method1": {Read: 12 + 2, Written: 26 + 26},
+		"/service.Service/Method1": {Read: 9 + 2, Written: 26 + 26},
 	})
 
 	stream, err := cli.Method3(ctx, in(3))
@@ -206,7 +209,7 @@ func TestClientStats(t *testing.T) {
 	assert.NoError(t, stream.Close())
 
 	assert.Equal(t, conn.Stats(), map[string]drpcstats.Stats{
-		"/service.Service/Method1": {Read: 12 + 2, Written: 26 + 26},
+		"/service.Service/Method1": {Read: 9 + 2, Written: 26 + 26},
 		"/service.Service/Method3": {Read: 6, Written: 26},
 	})
 }

@@ -11,8 +11,9 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
-	"storj.io/drpc/drpcerr"
 	"storj.io/drpc/drpctest"
 )
 
@@ -27,7 +28,9 @@ func TestError(t *testing.T) {
 		out, err := cli.Method1(ctx, in(i))
 		assert.Nil(t, out)
 		assert.Error(t, err)
-		assert.Equal(t, drpcerr.Code(err), i)
+		st, ok := status.FromError(err)
+		assert.That(t, ok)
+		assert.Equal(t, st.Code(), codes.Code(i))
 	}
 }
 
@@ -83,5 +86,7 @@ func TestError_Message(t *testing.T) {
 	out, err := cli.Method1(ctx, in(1))
 	assert.Nil(t, out)
 	assert.Error(t, err)
-	assert.Equal(t, err.Error(), "some unique error message")
+	st, ok := status.FromError(err)
+	assert.That(t, ok)
+	assert.Equal(t, st.Message(), "some unique error message")
 }

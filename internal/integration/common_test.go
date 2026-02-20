@@ -12,10 +12,10 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
-	"github.com/zeebo/errs"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"storj.io/drpc/drpcconn"
-	"storj.io/drpc/drpcerr"
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcmetadata"
 	"storj.io/drpc/drpcmux"
@@ -95,11 +95,13 @@ func (i impl) Method4(stream DRPCService_Method4Stream) error {
 var standardImpl = impl{
 	Method1Fn: func(ctx context.Context, in *In) (*Out, error) {
 		if in.In != 1 {
-			return nil, drpcerr.WithCode(errs.New("test"), uint64(in.In))
+			// Map input values to gRPC codes
+			code := codes.Code(in.In)
+			return nil, status.Error(code, "test")
 		}
 
 		var out int64 = 1
-		if metadata, ok := drpcmetadata.Get(ctx); ok {
+		if metadata, ok := drpcmetadata.GetFromIncomingContext(ctx); ok {
 			v, _ := strconv.ParseInt(metadata["inc"], 10, 64)
 			out += v
 		}
