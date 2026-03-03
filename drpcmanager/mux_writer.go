@@ -9,23 +9,20 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
-// muxWriter implements drpcwire.StreamWriter by serializing frame bytes into a
+// muxWriter implements drpcwire.StreamWriter by serializing packet bytes into a
 // shared write buffer. The manageWriter goroutine drains the buffer and writes
 // directly to the transport.
 //
-// Compared to the previous frameQueue approach, this avoids:
-//   - copying frame payload into an intermediate queue slot,
-//   - drpcwire.Writer mutex overhead in the writer goroutine.
-//
-// Frames are serialized (via AppendFrame) into the shared buffer under a
-// short-held mutex. The frame's Data slice is consumed before WriteFrame
-// returns, so callers may safely reuse their buffers afterward.
+// The entire packet is serialized as a single frame (via AppendFrame) under one
+// mutex hold, so frames from concurrent streams never interleave on the wire.
+// The packet's Data slice is consumed (copied) before WritePacket returns, so
+// callers may safely reuse their buffers afterward.
 type muxWriter struct {
 	sw *sharedWriteBuf
 }
 
-func (w *muxWriter) WriteFrame(fr drpcwire.Frame) error {
-	return w.sw.Append(fr)
+func (w *muxWriter) WritePacket(pkt drpcwire.Packet) error {
+	return w.sw.Append(pkt)
 }
 
 // Flush is a no-op because the manageWriter goroutine flushes to the
@@ -50,15 +47,21 @@ func newSharedWriteBuf() *sharedWriteBuf {
 	return sw
 }
 
-// Append serializes fr into the shared buffer. The frame's Data slice is
-// consumed (copied by AppendFrame) before Append returns.
-func (sw *sharedWriteBuf) Append(fr drpcwire.Frame) error {
+// Append serializes pkt as a single frame into the shared buffer. The packet's
+// Data slice is consumed (copied by AppendFrame) before Append returns.
+func (sw *sharedWriteBuf) Append(pkt drpcwire.Packet) error {
 	sw.mu.Lock()
 	if sw.closed {
 		sw.mu.Unlock()
 		return managerClosed.New("enqueue")
 	}
-	sw.buf = drpcwire.AppendFrame(sw.buf, fr)
+	sw.buf = drpcwire.AppendFrame(sw.buf, drpcwire.Frame{
+		Data:    pkt.Data,
+		ID:      pkt.ID,
+		Kind:    pkt.Kind,
+		Control: pkt.Control,
+		Done:    true,
+	})
 	sw.mu.Unlock()
 
 	sw.cond.Signal()

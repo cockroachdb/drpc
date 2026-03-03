@@ -15,7 +15,7 @@ import (
 	"github.com/zeebo/assert"
 	grpcmetadata "google.golang.org/grpc/metadata"
 	"storj.io/drpc/drpcmetadata"
-
+	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
@@ -243,6 +243,86 @@ func TestNewServerStreamUnreadMessageDoesNotBlockOtherStreams(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "rpc-2", rpc2)
 	defer func() { _ = srvStream2.Close() }()
+}
+
+// TestConcurrentLargeMessages verifies that two streams writing messages larger
+// than SplitSize concurrently do not corrupt each other's data. With the current
+// implementation, rawWriteLocked splits messages into multiple frames and each
+// frame is appended to the shared write buffer independently. Frames from
+// different streams can interleave in the buffer, and the reader resets partial
+// packets when it sees a frame from a different stream, silently corrupting data.
+func TestConcurrentLargeMessages(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	// Use a small SplitSize to force even small messages to be split into
+	// multiple frames, making interleaving likely.
+	streamOpts := drpcstream.Options{SplitSize: 5}
+
+	cman := NewWithOptions(cconn, Options{Stream: streamOpts})
+	defer func() { _ = cman.Close() }()
+
+	sman := NewWithOptions(sconn, Options{Stream: streamOpts})
+	defer func() { _ = sman.Close() }()
+
+	// Create two client streams and send invoke + message concurrently.
+	stream1, err := cman.NewClientStream(ctx, "rpc-1")
+	assert.NoError(t, err)
+	defer func() { _ = stream1.Close() }()
+
+	stream2, err := cman.NewClientStream(ctx, "rpc-2")
+	assert.NoError(t, err)
+	defer func() { _ = stream2.Close() }()
+
+	msg1 := []byte("AAAAAAAAAAAAAAAAAAAA") // 20 bytes, split into 4 frames of 5 bytes
+	msg2 := []byte("BBBBBBBBBBBBBBBBBBBB") // 20 bytes, split into 4 frames of 5 bytes
+
+	// Send invokes first (these are small, no splitting).
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindInvoke, []byte("rpc-1")))
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindInvoke, []byte("rpc-2")))
+
+	// Accept both server streams before sending messages, so the streams are
+	// registered and the reader can route packets.
+	srvStream1, rpc1, err := sman.NewServerStream(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "rpc-1", rpc1)
+	defer func() { _ = srvStream1.Close() }()
+
+	srvStream2, rpc2, err := sman.NewServerStream(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "rpc-2", rpc2)
+	defer func() { _ = srvStream2.Close() }()
+
+	// Write messages concurrently from both streams. With SplitSize=5, each
+	// 20-byte message becomes 4 frames. The frames should not interleave.
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-ready
+		assert.NoError(t, stream1.RawWrite(drpcwire.KindMessage, msg1))
+	}()
+	go func() {
+		defer wg.Done()
+		<-ready
+		assert.NoError(t, stream2.RawWrite(drpcwire.KindMessage, msg2))
+	}()
+	close(ready)
+	wg.Wait()
+
+	// Read from both server streams and verify correctness.
+	got1, err := srvStream1.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, got1, msg1)
+
+	got2, err := srvStream2.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, got2, msg2)
 }
 
 type blockingTransport chan struct{}

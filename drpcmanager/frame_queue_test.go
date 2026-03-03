@@ -7,21 +7,19 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
-
 	"storj.io/drpc/drpcwire"
 )
 
 func TestSharedWriteBuf_AppendDrain(t *testing.T) {
 	sw := newSharedWriteBuf()
 
-	fr := drpcwire.Frame{
+	pkt := drpcwire.Packet{
 		Data: []byte("hello"),
 		ID:   drpcwire.ID{Stream: 1, Message: 2},
 		Kind: drpcwire.KindMessage,
-		Done: true,
 	}
 
-	assert.NoError(t, sw.Append(fr))
+	assert.NoError(t, sw.Append(pkt))
 
 	// Drain should return serialized bytes.
 	data := sw.Drain(nil)
@@ -31,11 +29,11 @@ func TestSharedWriteBuf_AppendDrain(t *testing.T) {
 	_, got, ok, err := drpcwire.ParseFrame(data)
 	assert.NoError(t, err)
 	assert.That(t, ok)
-	assert.DeepEqual(t, got.Data, fr.Data)
-	assert.Equal(t, got.ID.Stream, fr.ID.Stream)
-	assert.Equal(t, got.ID.Message, fr.ID.Message)
-	assert.Equal(t, got.Kind, fr.Kind)
-	assert.Equal(t, got.Done, fr.Done)
+	assert.DeepEqual(t, got.Data, pkt.Data)
+	assert.Equal(t, got.ID.Stream, pkt.ID.Stream)
+	assert.Equal(t, got.ID.Message, pkt.ID.Message)
+	assert.Equal(t, got.Kind, pkt.Kind)
+	assert.Equal(t, got.Done, true)
 }
 
 func TestSharedWriteBuf_CloseIdempotent(t *testing.T) {
@@ -48,7 +46,7 @@ func TestSharedWriteBuf_AppendAfterClose(t *testing.T) {
 	sw := newSharedWriteBuf()
 	sw.Close()
 
-	err := sw.Append(drpcwire.Frame{})
+	err := sw.Append(drpcwire.Packet{})
 	assert.Error(t, err)
 }
 
@@ -64,7 +62,7 @@ func TestSharedWriteBuf_WaitAndDrainBlocks(t *testing.T) {
 	}()
 
 	// Append should wake the blocked WaitAndDrain.
-	assert.NoError(t, sw.Append(drpcwire.Frame{Data: []byte("a")}))
+	assert.NoError(t, sw.Append(drpcwire.Packet{Data: []byte("a")}))
 	<-done
 }
 
