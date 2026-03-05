@@ -53,8 +53,9 @@ type Stream struct {
 	flush sync.Once
 
 	id   drpcwire.ID
-	wr   *drpcwire.Writer
-	pbuf packetBuffer
+	mux  bool
+	wr   drpcwire.StreamWriter
+	pbuf packetStore
 	wbuf []byte
 
 	mu   sync.Mutex // protects state transitions
@@ -72,7 +73,7 @@ var _ drpc.Stream = (*Stream)(nil)
 // New returns a new stream bound to the context with the given stream id and
 // will use the writer to write messages on. It is important use monotonically
 // increasing stream ids within a single transport.
-func New(ctx context.Context, sid uint64, wr *drpcwire.Writer) *Stream {
+func New(ctx context.Context, sid uint64, wr drpcwire.StreamWriter) *Stream {
 	return NewWithOptions(ctx, sid, wr, Options{})
 }
 
@@ -80,7 +81,9 @@ func New(ctx context.Context, sid uint64, wr *drpcwire.Writer) *Stream {
 // stream id and will use the writer to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts Options) *Stream {
+func NewWithOptions(
+	ctx context.Context, sid uint64, wr drpcwire.StreamWriter, opts Options,
+) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -88,6 +91,8 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 			ctx, task = trace.NewTask(ctx, kind.String()+rpc)
 		}
 	}
+
+	mux := drpcopts.GetStreamMux(&opts.Internal)
 
 	s := &Stream{
 		ctx: streamCtx{
@@ -98,12 +103,21 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		fin:  drpcopts.GetStreamFin(&opts.Internal),
 		task: task,
 
-		id: drpcwire.ID{Stream: sid},
-		wr: wr.Reset(),
+		id:  drpcwire.ID{Stream: sid},
+		mux: mux,
+		wr:  wr,
 	}
 
-	// initialize the packet buffer
-	s.pbuf.init()
+	// initialize the packet buffer based on mode
+	if mux {
+		pb := new(queuePacketBuffer)
+		pb.init()
+		s.pbuf = pb
+	} else {
+		pb := new(syncPacketBuffer)
+		pb.init()
+		s.pbuf = pb
+	}
 
 	return s
 }
@@ -225,16 +239,18 @@ func (s *Stream) HandlePacket(pkt drpcwire.Packet) (err error) {
 
 	drpcopts.GetStreamStats(&s.opts.Internal).AddRead(uint64(len(pkt.Data)))
 
+	// Put must always be called for message packets to manage buffer
+	// ownership. Put returns the buffer to the pool if the stream is closed.
+	if pkt.Kind == drpcwire.KindMessage {
+		s.pbuf.Put(pkt.Data)
+		return nil
+	}
+
 	if s.sigs.term.IsSet() {
 		return nil
 	}
 
 	s.log("HANDLE", pkt.String)
-
-	if pkt.Kind == drpcwire.KindMessage {
-		s.pbuf.Put(pkt.Data)
-		return nil
-	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -314,26 +330,28 @@ func (s *Stream) checkCancelError(err error) error {
 	return err
 }
 
-// newFrameLocked bumps the internal message id and returns a frame. It must be
+// nextID bumps the internal message id and returns the new ID. It must be
 // called under a mutex.
-func (s *Stream) newFrameLocked(kind drpcwire.Kind) drpcwire.Frame {
+func (s *Stream) nextID() drpcwire.ID {
 	s.id.Message++
-	return drpcwire.Frame{ID: s.id, Kind: kind}
+	return s.id
 }
 
 // sendPacketLocked sends the packet in a single write and flushes. It does not
 // check for any conditions to stop it from writing and is meant for internal
 // stream use to do things like signal errors or closes to the remote side.
 func (s *Stream) sendPacketLocked(kind drpcwire.Kind, control bool, data []byte) (err error) {
-	fr := s.newFrameLocked(kind)
-	fr.Data = data
-	fr.Control = control
-	fr.Done = true
+	pkt := drpcwire.Packet{
+		ID:      s.nextID(),
+		Kind:    kind,
+		Data:    data,
+		Control: control,
+	}
 
 	drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(data)))
-	s.log("SEND", fr.String)
+	s.log("SEND", pkt.String)
 
-	if err := s.wr.WriteFrame(fr); err != nil {
+	if err := s.wr.WritePacket(pkt); err != nil {
 		return errs.Wrap(err)
 	}
 	if err := s.wr.Flush(); err != nil {
@@ -376,29 +394,26 @@ func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
 // rawWriteLocked does the body of RawWrite assuming the caller is holding the
 // appropriate locks.
 func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
-	fr := s.newFrameLocked(kind)
-	n := s.opts.SplitSize
-
-	for {
-		switch {
-		case s.sigs.send.IsSet():
-			return s.sigs.send.Err()
-		case s.sigs.term.IsSet():
-			return s.sigs.term.Err()
-		}
-
-		fr.Data, data = drpcwire.SplitData(data, n)
-		fr.Done = len(data) == 0
-
-		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
-		s.log("SEND", fr.String)
-
-		if err := s.wr.WriteFrame(fr); err != nil {
-			return s.checkCancelError(errs.Wrap(err))
-		} else if fr.Done {
-			return nil
-		}
+	switch {
+	case s.sigs.send.IsSet():
+		return s.sigs.send.Err()
+	case s.sigs.term.IsSet():
+		return s.sigs.term.Err()
 	}
+
+	pkt := drpcwire.Packet{
+		ID:   s.nextID(),
+		Kind: kind,
+		Data: data,
+	}
+
+	drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(data)))
+	s.log("SEND", pkt.String)
+
+	if err := s.wr.WritePacket(pkt); err != nil {
+		return s.checkCancelError(errs.Wrap(err))
+	}
+	return nil
 }
 
 // RawFlush flushes any buffers of data.
@@ -461,6 +476,14 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if s.mux {
+		// In mux mode, the buffer is owned by the caller (from the pool).
+		return data, nil
+	}
+
+	// In non-mux mode, copy the data and release the slot so the reader
+	// goroutine can continue.
 	data = append([]byte(nil), data...)
 	s.pbuf.Done()
 
@@ -514,7 +537,14 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 		return err
 	}
 	err = enc.Unmarshal(data, msg)
-	s.pbuf.Done()
+
+	if s.mux {
+		// In mux mode, return the buffer to the pool after unmarshal.
+		s.pbuf.Recycle(data)
+	} else {
+		// In non-mux mode, release the slot so the reader can continue.
+		s.pbuf.Done()
+	}
 
 	return err
 }

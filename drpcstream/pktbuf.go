@@ -7,7 +7,22 @@ import (
 	"sync"
 )
 
-type packetBuffer struct {
+// packetStore is the interface for packet buffer implementations.
+// syncPacketBuffer is used for non-mux mode (blocking, single-slot),
+// queuePacketBuffer is used for mux mode (non-blocking, queued).
+type packetStore interface {
+	Put(data []byte)
+	Get() ([]byte, error)
+	Close(err error)
+	Done()
+	Recycle([]byte)
+}
+
+// syncPacketBuffer is the original single-slot, blocking packet buffer used
+// in non-mux mode. Put blocks until the previous value is consumed via
+// Get+Done, and the reader (manageReader) blocks in Put until the stream
+// consumer finishes processing.
+type syncPacketBuffer struct {
 	mu   sync.Mutex
 	cond sync.Cond
 	err  error
@@ -16,11 +31,11 @@ type packetBuffer struct {
 	held bool
 }
 
-func (pb *packetBuffer) init() {
+func (pb *syncPacketBuffer) init() {
 	pb.cond.L = &pb.mu
 }
 
-func (pb *packetBuffer) Close(err error) {
+func (pb *syncPacketBuffer) Close(err error) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
@@ -36,7 +51,7 @@ func (pb *packetBuffer) Close(err error) {
 	}
 }
 
-func (pb *packetBuffer) Put(data []byte) {
+func (pb *syncPacketBuffer) Put(data []byte) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
@@ -57,7 +72,7 @@ func (pb *packetBuffer) Put(data []byte) {
 	}
 }
 
-func (pb *packetBuffer) Get() ([]byte, error) {
+func (pb *syncPacketBuffer) Get() ([]byte, error) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
@@ -74,7 +89,7 @@ func (pb *packetBuffer) Get() ([]byte, error) {
 	return pb.data, nil
 }
 
-func (pb *packetBuffer) Done() {
+func (pb *syncPacketBuffer) Done() {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
@@ -83,3 +98,7 @@ func (pb *packetBuffer) Done() {
 	pb.held = false
 	pb.cond.Broadcast()
 }
+
+// Recycle is a no-op for syncPacketBuffer. Buffer lifetime is managed by
+// the manageReader goroutine that owns the underlying slice.
+func (pb *syncPacketBuffer) Recycle([]byte) {}

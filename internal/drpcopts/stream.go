@@ -15,6 +15,7 @@ type Stream struct {
 	kind      drpc.StreamKind
 	rpc       string
 	stats     *drpcstats.Stats
+	mux       bool
 }
 
 // GetStreamTransport returns the drpc.Transport stored in the options.
@@ -46,3 +47,9 @@ func GetStreamStats(opts *Stream) *drpcstats.Stats { return opts.stats }
 
 // SetStreamStats sets the Stats stored in the options.
 func SetStreamStats(opts *Stream, stats *drpcstats.Stats) { opts.stats = stats }
+
+// GetStreamMux returns whether the stream is in multiplexing mode.
+func GetStreamMux(opts *Stream) bool { return opts.mux }
+
+// SetStreamMux sets whether the stream is in multiplexing mode.
+func SetStreamMux(opts *Stream, mux bool) { opts.mux = mux }

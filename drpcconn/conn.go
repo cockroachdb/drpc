@@ -29,10 +29,20 @@ type Options struct {
 	CollectStats bool
 }
 
+// streamManager is the interface satisfied by both drpcmanager.Manager (non-mux)
+// and drpcmanager.MuxManager (mux).
+type streamManager interface {
+	NewClientStream(ctx context.Context, rpc string) (*drpcstream.Stream, error)
+	Closed() <-chan struct{}
+	Unblocked() <-chan struct{}
+	Close() error
+}
+
 // Conn is a drpc client connection.
 type Conn struct {
 	tr   drpc.Transport
-	man  *drpcmanager.Manager
+	man  streamManager
+	mux  bool
 	mu   sync.Mutex
 	wbuf []byte
 
@@ -56,7 +66,12 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		c.stats = make(map[string]*drpcstats.Stats)
 	}
 
-	c.man = drpcmanager.NewWithOptions(tr, opts.Manager)
+	c.mux = opts.Manager.Mux
+	if c.mux {
+		c.man = drpcmanager.NewMuxWithOptions(tr, opts.Manager)
+	} else {
+		c.man = drpcmanager.NewWithOptions(tr, opts.Manager)
+	}
 
 	return c
 }
@@ -100,8 +115,9 @@ func (c *Conn) Unblocked() <-chan struct{} { return c.man.Unblocked() }
 // Close closes the connection.
 func (c *Conn) Close() (err error) { return c.man.Close() }
 
-// Invoke issues the rpc on the transport serializing in, waits for a response, and
-// deserializes it into out. Only one Invoke or Stream may be open at a time.
+// Invoke issues the rpc on the transport serializing in, waits for a response,
+// and deserializes it into out. In non-mux mode, only one Invoke or Stream may
+// be open at a time. In mux mode, multiple calls may be open concurrently.
 func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
@@ -117,18 +133,28 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	}
 	defer func() { err = errs.Combine(err, stream.Close()) }()
 
-	// we have to protect c.wbuf here even though the manager only allows one
-	// stream at a time because the stream may async close allowing another
-	// concurrent call to Invoke to proceed.
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var data []byte
+	if c.mux {
+		// Per-call buffer allocation for concurrent access.
+		data, err = drpcenc.MarshalAppend(in, enc, nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		// We have to protect c.wbuf here even though the manager only allows
+		// one stream at a time because the stream may async close allowing
+		// another concurrent call to Invoke to proceed.
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	c.wbuf, err = drpcenc.MarshalAppend(in, enc, c.wbuf[:0])
-	if err != nil {
-		return err
+		c.wbuf, err = drpcenc.MarshalAppend(in, enc, c.wbuf[:0])
+		if err != nil {
+			return err
+		}
+		data = c.wbuf
 	}
 
-	if err := c.doInvoke(stream, enc, rpc, c.wbuf, metadata, out); err != nil {
+	if err := c.doInvoke(stream, enc, rpc, data, metadata, out); err != nil {
 		return err
 	}
 	return nil

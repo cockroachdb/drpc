@@ -92,6 +92,19 @@ func (s *Server) getStats(rpc string) *drpcstats.Stats {
 
 // ServeOne serves a single set of rpcs on the provided transport.
 func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
+	ctx, err = s.setupConnection(ctx, tr)
+	if err != nil {
+		return err
+	}
+	if s.opts.Manager.Mux {
+		return s.serveOneMux(ctx, tr)
+	}
+	return s.serveOneNonMux(ctx, tr)
+}
+
+// setupConnection performs TLS handshake (if applicable) and sets up the
+// drpccache context. It is shared by both mux and non-mux serve paths.
+func (s *Server) setupConnection(ctx context.Context, tr drpc.Transport) (context.Context, error) {
 	// Check if the transport is a TLS connection
 	if tlsConn, ok := tr.(*tls.Conn); ok {
 		// Manually perform the TLS handshake to access peer certificate
@@ -109,7 +122,7 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		// anyway.
 		err := tlsConn.HandshakeContext(ctx)
 		if err != nil {
-			return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
+			return ctx, drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
 		}
 		state := tlsConn.ConnectionState()
 		if len(state.PeerCertificates) > 0 {
@@ -117,7 +130,11 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 				ctx, drpcctx.PeerConnectionInfo{Certificates: state.PeerCertificates})
 		}
 	}
+	return ctx, nil
+}
 
+// serveOneNonMux serves rpcs sequentially using the non-mux Manager.
+func (s *Server) serveOneNonMux(ctx context.Context, tr drpc.Transport) (err error) {
 	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
 	defer func() { err = errs.Combine(err, man.Close()) }()
 
@@ -134,6 +151,38 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		if err := s.handleRPC(stream, rpc); err != nil {
 			return errs.Wrap(err)
 		}
+	}
+}
+
+// serveOneMux serves rpcs concurrently using the MuxManager.
+func (s *Server) serveOneMux(ctx context.Context, tr drpc.Transport) (err error) {
+	man := drpcmanager.NewMuxWithOptions(tr, s.opts.Manager)
+
+	var wg sync.WaitGroup
+	defer func() {
+		wg.Wait()
+		err = errs.Combine(err, man.Close())
+	}()
+
+	cache := drpccache.New()
+	defer cache.Clear()
+
+	ctx = drpccache.WithContext(ctx, cache)
+
+	for {
+		stream, rpc, err := man.NewServerStream(ctx)
+		if err != nil {
+			return errs.Wrap(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.handleRPC(stream, rpc); err != nil {
+				if s.opts.Log != nil {
+					s.opts.Log(err)
+				}
+			}
+		}()
 	}
 }
 

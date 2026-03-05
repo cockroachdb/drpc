@@ -60,6 +60,11 @@ type Options struct {
 	// handling. When enabled, the server stream will decode incoming metadata
 	// into grpc metadata in the context.
 	GRPCMetadataCompatMode bool
+
+	// Mux enables stream multiplexing on the transport, allowing multiple
+	// concurrent streams. When false (default), the manager uses the
+	// original single-stream-at-a-time behavior.
+	Mux bool
 }
 
 // Manager handles the logic of managing a transport for a drpc client or
@@ -306,6 +311,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 		drpcopts.SetStreamStats(&opts.Internal, cb(rpc))
 	}
 
+	m.wr.Reset()
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
 	select {
 	case m.streams <- streamInfo{ctx: ctx, stream: stream}:

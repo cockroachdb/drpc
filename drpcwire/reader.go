@@ -143,7 +143,10 @@ func (r *Reader) ReadPacketUsing(buf []byte) (pkt Packet, err error) {
 		pkt.Control = pkt.Control || fr.Control
 
 		switch {
-		case fr.ID.Less(r.id):
+		case fr.ID.Stream == 0 || fr.ID.Message == 0:
+			return Packet{}, drpc.ProtocolError.New("id monotonicity violation (fr:%v r:%v)", fr.ID, r.id)
+
+		case fr.ID.Stream == r.id.Stream && fr.ID.Less(r.id):
 			return Packet{}, drpc.ProtocolError.New("id monotonicity violation (fr:%v r:%v)", fr.ID, r.id)
 
 		case r.id != fr.ID || pkt.ID == ID{}:

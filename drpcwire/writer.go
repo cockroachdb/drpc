@@ -12,6 +12,15 @@ import (
 	"storj.io/drpc/drpcdebug"
 )
 
+// StreamWriter is the interface used by streams for writing packets. Each call
+// to WritePacket must serialize the full data atomically so that frames from
+// concurrent writers on different streams do not interleave on the wire.
+type StreamWriter interface {
+	WritePacket(pkt Packet) error
+	Flush() error
+	Empty() bool
+}
+
 //
 // Writer
 //
