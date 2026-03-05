@@ -107,7 +107,7 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		// interrupting any ongoing communication. Even if we didn't call it
 		// explicitly, the first read/write operation would call it internally
 		// anyway.
-		err := tlsConn.Handshake()
+		err := tlsConn.HandshakeContext(ctx)
 		if err != nil {
 			return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
 		}
