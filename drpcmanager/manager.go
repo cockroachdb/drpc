@@ -298,7 +298,7 @@ func (m *Manager) manageReader() {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64, kind, rpc string) (*drpcstream.Stream, error) {
+func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string) (*drpcstream.Stream, error) {
 	opts := m.opts.Stream
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
@@ -342,6 +342,9 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 		err := m.sigs.term.Err()
 		if errors.Is(err, io.EOF) {
 			err = context.Canceled
+			if stream.Kind() == drpc.StreamKindClient {
+				err = drpc.ClosedError.New("connection closed")
+			}
 		}
 		stream.Cancel(err)
 		<-m.sfin
@@ -427,7 +430,7 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 		return nil, err
 	}
 
-	return m.newStream(ctx, m.sbuf.Get().ID()+1, "cli", rpc)
+	return m.newStream(ctx, m.sbuf.Get().ID()+1, drpc.StreamKindClient, rpc)
 }
 
 // NewServerStream starts a stream on the managed transport for use by a server.
@@ -498,7 +501,7 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 						ctx = drpcmetadata.NewIncomingContext(ctx, meta)
 					}
 				}
-				stream, err := m.newStream(ctx, pkt.ID.Stream, "srv", rpc)
+				stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
 				return stream, rpc, err
 
 			default:

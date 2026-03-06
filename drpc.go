@@ -48,12 +48,41 @@ type Conn interface {
 	NewStream(ctx context.Context, rpc string, enc Encoding) (Stream, error)
 }
 
+// StreamKind represents the type of stream ("unknown", "cli", or "srv").
+type StreamKind uint8
+
+const (
+	StreamKindUnknown StreamKind = iota
+	StreamKindClient
+	StreamKindServer
+)
+
+// String returns the string representation of the StreamKind.
+func (k StreamKind) String() string {
+	switch k {
+	case StreamKindClient:
+		return "cli"
+	case StreamKindServer:
+		return "srv"
+	default:
+		return "unknown"
+	}
+}
+
 // Stream is a bi-directional stream of messages to some other party.
 type Stream interface {
 	// Context returns the context associated with the stream. It is canceled
 	// when the Stream is closed and no more messages will ever be sent or
 	// received on it.
 	Context() context.Context
+
+	// Kind returns the type of the stream ("unknown", "cli", or "srv"). Client
+	// and server streams must be treated differently for error handling and
+	// logging purposes.
+	//
+	// Client streams return Unavailable errors when the remote closes the
+	// connection, while server streams return Canceled errors.
+	Kind() StreamKind
 
 	// MsgSend sends the Message to the remote.
 	MsgSend(msg Message, enc Encoding) error

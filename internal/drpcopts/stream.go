@@ -12,7 +12,7 @@ import (
 type Stream struct {
 	transport drpc.Transport
 	fin       chan<- struct{}
-	kind      string
+	kind      drpc.StreamKind
 	rpc       string
 	stats     *drpcstats.Stats
 }
@@ -29,11 +29,11 @@ func GetStreamFin(opts *Stream) chan<- struct{} { return opts.fin }
 // SetStreamFin sets the chan<- struct{} stored in the options.
 func SetStreamFin(opts *Stream, fin chan<- struct{}) { opts.fin = fin }
 
-// GetStreamKind returns the kind debug string stored in the options.
-func GetStreamKind(opts *Stream) string { return opts.kind }
+// GetStreamKind returns the StreamKind stored in the options.
+func GetStreamKind(opts *Stream) drpc.StreamKind { return opts.kind }
 
-// SetStreamKind sets the kind debug string stored in the options.
-func SetStreamKind(opts *Stream, kind string) { opts.kind = kind }
+// SetStreamKind sets the StreamKind stored in the options.
+func SetStreamKind(opts *Stream, kind drpc.StreamKind) { opts.kind = kind }
 
 // GetStreamRPC returns the RPC debug string stored in the options.
 func GetStreamRPC(opts *Stream) string { return opts.rpc }

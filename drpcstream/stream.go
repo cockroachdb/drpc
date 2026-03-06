@@ -84,8 +84,8 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
-		if kind != "" && rpc != "" {
-			ctx, task = trace.NewTask(ctx, kind+rpc)
+		if kind != drpc.StreamKindUnknown && rpc != "" {
+			ctx, task = trace.NewTask(ctx, kind.String()+rpc)
 		}
 	}
 
@@ -122,6 +122,10 @@ func (s *Stream) log(what string, cb func() string) {
 	if s.task != nil {
 		trace.Log(&s.ctx, what, cb())
 	}
+}
+
+func (s *Stream) Kind() drpc.StreamKind {
+	return drpcopts.GetStreamKind(&s.opts.Internal)
 }
 
 //

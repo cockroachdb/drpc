@@ -6,8 +6,6 @@ package drpcpool
 import (
 	"context"
 
-	"github.com/zeebo/errs"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcsignal"
 )
@@ -50,8 +48,10 @@ func (p *poolConn[K, V]) Unblocked() <-chan struct{} { return closedCh }
 // Invoke grabs a temporary connection from the Pool, calls Invoke on that, and replaces the
 // connection into the pool after.
 func (p *poolConn[K, V]) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in drpc.Message, out drpc.Message) (err error) {
+	defer func() { err = drpc.ToRPCErr(err) }()
+
 	if closed(p.done.Get()) {
-		return errs.New("connection closed")
+		return drpc.ClosedError.New("connection closed")
 	}
 
 	conn, ok := p.pool.Take(p.key)
@@ -72,8 +72,10 @@ func (p *poolConn[K, V]) Invoke(ctx context.Context, rpc string, enc drpc.Encodi
 // underlying connection has been returned to the pool, allowing callers to be sure that a
 // connection will be reused if possible.
 func (p *poolConn[K, V]) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
+	defer func() { err = drpc.ToRPCErr(err) }()
+
 	if closed(p.done.Get()) {
-		return nil, errs.New("connection closed")
+		return nil, drpc.ClosedError.New("connection closed")
 	}
 
 	conn, ok := p.pool.Take(p.key)

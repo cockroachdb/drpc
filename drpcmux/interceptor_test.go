@@ -24,6 +24,10 @@ func (m *mockStream) Context() context.Context {
 	return m.ctx
 }
 
+func (m *mockStream) Kind() drpc.StreamKind {
+	return drpc.StreamKindServer
+}
+
 func (m *mockStream) MsgSend(msg drpc.Message, enc drpc.Encoding) error {
 	if m.closed {
 		return errors.New("stream closed")

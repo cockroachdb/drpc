@@ -125,7 +125,7 @@ func (m *mockDrpcConn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding
 }
 
 func (m *mockDrpcConn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (drpc.Stream, error) {
-	return &mockStream{name: rpc}, nil
+	return &mockStream{name: rpc, kind: drpc.StreamKindClient}, nil
 }
 
 func (m *mockDrpcConn) Close() error {
@@ -138,6 +138,7 @@ func (m *mockDrpcConn) Closed() <-chan struct{} {
 
 type mockStream struct {
 	name string
+	kind drpc.StreamKind
 }
 
 func (m *mockStream) MsgSend(msg drpc.Message, enc drpc.Encoding) error {
@@ -158,4 +159,8 @@ func (m *mockStream) Context() context.Context {
 
 func (m *mockStream) CloseSend() error {
 	return nil
+}
+
+func (m *mockStream) Kind() drpc.StreamKind {
+	return m.kind
 }
