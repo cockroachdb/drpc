@@ -33,6 +33,17 @@ type Options struct {
 	// CollectStats controls whether the server should collect stats on the
 	// rpcs it serves.
 	CollectStats bool
+
+	// TLSConfig, if non-nil, is used to wrap the listener with tls.NewListener
+	// in Serve(). The TLS handshake is performed explicitly in ServeOne before
+	// processing requests.
+	TLSConfig *tls.Config
+
+	// TLSCipherRestrict, if non-nil, is called in ServeOne immediately after
+	// a successful TLS handshake. It receives the net.Conn (which is a
+	// *tls.Conn) and may inspect ConnectionState to enforce cipher suite
+	// restrictions. If it returns a non-nil error the connection is rejected.
+	TLSCipherRestrict func(conn net.Conn) error
 }
 
 // Server is an implementation of drpc.Server to serve drpc connections.
@@ -52,6 +63,12 @@ func New(handler drpc.Handler) *Server {
 // NewWithOptions constructs a new Server using the provided options to tune
 // how the drpc connections are handled.
 func NewWithOptions(handler drpc.Handler, opts Options) *Server {
+	// Clone the TLS config so the server owns its copy and the caller cannot
+	// mutate it after construction.
+	if opts.TLSConfig != nil {
+		opts.TLSConfig = opts.TLSConfig.Clone()
+	}
+
 	s := &Server{
 		opts:    opts,
 		handler: handler,
@@ -111,6 +128,11 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		if err != nil {
 			return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
 		}
+		if s.opts.TLSCipherRestrict != nil {
+			if err := s.opts.TLSCipherRestrict(tlsConn); err != nil {
+				return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
+			}
+		}
 		state := tlsConn.ConnectionState()
 		if len(state.PeerCertificates) > 0 {
 			ctx = drpcctx.WithPeerConnectionInfo(
@@ -142,6 +164,10 @@ var temporarySleep = 500 * time.Millisecond
 // Serve listens for connections on the listener and serves the drpc request
 // on new connections.
 func (s *Server) Serve(ctx context.Context, lis net.Listener) (err error) {
+	if s.opts.TLSConfig != nil {
+		lis = tls.NewListener(lis, s.opts.TLSConfig)
+	}
+
 	tracker := drpcctx.NewTracker(ctx)
 	defer tracker.Wait()
 	defer tracker.Cancel()
