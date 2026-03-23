@@ -43,9 +43,9 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 		wr := drpcwire.NewWriter(ps, 64)
 		rd := drpcwire.NewReader(ps)
 
-		_, _ = rd.ReadPacket()    // Invoke
-		_, _ = rd.ReadPacket()    // Message
-		pkt, _ := rd.ReadPacket() // CloseSend
+		_, _ = rd.ReadFrame()    // Invoke
+		_, _ = rd.ReadFrame()    // Message
+		pkt, _ := rd.ReadFrame() // CloseSend
 
 		_ = wr.WritePacket(drpcwire.Packet{
 			Data: []byte("qux"),
@@ -54,8 +54,8 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 		})
 		_ = wr.Flush()
 
-		_, _ = rd.ReadPacket() // Close
-		<-invokeDone           // wait for invoke to return
+		_, _ = rd.ReadFrame() // Close
+		<-invokeDone          // wait for invoke to return
 
 		// ensure that any later packets are dropped by writing one
 		// before closing the transport.
@@ -98,7 +98,7 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 		wr := drpcwire.NewWriter(ps, 64)
 		rd := drpcwire.NewReader(ps)
 
-		md, err := rd.ReadPacket() // Metadata
+		md, err := rd.ReadFrame() // Metadata
 		assert.NoError(t, err)
 		assert.Equal(t, md.Kind, drpcwire.KindInvokeMetadata)
 		metadata, err := drpcmetadata.Decode(md.Data)
@@ -110,9 +110,9 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"common-key":           "common-value2",
 		})
 
-		_, _ = rd.ReadPacket()    // Invoke
-		_, _ = rd.ReadPacket()    // Message
-		pkt, _ := rd.ReadPacket() // CloseSend
+		_, _ = rd.ReadFrame()    // Invoke
+		_, _ = rd.ReadFrame()    // Message
+		pkt, _ := rd.ReadFrame() // CloseSend
 
 		_ = wr.WritePacket(drpcwire.Packet{
 			Data: []byte("qux"),
@@ -121,7 +121,7 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 		})
 		_ = wr.Flush()
 
-		_, _ = rd.ReadPacket() // Close
+		_, _ = rd.ReadFrame() // Close
 	})
 
 	conn := New(pc)
@@ -154,7 +154,7 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	ctx.Run(func(ctx context.Context) {
 		rd := drpcwire.NewReader(ps)
 
-		md, err := rd.ReadPacket() // Metadata
+		md, err := rd.ReadFrame() // Metadata
 		assert.NoError(t, err)
 		assert.Equal(t, md.Kind, drpcwire.KindInvokeMetadata)
 		metadata, err := drpcmetadata.Decode(md.Data)
@@ -164,8 +164,8 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"drpc-key": "drpc-value",
 		})
 
-		_, _ = rd.ReadPacket() // Invoke
-		_, _ = rd.ReadPacket() // CloseSend
+		_, _ = rd.ReadFrame() // Invoke
+		_, _ = rd.ReadFrame() // CloseSend
 	})
 
 	conn := New(pc)

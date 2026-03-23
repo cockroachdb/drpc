@@ -23,7 +23,7 @@ import (
 
 // Options controls configuration settings for a stream.
 type Options struct {
-	// SplitSize controls the default size we split packets into frames.
+	// SplitSize controls the default size we split data packets into frames.
 	SplitSize int
 
 	// ManualFlush controls if the stream will automatically flush after every
@@ -51,6 +51,11 @@ type Stream struct {
 	write inspectMutex
 	read  inspectMutex
 	flush sync.Once
+
+	assembling    bool
+	pktBuf        []byte
+	pktKind       drpcwire.Kind
+	nextMessageID uint64
 
 	id   drpcwire.ID
 	wr   *drpcwire.Writer
@@ -97,6 +102,8 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		opts: opts,
 		fin:  drpcopts.GetStreamFin(&opts.Internal),
 		task: task,
+
+		nextMessageID: 1,
 
 		id: drpcwire.ID{Stream: sid},
 		wr: wr.Reset(),
@@ -211,23 +218,64 @@ func (s *Stream) IsFinished() bool { return s.sigs.fin.IsSet() }
 func (s *Stream) SetManualFlush(mf bool) { s.opts.ManualFlush = mf }
 
 //
-// packet handler
+// frame handler
 //
 
-// HandlePacket advances the stream state machine by inspecting the packet. It
-// returns any major errors that should terminate the transport the stream is
-// operating on as well as a boolean indicating if the stream expects more
-// packets.
-func (s *Stream) HandlePacket(pkt drpcwire.Packet) (err error) {
-	if pkt.ID.Stream != s.id.Stream {
-		return nil
-	}
-
-	drpcopts.GetStreamStats(&s.opts.Internal).AddRead(uint64(len(pkt.Data)))
-
+// HandleFrame processes an incoming frame, assembling multi-frame packets
+// and dispatching complete packets to the stream state machine.
+func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 	if s.sigs.term.IsSet() {
 		return nil
 	}
+
+	if fr.ID.Stream != s.ID() {
+		return drpc.ProtocolError.New("frame doesn't belong to this stream (fr: %v)", fr.ID)
+	}
+
+	if fr.ID.Message < s.nextMessageID {
+		return drpc.ProtocolError.New(
+			"id monotonicity violation: frame %v has message ID less than expected %v", fr.ID, s.nextMessageID)
+	} else if fr.ID.Message > s.nextMessageID || !s.assembling {
+		s.pktBuf = s.pktBuf[:0]
+		s.assembling = true
+		s.nextMessageID = fr.ID.Message
+	} else if fr.Kind != s.pktKind {
+		return drpc.ProtocolError.New("frame kind change within packet: got %v, expected %v", fr.Kind, s.pktKind)
+	}
+
+	// TODO(shubham): add buf reuse
+	s.pktBuf = append(s.pktBuf, fr.Data...)
+
+	s.pktKind = fr.Kind
+
+	if s.opts.MaximumBufferSize > 0 && len(s.pktBuf) > s.opts.MaximumBufferSize {
+		return drpc.ProtocolError.New("data overflow (len:%d)", len(s.pktBuf))
+	}
+
+	if !fr.Done {
+		return nil
+	}
+
+	s.assembling = false
+	s.nextMessageID = fr.ID.Message + 1
+
+	err = s.handlePacket(drpcwire.Packet{
+		ID:      fr.ID,
+		Kind:    fr.Kind,
+		Control: fr.Control,
+		Data:    s.pktBuf,
+	})
+
+	// TODO(shubham): add buf reuse
+	s.pktBuf = nil
+	return err
+}
+
+// handlePacket advances the stream state machine by inspecting the packet. It
+// returns any major errors that should terminate the transport the stream is
+// operating on.
+func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
+	drpcopts.GetStreamStats(&s.opts.Internal).AddRead(uint64(len(pkt.Data)))
 
 	s.log("HANDLE", pkt.String)
 
@@ -240,7 +288,7 @@ func (s *Stream) HandlePacket(pkt drpcwire.Packet) (err error) {
 	defer s.mu.Unlock()
 
 	switch pkt.Kind {
-	case drpcwire.KindInvoke:
+	case drpcwire.KindInvoke, drpcwire.KindInvokeMetadata:
 		err := drpc.ProtocolError.New("invoke on existing stream")
 		s.terminate(err)
 		return err
@@ -375,6 +423,7 @@ func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
 
 // rawWriteLocked does the body of RawWrite assuming the caller is holding the
 // appropriate locks.
+// TODO(shubham): can we merge this with sendPacketLocked?
 func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 	fr := s.newFrameLocked(kind)
 	n := s.opts.SplitSize

@@ -72,6 +72,9 @@ type Manager struct {
 	rd   *drpcwire.Reader
 	opts Options
 
+	lastFrameID   drpcwire.ID
+	lastFrameKind drpcwire.Kind
+
 	sem     drpcsignal.Chan      // held by the active stream
 	sbuf    streamBuffer         // largest stream id created
 	pkts    chan drpcwire.Packet // channel for invoke packets
@@ -213,27 +216,15 @@ func (m *Manager) terminate(err error) {
 // manage reader
 //
 
-// manageReader is always reading a packet and dispatching it to the appropriate
-// stream or queue. It sets the read signal when it exits so that one can wait
-// to ensure that no one is reading on the reader. It sets the term signal if
-// there is any error reading packets.
+// manageReader reads the frame and dispatches them to the appropriate stream or
+// queue. It sets the read signal when it exits so that one can wait to ensure
+// that no one is reading on the reader. It sets the term signal if there is any
+// error reading frames.
 func (m *Manager) manageReader() {
 	defer m.sigs.read.Set(nil)
 
-	var pkt drpcwire.Packet
-	var err error
-	var run int
-
 	for !m.sigs.term.IsSet() {
-		// if we have a run of "small" packets, drop the buffer to release
-		// memory so that a burst of large packets does not cause eternally
-		// large heap usage.
-		if run > 10 {
-			pkt.Data = nil
-			run = 0
-		}
-
-		pkt, err = m.rd.ReadPacketUsing(pkt.Data[:0])
+		incomingFrame, err := m.rd.ReadFrame()
 		if err != nil {
 			if isConnectionReset(err) {
 				err = drpc.ClosedError.Wrap(err)
@@ -242,36 +233,36 @@ func (m *Manager) manageReader() {
 			return
 		}
 
-		if len(pkt.Data) < cap(pkt.Data)/4 {
-			run++
-		} else {
-			run = 0
+		m.log("READ", incomingFrame.String)
+
+		if ok := m.checkStreamMonotonicity(incomingFrame); !ok {
+			m.terminate(managerClosed.Wrap(drpc.ProtocolError.New("id monotonicity violation")))
+			return
 		}
 
-		m.log("READ", pkt.String)
-
 		switch curr := m.sbuf.Get(); {
-		// if the packet is for the current stream, deliver it.
-		case curr != nil && pkt.ID.Stream == curr.ID():
-			if err := curr.HandlePacket(pkt); err != nil {
+		// If the frame is for the current stream, deliver it.
+		case curr != nil && incomingFrame.ID.Stream == curr.ID():
+			if err := curr.HandleFrame(incomingFrame); err != nil {
 				m.terminate(managerClosed.Wrap(err))
 				return
 			}
 
-		// if an old message has been sent, just ignore it.
-		case curr != nil && pkt.ID.Stream < curr.ID():
+		// If a frame arrives for an old stream, just ignore it.
+		case curr != nil && incomingFrame.ID.Stream < curr.ID():
 
-		// if any invoke sequence is being sent, close any old unterminated
-		// stream and forward it to be handled.
-		case pkt.Kind == drpcwire.KindInvoke || pkt.Kind == drpcwire.KindInvokeMetadata:
+		// If an invoke sequence is being sent for a new stream, close any
+		// old unterminated stream and forward it to be handled.
+		case incomingFrame.Kind == drpcwire.KindInvoke || incomingFrame.Kind == drpcwire.KindInvokeMetadata:
 			if curr != nil && !curr.IsTerminated() {
 				curr.Cancel(context.Canceled)
 			}
 
+			pkt := drpcwire.Packet{ID: incomingFrame.ID, Kind: incomingFrame.Kind, Data: incomingFrame.Data}
 			select {
 			case m.pkts <- pkt:
 				// Wait for NewServerStream to finish stream creation (including
-				// sbuf.Set) before reading the next packet. This guarantees curr
+				// sbuf.Set) before reading the next frame. This guarantees curr
 				// is set for subsequent non-invoke packets.
 				m.pdone.Recv()
 
@@ -280,16 +271,26 @@ func (m *Manager) manageReader() {
 			}
 
 		default:
-			// A non-invoke packet arrived for a stream that doesn't exist yet
-			// (curr is nil or pkt.ID.Stream > curr.ID). The first packet of a
-			// new stream must be KindInvoke or KindInvokeMetadata.
+			// A non-invoke frame arrived for a stream that doesn't exist yet
+			// (curr is nil or incomingFrame.ID.Stream > curr.ID). The first
+			// frame of a new stream must be KindInvoke or KindInvokeMetadata.
 			m.terminate(managerClosed.Wrap(drpc.ProtocolError.New(
-				"first packet of a new stream must be Invoke, got %v (ID:%v)",
-				pkt.Kind,
-				pkt.ID)))
+				"first frame of a new stream must be Invoke, got %v (ID:%v)",
+				incomingFrame.Kind,
+				incomingFrame.ID)))
 			return
 		}
 	}
+}
+
+func (m *Manager) checkStreamMonotonicity(incomingFrame drpcwire.Frame) bool {
+	ok := incomingFrame.ID.Stream >= m.lastFrameID.Stream
+	m.lastFrameKind = incomingFrame.Kind
+	m.lastFrameID = incomingFrame.ID
+	if incomingFrame.Done {
+		m.lastFrameID.Message += 1
+	}
+	return ok
 }
 
 //

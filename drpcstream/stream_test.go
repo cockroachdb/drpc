@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/zeebo/assert"
@@ -18,15 +19,22 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
+// handleFrame is a helper that sends a single-frame packet to the stream.
+// It constructs a frame with the given kind, matching the stream's ID,
+// using the provided message ID, done=true.
+func handleFrame(st *Stream, kind drpcwire.Kind, mid uint64) error {
+	return st.HandleFrame(drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: st.ID(), Message: mid},
+		Kind: kind,
+		Done: true,
+	})
+}
+
 func TestStream_StateTransitions(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
 	any := errors.New("any sentinel error")
-
-	handlePacket := func(st *Stream, kind drpcwire.Kind) error {
-		return st.HandlePacket(drpcwire.Packet{Kind: kind})
-	}
 
 	checkErrs := func(t *testing.T, exp interface{}, got error) {
 		t.Helper()
@@ -81,32 +89,32 @@ func TestStream_StateTransitions(t *testing.T) {
 		},
 
 		{ // recv close
-			Op:   func(st *Stream) error { return handlePacket(st, drpcwire.KindClose) },
+			Op:   func(st *Stream) error { return handleFrame(st, drpcwire.KindClose, 1) },
 			Send: &drpc.ClosedError,
 			Recv: io.EOF,
 		},
 
 		{ // recv error
-			Op:   func(st *Stream) error { return handlePacket(st, drpcwire.KindError) },
+			Op:   func(st *Stream) error { return handleFrame(st, drpcwire.KindError, 1) },
 			Send: io.EOF,
 			Recv: any,
 		},
 
 		{ // recv closesend
-			Op:   func(st *Stream) error { return handlePacket(st, drpcwire.KindCloseSend) },
+			Op:   func(st *Stream) error { return handleFrame(st, drpcwire.KindCloseSend, 1) },
 			Send: nil,
 			Recv: io.EOF,
 		},
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+		st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
 		assert.NoError(t, test.Op(st))
 
 		checkErrs(t, test.Send, st.RawWrite(drpcwire.KindMessage, nil))
 
 		if test.Recv == nil {
-			ctx.Run(func(ctx context.Context) { _ = handlePacket(st, drpcwire.KindMessage) })
+			ctx.Run(func(ctx context.Context) { _ = handleFrame(st, drpcwire.KindMessage, 2) })
 		}
 		_, err := st.RawRecv()
 		checkErrs(t, test.Recv, err)
@@ -116,10 +124,6 @@ func TestStream_StateTransitions(t *testing.T) {
 func TestStream_Unblocks(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
-
-	handlePacket := func(st *Stream, kind drpcwire.Kind) error {
-		return st.HandlePacket(drpcwire.Packet{Kind: kind})
-	}
 
 	cases := []struct {
 		Op func(st *Stream) error
@@ -141,20 +145,20 @@ func TestStream_Unblocks(t *testing.T) {
 		},
 
 		{ // recv close
-			Op: func(st *Stream) error { return handlePacket(st, drpcwire.KindClose) },
+			Op: func(st *Stream) error { return handleFrame(st, drpcwire.KindClose, 1) },
 		},
 
 		{ // recv error
-			Op: func(st *Stream) error { return handlePacket(st, drpcwire.KindError) },
+			Op: func(st *Stream) error { return handleFrame(st, drpcwire.KindError, 1) },
 		},
 
 		{ // recv closesend
-			Op: func(st *Stream) error { return handlePacket(st, drpcwire.KindCloseSend) },
+			Op: func(st *Stream) error { return handleFrame(st, drpcwire.KindCloseSend, 1) },
 		},
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+		st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
 
 		ctx.Run(func(ctx context.Context) { _, _ = st.RawRecv() })
 		assert.NoError(t, test.Op(st))
@@ -200,20 +204,6 @@ func TestStream_ConcurrentCloseCancel(t *testing.T) {
 	assert.That(t, errors.Is(<-errch, context.Canceled))
 }
 
-func TestStream_Control(t *testing.T) {
-	st := New(context.Background(), 0, drpcwire.NewWriter(io.Discard, 0))
-
-	// N.B. the stream will return nil on any HandlePacket calls after the
-	// stream has been terminated for any reason, including if an invalid
-	// packet has been sent. the order of these two assertions is important!
-
-	// an invalid packet is not an error if the control bit is set
-	assert.NoError(t, st.HandlePacket(drpcwire.Packet{Control: true}))
-
-	// an invalid packet is an error if the control bit it not set
-	assert.That(t, drpc.InternalError.Has(st.HandlePacket(drpcwire.Packet{})))
-}
-
 func TestStream_CorkUntilFirstRead(t *testing.T) {
 	run := func() {
 		ctx := drpctest.NewTracker(t)
@@ -234,10 +224,11 @@ func TestStream_CorkUntilFirstRead(t *testing.T) {
 			errch <- err
 		})
 		ctx.Run(func(ctx context.Context) {
-			errch <- st.HandlePacket(drpcwire.Packet{
+			errch <- st.HandleFrame(drpcwire.Frame{
 				Data: []byte("read"),
 				ID:   drpcwire.ID{Message: 1},
 				Kind: drpcwire.KindMessage,
+				Done: true,
 			})
 		})
 
@@ -266,20 +257,24 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 		defer ctx.Close()
 		defer ctx.Wait()
 
-		buf := make([]byte, 20)
-		st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+		data := make([]byte, 20)
+		mid := uint64(1)
+		st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
 
 		ctx.Run(func(ctx context.Context) {
 			for !st.IsTerminated() {
-				err := st.HandlePacket(drpcwire.Packet{
-					Data: buf,
+				err := st.HandleFrame(drpcwire.Frame{
+					Data: data,
+					ID:   drpcwire.ID{Stream: 1, Message: mid},
 					Kind: drpcwire.KindMessage,
+					Done: true,
 				})
 				if err != nil {
 					return
 				}
-				for i := range buf {
-					buf[i]++
+				mid++
+				for i := range data {
+					data[i]++
 				}
 			}
 		})
@@ -326,4 +321,355 @@ func TestStream_SendCancelBusyDuringBlockedClose(t *testing.T) {
 	busy, err := st.SendCancel(context.Canceled)
 	assert.NoError(t, err)
 	assert.That(t, busy)
+}
+
+//
+// HandleFrame tests
+//
+
+// A frame routed to the wrong stream is a protocol error.
+func TestHandleFrame_WrongStreamID(t *testing.T) {
+	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+
+	err := st.HandleFrame(drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: 2, Message: 1},
+		Kind: drpcwire.KindMessage,
+		Done: true,
+	})
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "doesn't belong"))
+}
+
+// A frame with a message ID lower than a previously completed message is rejected.
+func TestHandleFrame_MessageMonotonicity(t *testing.T) {
+	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+	// Close packet buffer so KindMessage delivery doesn't block.
+	st.pbuf.Close(io.EOF)
+
+	// m3 completes, nextMessageID becomes 4.
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 3}, Kind: drpcwire.KindMessage, Done: true,
+	}))
+
+	// m2 < 4 → error.
+	err := st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 2}, Kind: drpcwire.KindMessage, Done: true,
+	})
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "monotonicity"))
+}
+
+func TestHandleFrame_FirstFrameOnFreshStream(t *testing.T) {
+	// On the client side, the first message received will have ID 1. But on the
+	// server side, invoke is consumed by the manager. The first frame reaching
+	// the stream could have msg > 1 (e.g., msg=2). nextMessageID=1, so 2 > 1
+	// makes this a valid frame.
+	for _, messageID := range []uint64{1, 2} {
+		st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+		// Close the packet buffer so KindMessage Put doesn't block.
+		st.pbuf.Close(io.EOF)
+		err := st.HandleFrame(drpcwire.Frame{
+			ID: drpcwire.ID{Stream: 1, Message: messageID}, Kind: drpcwire.KindMessage, Done: true,
+		})
+		assert.NoError(t, err)
+	}
+}
+
+// When a higher message ID arrives mid-assembly, the in-progress data is
+// silently discarded and a new packet begins.
+func TestHandleFrame_HigherMsgDiscardsInProgress(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+
+	// Start accumulating m1 (done=false doesn't call Put, so no blocking).
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: []byte("discard"), Done: false,
+	}))
+
+	// Launch receiver before sending done frame to avoid Put blocking.
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		data, err := st.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
+	})
+
+	// m2 arrives, m1 data should be silently discarded.
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 2}, Kind: drpcwire.KindMessage, Data: []byte("kept"), Done: true,
+	}))
+
+	// Verify only m2's data was delivered.
+	assert.DeepEqual(t, <-recv, []byte("kept"))
+}
+
+// Continuation frames (same message ID, mid-assembly) must carry the same
+// kind as the first frame. A kind change mid-packet is a protocol error.
+func TestHandleFrame_KindChangeWithinPacket(t *testing.T) {
+	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Done: false,
+	}))
+
+	err := st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindError, Done: true,
+	})
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "kind change"))
+}
+
+// Multiple continuation frames for the same message accumulate data correctly.
+func TestHandleFrame_MultiFrameDataAccumulation(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+
+	// Continuation frames (done=false) don't call Put, so no blocking.
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: []byte("hel"), Done: false,
+	}))
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: []byte("lo "), Done: false,
+	}))
+
+	// Launch receiver before the final frame to avoid Put blocking.
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		data, err := st.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
+	})
+
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: []byte("world"), Done: true,
+	}))
+
+	assert.DeepEqual(t, <-recv, []byte("hello world"))
+}
+
+// Multi-frame assembly works when the message ID is greater than nextMessageID
+// (e.g., on the server side where invoke consumed earlier message IDs).
+// Continuation frames must accumulate data, not reset on each frame.
+func TestHandleFrame_MultiFrameWithSkippedMessageID(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+
+	// msg=3 is greater than nextMessageID=1. Continuation frames for the
+	// same message must still accumulate correctly.
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 3}, Kind: drpcwire.KindMessage, Data: []byte("hel"), Done: false,
+	}))
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 3}, Kind: drpcwire.KindMessage, Data: []byte("lo"), Done: false,
+	}))
+
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		data, err := st.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
+	})
+
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 3}, Kind: drpcwire.KindMessage, Data: []byte(" world"), Done: true,
+	}))
+
+	assert.DeepEqual(t, <-recv, []byte("hello world"))
+}
+
+// Once a message completes (done=true), the same message ID is rejected.
+func TestHandleFrame_DonePreventsReplay(t *testing.T) {
+	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+	// Close packet buffer so KindMessage delivery doesn't block.
+	st.pbuf.Close(io.EOF)
+
+	// m1 completes → nextMessageID becomes 2.
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Done: true,
+	}))
+
+	// Same message ID again → error.
+	err := st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Done: true,
+	})
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "monotonicity"))
+}
+
+// Kind consistency is only enforced within a packet (continuation frames), not
+// across messages. A multi-frame KindMessage followed by a KindClose for the
+// next message should be accepted without error.
+func TestHandleFrame_MultiFrameThenNextMessage(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: []byte("ab"), Done: false,
+	}))
+
+	// Launch receiver before done frame.
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		data, err := st.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
+	})
+
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: []byte("cd"), Done: true,
+	}))
+	assert.DeepEqual(t, <-recv, []byte("abcd"))
+
+	// Message 2 with a different kind — should not trigger kind check.
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 2}, Kind: drpcwire.KindClose, Done: true,
+	}))
+
+	// Close triggers EOF on recv.
+	ctx.Run(func(ctx context.Context) {
+		_, err := st.RawRecv()
+		assert.That(t, errors.Is(err, io.EOF))
+	})
+	ctx.Wait()
+}
+
+// Invoke and InvokeMetadata frames are rejected on an already-created stream.
+func TestHandleFrame_InvokeOnExistingStream(t *testing.T) {
+	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+
+	err := handleFrame(st, drpcwire.KindInvoke, 1)
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "invoke on existing stream"))
+}
+
+func TestHandleFrame_InvokeMetadataOnExistingStream(t *testing.T) {
+	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+
+	err := handleFrame(st, drpcwire.KindInvokeMetadata, 1)
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "invoke on existing stream"))
+}
+
+// Frames arriving after the stream is terminated are silently ignored.
+func TestHandleFrame_AfterTerminated(t *testing.T) {
+	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+
+	// Terminate the stream via cancel.
+	st.Cancel(context.Canceled)
+
+	// Frames after termination are silently ignored.
+	err := st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Done: true,
+	})
+	assert.NoError(t, err)
+}
+
+// A completed KindMessage frame delivers its data through RawRecv.
+func TestHandleFrame_MessageDeliveredViaRecv(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+
+	// Launch receiver before sending to avoid Put blocking.
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		data, err := st.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
+	})
+
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: 1, Message: 1},
+		Kind: drpcwire.KindMessage,
+		Data: []byte("payload"),
+		Done: true,
+	}))
+
+	assert.DeepEqual(t, <-recv, []byte("payload"))
+}
+
+//
+// Write-side tests
+//
+
+func TestRawWrite_NonMessageSingleFrame(t *testing.T) {
+	// Non-KindMessage kinds must produce a single frame (n=0 in
+	// rawWriteLocked means default 64KB, effectively no split for
+	// small payloads). Verify they produce exactly one frame with Done=true.
+	kinds := []drpcwire.Kind{
+		drpcwire.KindInvoke,
+		drpcwire.KindError,
+		drpcwire.KindCancel,
+		drpcwire.KindClose,
+		drpcwire.KindCloseSend,
+		drpcwire.KindInvokeMetadata,
+	}
+
+	for _, kind := range kinds {
+		var buf bytes.Buffer
+		st := New(context.Background(), 1, drpcwire.NewWriter(&buf, 0))
+
+		assert.NoError(t, st.RawWrite(kind, []byte("data")))
+		assert.NoError(t, st.RawFlush())
+		var err error
+
+		// Parse all frames from the buffer — should be exactly one.
+		data := buf.Bytes()
+		var frames []drpcwire.Frame
+		for len(data) > 0 {
+			var fr drpcwire.Frame
+			var ok bool
+			data, fr, ok, err = drpcwire.ParseFrame(data)
+			assert.NoError(t, err)
+			assert.That(t, ok)
+			frames = append(frames, fr)
+		}
+		assert.Equal(t, len(frames), 1)
+		assert.That(t, frames[0].Done)
+		assert.Equal(t, frames[0].Kind, kind)
+	}
+}
+
+func TestRawWrite_MessageRespectsSplitSize(t *testing.T) {
+	var buf bytes.Buffer
+	st := NewWithOptions(context.Background(), 1,
+		drpcwire.NewWriter(&buf, 0),
+		Options{SplitSize: 5},
+	)
+
+	// "helloworld" is 10 bytes, split at 5 → 2 frames.
+	assert.NoError(t, st.RawWrite(drpcwire.KindMessage, []byte("helloworld")))
+	assert.NoError(t, st.RawFlush())
+	var err error
+
+	data := buf.Bytes()
+	var frames []drpcwire.Frame
+	for len(data) > 0 {
+		var fr drpcwire.Frame
+		var ok bool
+		data, fr, ok, err = drpcwire.ParseFrame(data)
+		assert.NoError(t, err)
+		assert.That(t, ok)
+		frames = append(frames, fr)
+	}
+	assert.Equal(t, len(frames), 2)
+	assert.That(t, !frames[0].Done)
+	assert.That(t, frames[1].Done)
+	assert.DeepEqual(t, frames[0].Data, []byte("hello"))
+	assert.DeepEqual(t, frames[1].Data, []byte("world"))
 }
