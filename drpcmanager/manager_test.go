@@ -366,7 +366,7 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 
 // The first frame for a new stream must be KindInvoke or KindInvokeMetadata.
 // A non-invoke kind causes a protocol error.
-func Disabled_TestManageReader_FirstFrameMustBeInvoke(t *testing.T) {
+func TestManageReader_FirstFrameMustBeInvoke(t *testing.T) {
 	for _, kind := range []drpcwire.Kind{
 		drpcwire.KindMessage,
 		drpcwire.KindCancel,
