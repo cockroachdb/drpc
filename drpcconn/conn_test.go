@@ -40,31 +40,32 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 	invokeDone := make(chan struct{})
 
 	ctx.Run(func(ctx context.Context) {
-		wr := drpcwire.NewWriter(ps, 64)
+		wr := drpcwire.NewMuxWriter(ps, nil)
+		defer func() { wr.Stop(nil); <-wr.Done() }()
 		rd := drpcwire.NewReader(ps)
 
-		_, _ = rd.ReadPacket()    // Invoke
-		_, _ = rd.ReadPacket()    // Message
-		pkt, _ := rd.ReadPacket() // CloseSend
+		_, _ = rd.ReadFrame()    // Invoke
+		_, _ = rd.ReadFrame()    // Message
+		pkt, _ := rd.ReadFrame() // CloseSend
 
-		_ = wr.WritePacket(drpcwire.Packet{
+		_ = wr.WriteFrame(drpcwire.Frame{
 			Data: []byte("qux"),
 			ID:   drpcwire.ID{Stream: pkt.ID.Stream, Message: 1},
 			Kind: drpcwire.KindMessage,
+			Done: true,
 		})
-		_ = wr.Flush()
 
-		_, _ = rd.ReadPacket() // Close
-		<-invokeDone           // wait for invoke to return
+		_, _ = rd.ReadFrame() // Close
+		<-invokeDone          // wait for invoke to return
 
 		// ensure that any later packets are dropped by writing one
 		// before closing the transport.
-		for i := 0; i < 5; i++ {
-			_ = wr.WritePacket(drpcwire.Packet{
+		for range 5 {
+			_ = wr.WriteFrame(drpcwire.Frame{
 				ID:   drpcwire.ID{Stream: pkt.ID.Stream, Message: 2},
 				Kind: drpcwire.KindCloseSend,
+				Done: true,
 			})
-			_ = wr.Flush()
 		}
 
 		_ = ps.Close()
@@ -78,7 +79,7 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 
 	invokeDone <- struct{}{} // signal invoke has returned
 
-	// we should eventually notice the transport is closed
+	// we should eventually notice the transport is closed due to ps.Close()
 	select {
 	case <-conn.Closed():
 	case <-time.After(1 * time.Second):
@@ -95,10 +96,11 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 	defer func() { assert.NoError(t, ps.Close()) }()
 
 	ctx.Run(func(ctx context.Context) {
-		wr := drpcwire.NewWriter(ps, 64)
+		wr := drpcwire.NewMuxWriter(ps, nil)
+		defer func() { wr.Stop(nil); <-wr.Done() }()
 		rd := drpcwire.NewReader(ps)
 
-		md, err := rd.ReadPacket() // Metadata
+		md, err := rd.ReadFrame() // Metadata
 		assert.NoError(t, err)
 		assert.Equal(t, md.Kind, drpcwire.KindInvokeMetadata)
 		metadata, err := drpcmetadata.Decode(md.Data)
@@ -110,18 +112,18 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"common-key":           "common-value2",
 		})
 
-		_, _ = rd.ReadPacket()    // Invoke
-		_, _ = rd.ReadPacket()    // Message
-		pkt, _ := rd.ReadPacket() // CloseSend
+		_, _ = rd.ReadFrame()    // Invoke
+		_, _ = rd.ReadFrame()    // Message
+		pkt, _ := rd.ReadFrame() // CloseSend
 
-		_ = wr.WritePacket(drpcwire.Packet{
+		_ = wr.WriteFrame(drpcwire.Frame{
 			Data: []byte("qux"),
 			ID:   drpcwire.ID{Stream: pkt.ID.Stream, Message: 1},
 			Kind: drpcwire.KindMessage,
+			Done: true,
 		})
-		_ = wr.Flush()
 
-		_, _ = rd.ReadPacket() // Close
+		_, _ = rd.ReadFrame() // Close
 	})
 
 	conn := New(pc)
@@ -154,7 +156,7 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	ctx.Run(func(ctx context.Context) {
 		rd := drpcwire.NewReader(ps)
 
-		md, err := rd.ReadPacket() // Metadata
+		md, err := rd.ReadFrame() // Metadata
 		assert.NoError(t, err)
 		assert.Equal(t, md.Kind, drpcwire.KindInvokeMetadata)
 		metadata, err := drpcmetadata.Decode(md.Data)
@@ -164,8 +166,8 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"drpc-key": "drpc-value",
 		})
 
-		_, _ = rd.ReadPacket() // Invoke
-		_, _ = rd.ReadPacket() // CloseSend
+		_, _ = rd.ReadFrame() // Invoke
+		_, _ = rd.ReadFrame() // CloseSend
 	})
 
 	conn := New(pc)
@@ -181,6 +183,10 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	s, err := conn.NewStream(ctx, "/com.example.Foo/Bar", testEncoding{})
 	assert.NoError(t, err)
 	_ = s.CloseSend()
+
+	// Wait for the server goroutine to read all frames before defers
+	// close the pipe. With MuxWriter, writes are asynchronous.
+	ctx.Wait()
 }
 
 func TestConn_encodeMetadata(t *testing.T) {

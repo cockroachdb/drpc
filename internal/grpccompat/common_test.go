@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zeebo/assert"
 	"github.com/zeebo/errs"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

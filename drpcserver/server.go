@@ -12,7 +12,6 @@ import (
 
 	"github.com/zeebo/errs"
 	"storj.io/drpc"
-	"storj.io/drpc/drpccache"
 	"storj.io/drpc/drpcctx"
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcmetrics"
@@ -161,22 +160,28 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		}
 	}
 
-	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
-	defer func() { err = errs.Combine(err, man.Close()) }()
-
-	cache := drpccache.New()
-	defer cache.Clear()
-
-	ctx = drpccache.WithContext(ctx, cache)
+	man := drpcmanager.NewWithOptions(tr, drpcmanager.Server, s.opts.Manager)
+	var wg sync.WaitGroup
+	defer func() {
+		wg.Wait()
+		err = errs.Combine(err, man.Close())
+	}()
 
 	for {
 		stream, rpc, err := man.NewServerStream(ctx)
 		if err != nil {
 			return errs.Wrap(err)
 		}
-		if err := s.handleRPC(stream, rpc); err != nil {
-			return errs.Wrap(err)
-		}
+		// TODO: add worker pool
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.handleRPC(stream, rpc); err != nil {
+				if s.opts.Log != nil {
+					s.opts.Log(err)
+				}
+			}
+		}()
 	}
 }
 

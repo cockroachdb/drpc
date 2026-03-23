@@ -4,10 +4,10 @@
 package drpcstream
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/zeebo/assert"
@@ -18,15 +18,32 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
+// testMuxWriter creates a MuxWriter that writes to io.Discard with a no-op
+// error handler. The writer goroutine is stopped when the test finishes.
+func testMuxWriter(t *testing.T) *drpcwire.MuxWriter {
+	t.Helper()
+	mw := drpcwire.NewMuxWriter(io.Discard, func(error) {})
+	t.Cleanup(func() { mw.Stop(nil); <-mw.Done() })
+	return mw
+}
+
+// handleFrame is a helper that sends a single-frame packet to the stream.
+// It constructs a frame with the given kind, matching the stream's ID,
+// using the provided message ID, done=true.
+func handleFrame(st *Stream, kind drpcwire.Kind, mid uint64) error {
+	return st.HandleFrame(drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: st.ID(), Message: mid},
+		Kind: kind,
+		Done: true,
+	})
+}
+
 func TestStream_StateTransitions(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
+	mw := testMuxWriter(t)
 	any := errors.New("any sentinel error")
-
-	handlePacket := func(st *Stream, kind drpcwire.Kind) error {
-		return st.HandlePacket(drpcwire.Packet{Kind: kind})
-	}
 
 	checkErrs := func(t *testing.T, exp interface{}, got error) {
 		t.Helper()
@@ -81,32 +98,32 @@ func TestStream_StateTransitions(t *testing.T) {
 		},
 
 		{ // recv close
-			Op:   func(st *Stream) error { return handlePacket(st, drpcwire.KindClose) },
+			Op:   func(st *Stream) error { return handleFrame(st, drpcwire.KindClose, 1) },
 			Send: &drpc.ClosedError,
 			Recv: io.EOF,
 		},
 
 		{ // recv error
-			Op:   func(st *Stream) error { return handlePacket(st, drpcwire.KindError) },
+			Op:   func(st *Stream) error { return handleFrame(st, drpcwire.KindError, 1) },
 			Send: io.EOF,
 			Recv: any,
 		},
 
 		{ // recv closesend
-			Op:   func(st *Stream) error { return handlePacket(st, drpcwire.KindCloseSend) },
+			Op:   func(st *Stream) error { return handleFrame(st, drpcwire.KindCloseSend, 1) },
 			Send: nil,
 			Recv: io.EOF,
 		},
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+		st := New(ctx, 1, mw)
 		assert.NoError(t, test.Op(st))
 
 		checkErrs(t, test.Send, st.RawWrite(drpcwire.KindMessage, nil))
 
 		if test.Recv == nil {
-			ctx.Run(func(ctx context.Context) { _ = handlePacket(st, drpcwire.KindMessage) })
+			ctx.Run(func(ctx context.Context) { _ = handleFrame(st, drpcwire.KindMessage, 2) })
 		}
 		_, err := st.RawRecv()
 		checkErrs(t, test.Recv, err)
@@ -117,9 +134,7 @@ func TestStream_Unblocks(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
-	handlePacket := func(st *Stream, kind drpcwire.Kind) error {
-		return st.HandlePacket(drpcwire.Packet{Kind: kind})
-	}
+	mw := testMuxWriter(t)
 
 	cases := []struct {
 		Op func(st *Stream) error
@@ -141,20 +156,20 @@ func TestStream_Unblocks(t *testing.T) {
 		},
 
 		{ // recv close
-			Op: func(st *Stream) error { return handlePacket(st, drpcwire.KindClose) },
+			Op: func(st *Stream) error { return handleFrame(st, drpcwire.KindClose, 1) },
 		},
 
 		{ // recv error
-			Op: func(st *Stream) error { return handlePacket(st, drpcwire.KindError) },
+			Op: func(st *Stream) error { return handleFrame(st, drpcwire.KindError, 1) },
 		},
 
 		{ // recv closesend
-			Op: func(st *Stream) error { return handlePacket(st, drpcwire.KindCloseSend) },
+			Op: func(st *Stream) error { return handleFrame(st, drpcwire.KindCloseSend, 1) },
 		},
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+		st := New(ctx, 1, mw)
 
 		ctx.Run(func(ctx context.Context) { _, _ = st.RawRecv() })
 		assert.NoError(t, test.Op(st))
@@ -164,7 +179,8 @@ func TestStream_Unblocks(t *testing.T) {
 
 func TestStream_ContextCancel(t *testing.T) {
 	ctx := context.Background()
-	st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+	mw := testMuxWriter(t)
+	st := New(ctx, 0, mw)
 
 	child, cancel := context.WithCancel(st.Context())
 	defer cancel()
@@ -178,86 +194,20 @@ func TestStream_ConcurrentCloseCancel(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
-	pr, pw := io.Pipe()
-	defer func() { _ = pr.Close() }()
-	defer func() { _ = pw.Close() }()
+	mw := testMuxWriter(t)
+	st := New(ctx, 0, mw)
 
-	st := New(ctx, 0, drpcwire.NewWriter(pw, 0))
-
-	// start the Close call
+	// Close and Cancel concurrently should not panic or deadlock.
 	errch := make(chan error, 1)
 	go func() { errch <- st.Close() }()
 
-	// wait for the close to begin writing
-	_, err := pr.Read(make([]byte, 1))
-	assert.NoError(t, err)
-
-	// cancel the context and close the transport
 	st.Cancel(context.Canceled)
-	assert.NoError(t, pw.Close())
 
-	// we should always receive the canceled error
-	assert.That(t, errors.Is(<-errch, context.Canceled))
-}
-
-func TestStream_Control(t *testing.T) {
-	st := New(context.Background(), 0, drpcwire.NewWriter(io.Discard, 0))
-
-	// N.B. the stream will return nil on any HandlePacket calls after the
-	// stream has been terminated for any reason, including if an invalid
-	// packet has been sent. the order of these two assertions is important!
-
-	// an invalid packet is not an error if the control bit is set
-	assert.NoError(t, st.HandlePacket(drpcwire.Packet{Control: true}))
-
-	// an invalid packet is an error if the control bit it not set
-	assert.That(t, drpc.InternalError.Has(st.HandlePacket(drpcwire.Packet{})))
-}
-
-func TestStream_CorkUntilFirstRead(t *testing.T) {
-	run := func() {
-		ctx := drpctest.NewTracker(t)
-		defer ctx.Close()
-
-		var buf bytes.Buffer
-		st := New(ctx, 0, drpcwire.NewWriter(&buf, 50))
-
-		// concurrently read and write at the same time.
-		// we should always see the write happen.
-
-		errch := make(chan error, 3)
-		ctx.Run(func(ctx context.Context) {
-			errch <- st.MsgSend([]byte("write"), byteEncoding{})
-		})
-		ctx.Run(func(ctx context.Context) {
-			_, err := st.RawRecv()
-			errch <- err
-		})
-		ctx.Run(func(ctx context.Context) {
-			errch <- st.HandlePacket(drpcwire.Packet{
-				Data: []byte("read"),
-				ID:   drpcwire.ID{Message: 1},
-				Kind: drpcwire.KindMessage,
-			})
-		})
-
-		assert.NoError(t, <-errch)
-		assert.NoError(t, <-errch)
-		assert.NoError(t, <-errch)
-
-		assert.Equal(t, buf.String(), "\x05\x00\x01\x05write")
+	// Close returns nil or context.Canceled depending on timing.
+	err := <-errch
+	if err != nil {
+		assert.That(t, errors.Is(err, context.Canceled))
 	}
-	for i := 0; i < 100; i++ {
-		run()
-	}
-}
-
-type byteEncoding struct{}
-
-func (byteEncoding) Marshal(msg drpc.Message) ([]byte, error) { return msg.([]byte), nil }
-func (byteEncoding) Unmarshal(buf []byte, msg drpc.Message) error {
-	*msg.(*[]byte) = append(*msg.(*[]byte), buf...)
-	return nil
 }
 
 func TestStream_PacketBufferReuse(t *testing.T) {
@@ -266,20 +216,25 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 		defer ctx.Close()
 		defer ctx.Wait()
 
-		buf := make([]byte, 20)
-		st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+		mw := testMuxWriter(t)
+		data := make([]byte, 20)
+		mid := uint64(1)
+		st := New(ctx, 1, mw)
 
 		ctx.Run(func(ctx context.Context) {
 			for !st.IsTerminated() {
-				err := st.HandlePacket(drpcwire.Packet{
-					Data: buf,
+				err := st.HandleFrame(drpcwire.Frame{
+					Data: data,
+					ID:   drpcwire.ID{Stream: 1, Message: mid},
 					Kind: drpcwire.KindMessage,
+					Done: true,
 				})
 				if err != nil {
 					return
 				}
-				for i := range buf {
-					buf[i]++
+				mid++
+				for i := range data {
+					data[i]++
 				}
 			}
 		})
@@ -303,27 +258,81 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 	}
 }
 
-func TestStream_SendCancelBusyDuringBlockedClose(t *testing.T) {
+//
+// HandleFrame tests
+//
+
+func TestHandleFrame_FirstFrameOnFreshStream(t *testing.T) {
+	mw := testMuxWriter(t)
+	for _, messageID := range []uint64{1, 2} {
+		st := New(context.Background(), 1, mw)
+		// Close the ring buffer so KindMessage Enqueue doesn't block.
+		st.recvQueue.Close(io.EOF)
+		err := st.HandleFrame(drpcwire.Frame{
+			ID: drpcwire.ID{Stream: 1, Message: messageID}, Kind: drpcwire.KindMessage, Done: true,
+		})
+		assert.NoError(t, err)
+	}
+}
+
+// Invoke and InvokeMetadata frames are rejected on an already-created stream.
+func TestHandleFrame_InvokeOnExistingStream(t *testing.T) {
+	mw := testMuxWriter(t)
+	st := New(context.Background(), 1, mw)
+
+	err := handleFrame(st, drpcwire.KindInvoke, 1)
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "invoke on existing stream"))
+}
+
+func TestHandleFrame_InvokeMetadataOnExistingStream(t *testing.T) {
+	mw := testMuxWriter(t)
+	st := New(context.Background(), 1, mw)
+
+	err := handleFrame(st, drpcwire.KindInvokeMetadata, 1)
+	assert.Error(t, err)
+	assert.That(t, drpc.ProtocolError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "invoke on existing stream"))
+}
+
+// Frames arriving after the stream is terminated are silently ignored.
+func TestHandleFrame_AfterTerminated(t *testing.T) {
+	mw := testMuxWriter(t)
+	st := New(context.Background(), 1, mw)
+
+	// Terminate the stream via cancel.
+	st.Cancel(context.Canceled)
+
+	// Frames after termination are silently ignored.
+	err := st.HandleFrame(drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Done: true,
+	})
+	assert.NoError(t, err)
+}
+
+// A completed KindMessage frame delivers its data through RawRecv.
+func TestHandleFrame_MessageDeliveredViaRecv(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
-	pr, pw := io.Pipe()
-	defer func() { _ = pr.Close() }()
-	defer func() { _ = pw.Close() }()
+	mw := testMuxWriter(t)
+	st := New(ctx, 1, mw)
 
-	st := New(ctx, 0, drpcwire.NewWriter(pw, 0))
+	// Launch receiver before sending to avoid Put blocking.
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		data, err := st.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
+	})
 
-	// launch a goroutine to close the stream
-	ctx.Run(func(ctx context.Context) { _ = st.Close() })
+	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: 1, Message: 1},
+		Kind: drpcwire.KindMessage,
+		Data: []byte("payload"),
+		Done: true,
+	}))
 
-	// read just 1 byte from the pipe to ensure that the Close has started
-	_, err := pr.Read(make([]byte, 1))
-	assert.NoError(t, err)
-	assert.That(t, st.IsTerminated())
-
-	// even though the stream is terminated, soft cancel should report that
-	// the stream is still busy because the close is being sent.
-	busy, err := st.SendCancel(context.Canceled)
-	assert.NoError(t, err)
-	assert.That(t, busy)
+	assert.DeepEqual(t, <-recv, []byte("payload"))
 }

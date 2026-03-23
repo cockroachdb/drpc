@@ -10,8 +10,9 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
@@ -29,29 +30,11 @@ var managerClosed = errs.Class("manager closed")
 
 // Options controls configuration settings for a manager.
 type Options struct {
-	// WriterBufferSize controls the size of the buffer that we will fill before
-	// flushing. Normal writes to streams typically issue a flush explicitly.
-	WriterBufferSize int
-
 	// Reader are passed to any readers the manager creates.
 	Reader drpcwire.ReaderOptions
 
 	// Stream are passed to any streams the manager creates.
 	Stream drpcstream.Options
-
-	// SoftCancel controls if a context cancel will cause the transport to be
-	// closed or, if true, a soft cancel message will be attempted if possible.
-	// A soft cancel can reduce the amount of closed and dialed connections at
-	// the potential cost of higher latencies if there is latent data still
-	// being flushed when the cancel happens.
-	SoftCancel bool
-
-	// InactivityTimeout is the amount of time the manager will wait when
-	// creating a NewServerStream. It only includes the time it is reading
-	// packets from the remote client. In other words, it only includes the time
-	// that the client could delay before invoking an RPC. If zero or negative,
-	// no timeout is used.
-	InactivityTimeout time.Duration
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
@@ -68,65 +51,90 @@ type Options struct {
 // to the appropriate stream.
 type Manager struct {
 	tr   drpc.Transport
-	wr   *drpcwire.Writer
+	wr   *drpcwire.MuxWriter
 	rd   *drpcwire.Reader
 	opts Options
 
-	sem     drpcsignal.Chan      // held by the active stream
-	sbuf    streamBuffer         // largest stream id created
-	pkts    chan drpcwire.Packet // channel for invoke packets
-	pdone   drpcsignal.Chan      // signals when a packets buffers can be reused
-	sfin    chan struct{}        // shared signal for stream finished
-	streams chan streamInfo      // channel to signal that a stream should start
+	// next client stream ID, incremented atomically
+	lastStreamID atomic.Uint64
+
+	wg sync.WaitGroup // tracks active manageStream goroutines
+
+	// streams tracks active streams.
+	streams *activeStreams
+
+	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream
+	invokes chan invokeInfo // completed invoke info from manageReader to NewServerStream
+
+	// pendingStreams is owned by the manageReader goroutine, used in
+	// handleInvokeFrame. It tracks streams that are being assembled from
+	// invoke/metadata frames but haven't been fully created yet.
+	pendingStreams map[uint64]*pendingStream
 
 	sigs struct {
-		term   drpcsignal.Signal // set when the manager should start terminating
-		stream drpcsignal.Signal // set when the manage streams goroutine is done
-		read   drpcsignal.Signal // set after the goroutine reading from the transport is done
-		tport  drpcsignal.Signal // set after the transport has been closed
+		term  drpcsignal.Signal // set when the manager should start terminating
+		read  drpcsignal.Signal // set after the goroutine reading from the transport is done
+		tport drpcsignal.Signal // set after the transport has been closed
 	}
+
+	kind ManagerKind
 }
 
-type streamInfo struct {
-	ctx    context.Context
-	stream *drpcstream.Stream
+type ManagerKind uint8
+
+const (
+	_ ManagerKind = iota
+	Client
+	Server
+)
+
+// pendingStream accumulates invoke and metadata frames for a stream that is
+// being set up but hasn't been fully created yet. Once the invoke packet
+// arrives, the pending stream is forwarded to NewServerStream.
+type pendingStream struct {
+	metadata map[string]string        // accumulated invoke metadata
+	pa       drpcwire.PacketAssembler // assembles invoke/metadata frames into packets
+}
+
+// invokeInfo carries the assembled invoke data from manageReader to
+// NewServerStream. It is reused across invocations; call Reset between uses.
+type invokeInfo struct {
+	sid      uint64
+	metadata map[string]string
+	data     []byte // RPC name bytes from the KindInvoke packet
 }
 
 // New returns a new Manager for the transport.
-func New(tr drpc.Transport) *Manager {
-	return NewWithOptions(tr, Options{})
+func New(tr drpc.Transport, kind ManagerKind) *Manager {
+	return NewWithOptions(tr, kind, Options{})
 }
 
 // NewWithOptions returns a new manager for the transport. It uses the provided
 // options to manage details of how it uses it.
-func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
+func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager {
 	m := &Manager{
 		tr:   tr,
-		wr:   drpcwire.NewWriter(tr, opts.WriterBufferSize),
 		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
 
-		pkts:    make(chan drpcwire.Packet),
-		sfin:    make(chan struct{}, 1),
-		streams: make(chan streamInfo),
+		invokes: make(chan invokeInfo),
+		kind:    kind,
 	}
 
-	// initialize the stream buffer
-	m.sbuf.init()
+	m.wr = drpcwire.NewMuxWriter(tr, m.terminate)
 
-	// this semaphore controls the number of concurrent streams. it MUST be 1.
-	m.sem.Make(1)
-
-	// a buffer of size 1 allows the consumer of the packet to signal it is done
-	// without having to coordinate with the sender of the packet.
+	// a buffer of size 1 allows NewServerStream to signal it is done creating a
+	// new server stream without having to coordinate with manageReader.
 	m.pdone.Make(1)
+
+	m.pendingStreams = make(map[uint64]*pendingStream)
+
+	m.streams = newActiveStreams()
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
-	drpcopts.SetStreamFin(&m.opts.Stream.Internal, m.sfin)
 
 	go m.manageReader()
-	go m.manageStreams()
 
 	return m
 }
@@ -140,72 +148,23 @@ func (m *Manager) log(what string, cb func() string) {
 	}
 }
 
-//
-// helpers
-//
-
-// acquireSemaphore attempts to acquire the semaphore protecting streams. If the
-// context is canceled or the manager is terminated, it returns an error.
-func (m *Manager) acquireSemaphore(ctx context.Context) error {
-	if err, ok := m.sigs.term.Get(); ok {
-		return err
-	} else if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-
-	case <-m.sigs.term.Signal():
-		return m.sigs.term.Err()
-
-	case m.sem.Get() <- struct{}{}:
-		if err := m.waitForPreviousStream(ctx); err != nil {
-			m.sem.Recv()
-			return err
-		}
-		return nil
-	}
-}
-
-// waitForPreviousStream will, if there was a previous stream, ensure it is
-// Closed and then wait until it is in the Finished state, where it will no
-// longer make any reads or writes on the transport. It exits early if the
-// context is canceled or the manager is terminated.
-func (m *Manager) waitForPreviousStream(ctx context.Context) (err error) {
-	prev := m.sbuf.Get()
-	if prev == nil {
-		return nil
-	}
-
-	// if the stream is not finished yet, we need to wait for it to be
-	// finished before letting the next stream to start.
-	if prev.IsFinished() {
-		return nil
-	}
-
-	m.log("WAIT", prev.String)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-
-	case <-m.sigs.term.Signal():
-		return m.sigs.term.Err()
-
-	case <-prev.Finished():
-		return nil
-	}
-}
-
 // terminate puts the Manager into a terminal state and closes any resources
-// that need to be closed to signal the state change.
+// that need to be closed to signal the state change. The mux writer is stopped
+// before closing the transport so that WriteFrame immediately rejects new
+// writes; the subsequent transport close unblocks any in-flight Write in the
+// drain goroutine.
 func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
+		if errors.Is(err, io.EOF) {
+			err = context.Canceled
+			if m.kind == Client {
+				err = drpc.ClosedError.New("connection closed")
+			}
+		}
+		m.wr.Stop(err)
 		m.sigs.tport.Set(m.tr.Close())
-		m.sbuf.Close()
+		m.streams.Close(err)
 	}
 }
 
@@ -213,27 +172,15 @@ func (m *Manager) terminate(err error) {
 // manage reader
 //
 
-// manageReader is always reading a packet and dispatching it to the appropriate
-// stream or queue. It sets the read signal when it exits so that one can wait
-// to ensure that no one is reading on the reader. It sets the term signal if
-// there is any error reading packets.
+// manageReader reads the frame and dispatches them to the appropriate stream or
+// queue. It sets the read signal when it exits so that one can wait to ensure
+// that no one is reading on the reader. It sets the term signal if there is any
+// error reading frames.
 func (m *Manager) manageReader() {
 	defer m.sigs.read.Set(nil)
 
-	var pkt drpcwire.Packet
-	var err error
-	var run int
-
 	for !m.sigs.term.IsSet() {
-		// if we have a run of "small" packets, drop the buffer to release
-		// memory so that a burst of large packets does not cause eternally
-		// large heap usage.
-		if run > 10 {
-			pkt.Data = nil
-			run = 0
-		}
-
-		pkt, err = m.rd.ReadPacketUsing(pkt.Data[:0])
+		incomingFrame, err := m.rd.ReadFrame()
 		if err != nil {
 			if isConnectionReset(err) {
 				err = drpc.ClosedError.Wrap(err)
@@ -242,55 +189,70 @@ func (m *Manager) manageReader() {
 			return
 		}
 
-		if len(pkt.Data) < cap(pkt.Data)/4 {
-			run++
-		} else {
-			run = 0
-		}
+		m.log("READ", incomingFrame.String)
 
-		m.log("READ", pkt.String)
+		stream, ok := m.streams.Get(incomingFrame.ID.Stream)
 
-	again:
-		switch curr := m.sbuf.Get(); {
-		// if the packet is for the current stream, deliver it.
-		case curr != nil && pkt.ID.Stream == curr.ID():
-			if err := curr.HandlePacket(pkt); err != nil {
+		switch {
+		// if the packet is for an active stream, deliver it.
+		case ok:
+			if err := stream.HandleFrame(incomingFrame); err != nil {
 				m.terminate(managerClosed.Wrap(err))
 				return
 			}
 
-		// if an old message has been sent, just ignore it.
-		case curr != nil && pkt.ID.Stream < curr.ID():
-
-		// if any invoke sequence is being sent, close any old unterminated
-		// stream and forward it to be handled.
-		case pkt.Kind == drpcwire.KindInvoke || pkt.Kind == drpcwire.KindInvokeMetadata:
-			if curr != nil && !curr.IsTerminated() {
-				curr.Cancel(context.Canceled)
-			}
-
-			select {
-			case m.pkts <- pkt:
-				m.pdone.Recv()
-
-			case <-m.sigs.term.Signal():
+		case incomingFrame.Kind == drpcwire.KindInvoke || incomingFrame.Kind == drpcwire.KindInvokeMetadata:
+			if err := m.handleInvokeFrame(incomingFrame); err != nil {
+				m.terminate(managerClosed.Wrap(err))
 				return
 			}
 
-		// a non-invoke packet should be delivered to some stream so we wait for
-		// a new stream to be created and try again. like an invoke, we
-		// implicitly close any previous stream.
+		// silently drop packet for an unknown stream
 		default:
-			if curr != nil && !curr.IsTerminated() {
-				curr.Cancel(context.Canceled)
-			}
-
-			if !m.sbuf.Wait(curr.ID()) {
-				return
-			}
-			goto again
+			m.log("DROP", incomingFrame.String)
 		}
 	}
+}
+
+// handleInvokeFrame assembles invoke/metadata frames into complete packets and
+// forwards the finished invoke info to NewServerStream. Metadata packets are
+// accumulated; the invoke packet triggers the send.
+func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
+	ps, ok := m.pendingStreams[fr.ID.Stream]
+	if !ok {
+		ps = &pendingStream{pa: drpcwire.NewPacketAssembler()}
+		m.pendingStreams[fr.ID.Stream] = ps
+	}
+	pkt, packetReady, err := ps.pa.AppendFrame(fr)
+	if err != nil {
+		return err
+	}
+	if !packetReady {
+		return nil
+	}
+
+	// Metadata arrives before invoke; accumulate it and wait for the invoke.
+	if pkt.Kind == drpcwire.KindInvokeMetadata {
+		meta, err := drpcmetadata.Decode(pkt.Data)
+		if err != nil {
+			return err
+		}
+		ps.metadata = meta
+		return nil
+	}
+
+	// Invoke packet completes the sequence. Send to NewServerStream.
+	select {
+	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: ps.metadata}:
+		// Wait for NewServerStream to finish stream creation before reading the
+		// next frame. This guarantees curr is set for subsequent non-invoke
+		// packets.
+		m.pdone.Recv()
+		// TODO: reuse pending stream
+		delete(m.pendingStreams, fr.ID.Stream)
+	case <-m.sigs.term.Signal():
+	}
+	return nil
 }
 
 //
@@ -307,88 +269,36 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 	}
 
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
-	select {
-	case m.streams <- streamInfo{ctx: ctx, stream: stream}:
-		m.sbuf.Set(stream)
-		m.log("STREAM", stream.String)
-		return stream, nil
 
-	case <-m.sigs.term.Signal():
-		return nil, m.sigs.term.Err()
+	if err := m.streams.Add(sid, stream); err != nil {
+		return nil, err
 	}
-}
 
-// manageStreams reads from the streams channel for stream infos and runs the
-// manageStream function on them.
-func (m *Manager) manageStreams() {
-	defer m.sigs.stream.Set(nil)
+	m.wg.Add(1)
+	go m.manageStream(ctx, stream)
 
-	for {
-		select {
-		case si := <-m.streams:
-			m.manageStream(si.ctx, si.stream)
+	m.log("STREAM", stream.String)
 
-		case <-m.sigs.term.Signal():
-			return
-		}
-	}
+	return stream, nil
 }
 
 // manageStream watches the context and the stream and returns when the stream
 // is finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
+	defer m.wg.Done()
+	defer m.streams.Remove(stream.ID())
 	select {
-	case <-m.sigs.term.Signal():
-		err := m.sigs.term.Err()
-		if errors.Is(err, io.EOF) {
-			err = context.Canceled
-			if stream.Kind() == drpc.StreamKindClient {
-				err = drpc.ClosedError.New("connection closed")
-			}
-		}
-		stream.Cancel(err)
-		<-m.sfin
-		m.sem.Recv()
-
-	case <-m.sfin:
-		m.sem.Recv()
+	case <-stream.Finished():
 
 	case <-ctx.Done():
 		m.log("CANCEL", stream.String)
 
-		if m.opts.SoftCancel {
-			// allow a new stream to begin.
-			m.sem.Recv()
-
-			// attempt to send the soft cancel. if it fails or if the stream is
-			// busy sending something else, then we have to hard cancel.
-			if busy, err := stream.SendCancel(ctx.Err()); err != nil {
-				m.terminate(err)
-			} else if busy {
-				m.log("BUSY", stream.String)
-				m.terminate(ctx.Err())
-			}
-			stream.Cancel(ctx.Err())
-
-			// wait for the stream to signal that it is finished.
-			<-m.sfin
-		} else {
-			// If the stream isn't already finished, we have to terminate the
-			// transport to do an active cancel. If it is already finished,
-			// there is no need.
-			if !stream.Cancel(ctx.Err()) {
-				m.log("UNFIN", stream.String)
-				m.terminate(ctx.Err())
-			} else {
-				m.log("CLEAN", stream.String)
-			}
-
-			// wait for the stream to signal that it is finished.
-			<-m.sfin
-
-			// allow a new stream to begin.
-			m.sem.Recv()
+		if err := stream.SendCancel(ctx.Err()); err != nil {
+			// SendCancel can fail if it's an IO error which reader will catch.
+			m.log("SendCancel", func() string { return fmt.Sprintf("%s: %s", stream.String(), err) })
 		}
+		stream.Cancel(ctx.Err())
+		<-stream.Finished()
 	}
 }
 
@@ -402,14 +312,12 @@ func (m *Manager) Closed() <-chan struct{} {
 }
 
 // Unblocked returns a channel that is closed when the manager is no longer
-// blocked from creating a new stream due to a previous stream's soft cancel. It
-// should not be called concurrently with NewClientStream or NewServerStream and
-// the return result is only valid until the next call to NewClientStream or
-// NewServerStream.
+// blocked. With multiplexing, multiple streams run concurrently and this
+// channel is always closed immediately.
+//
+// TODO(shubham): audit whether this is still useful in a multiplexing world.
+// The only meaningful caller is Pool.Take.
 func (m *Manager) Unblocked() <-chan struct{} {
-	if prev := m.sbuf.Get(); prev != nil {
-		return prev.Context().Done()
-	}
 	return closedCh
 }
 
@@ -417,8 +325,9 @@ func (m *Manager) Unblocked() <-chan struct{} {
 func (m *Manager) Close() error {
 	m.terminate(managerClosed.New("Close called"))
 
-	m.sigs.stream.Wait()
-	m.sigs.read.Wait()
+	<-m.wr.Done()      // wait for writer goroutine to exit
+	m.wg.Wait()        // wait for all stream goroutines
+	m.sigs.read.Wait() // wait for reader goroutine to exit
 	m.sigs.tport.Wait()
 
 	return m.sigs.tport.Err()
@@ -426,89 +335,46 @@ func (m *Manager) Close() error {
 
 // NewClientStream starts a stream on the managed transport for use by a client.
 func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpcstream.Stream, err error) {
-	if err := m.acquireSemaphore(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	return m.newStream(ctx, m.sbuf.Get().ID()+1, drpc.StreamKindClient, rpc)
+	return m.newStream(ctx, m.lastStreamID.Add(1), drpc.StreamKindClient, rpc)
 }
 
 // NewServerStream starts a stream on the managed transport for use by a server.
 // It does this by waiting for the client to issue an invoke message and
 // returning the details.
 func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Stream, rpc string, err error) {
-	if err := m.acquireSemaphore(ctx); err != nil {
-		return nil, "", err
-	}
-	defer func() {
-		if err != nil {
-			m.sem.Recv()
-		}
-	}()
+	select {
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
 
-	var meta map[string]string
-	var metaID uint64
-	var timeoutCh <-chan time.Time
+	case <-m.sigs.term.Signal():
+		return nil, "", m.sigs.term.Err()
 
-	// set up the timeout on the context if necessary.
-	if timeout := m.opts.InactivityTimeout; timeout > 0 {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		timeoutCh = timer.C
-	}
-
-	for {
-		select {
-		case <-timeoutCh:
-			return nil, "", context.DeadlineExceeded
-
-		case <-ctx.Done():
-			return nil, "", ctx.Err()
-
-		case <-m.sigs.term.Signal():
-			return nil, "", m.sigs.term.Err()
-
-		case pkt := <-m.pkts:
-			switch pkt.Kind {
-			// keep track of any metadata being sent before an invoke so that we
-			// can include it if the stream id matches the eventual invoke.
-			case drpcwire.KindInvokeMetadata:
-				meta, err = drpcmetadata.Decode(pkt.Data)
-				m.pdone.Send()
-
-				if err != nil {
-					return nil, "", err
+	case pkt := <-m.invokes:
+		rpc = string(pkt.data)
+		if pkt.metadata != nil {
+			if m.opts.GRPCMetadataCompatMode {
+				// Populate incoming metadata as grpc metadata in the
+				// context. This is a short-term fix that will enable us
+				// to send and receive grpc metadata when DRPC is enabled,
+				// without any changes in the calling code.
+				grpcMeta := make(map[string][]string, len(pkt.metadata))
+				for k, v := range pkt.metadata {
+					grpcMeta[k] = []string{v}
 				}
-				metaID = pkt.ID.Stream
-
-			case drpcwire.KindInvoke:
-				rpc = string(pkt.Data)
-				m.pdone.Send()
-
-				if metaID == pkt.ID.Stream {
-					if m.opts.GRPCMetadataCompatMode {
-						// Populate incoming metadata as grpc metadata in the
-						// context. This is a short-term fix that will enable us
-						// to send and receive grpc metadata when DRPC is enabled,
-						// without any changes in the calling code.
-						grpcMeta := make(map[string][]string, len(meta))
-						for k, v := range meta {
-							grpcMeta[k] = []string{v}
-						}
-						ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
-					} else {
-						// Add metadata to the incoming context.
-						ctx = drpcmetadata.NewIncomingContext(ctx, meta)
-					}
-				}
-				stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
-				return stream, rpc, err
-
-			default:
-				// this should never happen, but defensive.
-				m.pdone.Send()
+				ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
+			} else {
+				// Add metadata to the incoming context.
+				ctx = drpcmetadata.NewIncomingContext(ctx, pkt.metadata)
 			}
 		}
+		stream, err := m.newStream(ctx, pkt.sid, drpc.StreamKindServer, rpc)
+		// Signal pdone only after adding the stream so that manageReader sees
+		// the new stream in activeStreams when it reads the next frame.
+		m.pdone.Send()
+		return stream, rpc, err
 	}
 }
 
