@@ -14,6 +14,7 @@ import (
 
 	"github.com/zeebo/assert"
 	grpcmetadata "google.golang.org/grpc/metadata"
+	"storj.io/drpc"
 	"storj.io/drpc/drpcmetadata"
 
 	"storj.io/drpc/drpctest"
@@ -159,6 +160,90 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 	})
 
 	ctx.Wait()
+}
+
+// writeFrames serializes the given frames and writes them to w.
+func writeFrames(t *testing.T, w io.Writer, frames ...drpcwire.Frame) {
+	t.Helper()
+	var buf []byte
+	for _, fr := range frames {
+		buf = drpcwire.AppendFrame(buf, fr)
+	}
+	_, err := w.Write(buf)
+	assert.NoError(t, err)
+}
+
+// createFrame is a shorthand for constructing a Frame.
+func createFrame(kind drpcwire.Kind, sid, mid uint64, data string, done bool) drpcwire.Frame {
+	return drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: sid, Message: mid},
+		Kind: kind,
+		Data: []byte(data),
+		Done: done,
+	}
+}
+
+// waitForClosed blocks until the manager terminates or the timeout expires.
+func waitForClosed(t *testing.T, man *Manager) {
+	t.Helper()
+	select {
+	case <-man.Closed():
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager did not terminate in time")
+	}
+}
+
+// Invoke replay: after [s1,m1,invoke,done=true], lastFrameID is bumped to
+// {1,2}. A replayed [s1,m1,invoke] is caught by the monotonicity check.
+func TestManageReader_InvokeReplayBlocked(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	man := New(sconn)
+	defer func() { _ = man.Close() }()
+
+	ctx.Run(func(ctx context.Context) {
+		_, _, _ = man.NewServerStream(ctx)
+	})
+
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
+	)
+
+	waitForClosed(t, man)
+}
+
+// A second invoke for the same stream ID is rejected — the stream treats
+// it as a protocol error, terminating the manager.
+func TestManageReader_InvokeOnExistingStream(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	man := New(sconn)
+	defer func() { _ = man.Close() }()
+
+	ctx.Run(func(ctx context.Context) {
+		stream, _, err := man.NewServerStream(ctx)
+		assert.NoError(t, err)
+		_ = stream
+	})
+
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
+		createFrame(drpcwire.KindInvoke, 1, 2, "rpc2", true),
+	)
+
+	waitForClosed(t, man)
+	assert.That(t, drpc.ProtocolError.Has(man.sigs.term.Err()))
 }
 
 type blockingTransport chan struct{}

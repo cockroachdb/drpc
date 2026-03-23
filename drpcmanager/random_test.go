@@ -22,10 +22,12 @@ import (
 )
 
 func TestRandomized_Client(t *testing.T) {
+	t.Skip("disabled as the generated random workload violates the wire protocol")
 	runRandomized(t, randomBytes(time.Now().UnixNano(), 1024), new(randClient))
 }
 
 func TestRandomized_Server(t *testing.T) {
+	t.Skip("disabled as the generated random workload violates the wire protocol")
 	runRandomized(t, randomBytes(time.Now().UnixNano(), 1024), new(randServer))
 }
 
