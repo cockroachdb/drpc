@@ -250,7 +250,6 @@ func (m *Manager) manageReader() {
 
 		m.log("READ", pkt.String)
 
-	again:
 		switch curr := m.sbuf.Get(); {
 		// if the packet is for the current stream, deliver it.
 		case curr != nil && pkt.ID.Stream == curr.ID():
@@ -271,24 +270,24 @@ func (m *Manager) manageReader() {
 
 			select {
 			case m.pkts <- pkt:
+				// Wait for NewServerStream to finish stream creation (including
+				// sbuf.Set) before reading the next packet. This guarantees curr
+				// is set for subsequent non-invoke packets.
 				m.pdone.Recv()
 
 			case <-m.sigs.term.Signal():
 				return
 			}
 
-		// a non-invoke packet should be delivered to some stream so we wait for
-		// a new stream to be created and try again. like an invoke, we
-		// implicitly close any previous stream.
 		default:
-			if curr != nil && !curr.IsTerminated() {
-				curr.Cancel(context.Canceled)
-			}
-
-			if !m.sbuf.Wait(curr.ID()) {
-				return
-			}
-			goto again
+			// A non-invoke packet arrived for a stream that doesn't exist yet
+			// (curr is nil or pkt.ID.Stream > curr.ID). The first packet of a
+			// new stream must be KindInvoke or KindInvokeMetadata.
+			m.terminate(managerClosed.Wrap(drpc.ProtocolError.New(
+				"first packet of a new stream must be Invoke, got %v (ID:%v)",
+				pkt.Kind,
+				pkt.ID)))
+			return
 		}
 	}
 }
@@ -483,7 +482,6 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 
 			case drpcwire.KindInvoke:
 				rpc = string(pkt.Data)
-				m.pdone.Send()
 
 				if metaID == pkt.ID.Stream {
 					if m.opts.GRPCMetadataCompatMode {
@@ -502,6 +500,10 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 					}
 				}
 				stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
+				// Signal pdone only after stream registration so that
+				// manageReader sees the new stream via sbuf.Get() when it reads
+				// the next frame.
+				m.pdone.Send()
 				return stream, rpc, err
 
 			default:
