@@ -52,10 +52,7 @@ type Stream struct {
 	read  inspectMutex
 	flush sync.Once
 
-	assembling    bool
-	pktBuf        []byte
-	pktKind       drpcwire.Kind
-	nextMessageID uint64
+	pa drpcwire.PacketAssembler
 
 	id   drpcwire.ID
 	wr   *drpcwire.Writer
@@ -94,6 +91,9 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		}
 	}
 
+	pa := drpcwire.NewPacketAssembler()
+	pa.SetStreamID(sid)
+
 	s := &Stream{
 		ctx: streamCtx{
 			Context: ctx,
@@ -103,7 +103,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		fin:  drpcopts.GetStreamFin(&opts.Internal),
 		task: task,
 
-		nextMessageID: 1,
+		pa: pa,
 
 		id: drpcwire.ID{Stream: sid},
 		wr: wr.Reset(),
@@ -228,47 +228,14 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 		return nil
 	}
 
-	if fr.ID.Stream != s.ID() {
-		return drpc.ProtocolError.New("frame doesn't belong to this stream (fr: %v)", fr.ID)
+	packet, packetReady, err := s.pa.AppendFrame(fr)
+	if err != nil {
+		return err
 	}
-
-	if fr.ID.Message < s.nextMessageID {
-		return drpc.ProtocolError.New(
-			"id monotonicity violation: frame %v has message ID less than expected %v", fr.ID, s.nextMessageID)
-	} else if fr.ID.Message > s.nextMessageID || !s.assembling {
-		s.pktBuf = s.pktBuf[:0]
-		s.assembling = true
-		s.nextMessageID = fr.ID.Message
-	} else if fr.Kind != s.pktKind {
-		return drpc.ProtocolError.New("frame kind change within packet: got %v, expected %v", fr.Kind, s.pktKind)
-	}
-
-	// TODO(shubham): add buf reuse
-	s.pktBuf = append(s.pktBuf, fr.Data...)
-
-	s.pktKind = fr.Kind
-
-	if s.opts.MaximumBufferSize > 0 && len(s.pktBuf) > s.opts.MaximumBufferSize {
-		return drpc.ProtocolError.New("data overflow (len:%d)", len(s.pktBuf))
-	}
-
-	if !fr.Done {
+	if !packetReady {
 		return nil
 	}
-
-	s.assembling = false
-	s.nextMessageID = fr.ID.Message + 1
-
-	err = s.handlePacket(drpcwire.Packet{
-		ID:      fr.ID,
-		Kind:    fr.Kind,
-		Control: fr.Control,
-		Data:    s.pktBuf,
-	})
-
-	// TODO(shubham): add buf reuse
-	s.pktBuf = nil
-	return err
+	return s.handlePacket(packet)
 }
 
 // handlePacket advances the stream state machine by inspecting the packet. It
