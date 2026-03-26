@@ -338,7 +338,7 @@ func TestHandleFrame_WrongStreamID(t *testing.T) {
 	})
 	assert.Error(t, err)
 	assert.That(t, drpc.ProtocolError.Has(err))
-	assert.That(t, strings.Contains(err.Error(), "doesn't belong"))
+	assert.That(t, strings.Contains(err.Error(), "frame stream mismatch"))
 }
 
 // A frame with a message ID lower than a previously completed message is rejected.
