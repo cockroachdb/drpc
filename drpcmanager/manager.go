@@ -80,8 +80,12 @@ type Manager struct {
 	sfin    chan struct{}   // shared signal for stream finished
 	streams chan streamInfo // channel to signal that a stream should start
 
-	newServerStreamInfo chan newStreamInfo // completed invoke info from manageReader to NewServerStream
-	pdone               drpcsignal.Chan    // signals when NewServerStream has registered the new stream
+	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream
+	invokes chan invokeInfo // completed invoke info from manageReader to NewServerStream
+
+	// Below fields are owned by the manageReader goroutine, used in handleInvokeFrame.
+	metadata map[string]string        // accumulated invoke metadata
+	pa       drpcwire.PacketAssembler // assembles invoke/metadata frames into packets
 
 	sigs struct {
 		term   drpcsignal.Signal // set when the manager should start terminating
@@ -91,18 +95,12 @@ type Manager struct {
 	}
 }
 
-// newStreamInfo carries the assembled invoke data from manageReader to
+// invokeInfo carries the assembled invoke data from manageReader to
 // NewServerStream. It is reused across invocations; call Reset between uses.
-type newStreamInfo struct {
+type invokeInfo struct {
 	sid      uint64
 	metadata map[string]string
 	data     []byte // RPC name bytes from the KindInvoke packet
-}
-
-// Reset clears all fields for reuse on the next invoke sequence.
-func (ns *newStreamInfo) Reset() {
-	ns.sid = 0
-	ns.metadata = nil
 }
 
 type streamInfo struct {
@@ -124,7 +122,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
 
-		newServerStreamInfo: make(chan newStreamInfo),
+		invokes: make(chan invokeInfo),
 
 		sfin:    make(chan struct{}, 1),
 		streams: make(chan streamInfo),
@@ -139,6 +137,8 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	// a buffer of size 1 allows NewServerStream to signal it is done
 	// without having to coordinate with manageReader.
 	m.pdone.Make(1)
+
+	m.pa = drpcwire.NewPacketAssembler()
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
@@ -239,9 +239,6 @@ func (m *Manager) terminate(err error) {
 func (m *Manager) manageReader() {
 	defer m.sigs.read.Set(nil)
 
-	invokePktAssembler := drpcwire.NewPacketAssembler()
-	createStreamInfo := newStreamInfo{}
-
 	for !m.sigs.term.IsSet() {
 		incomingFrame, err := m.rd.ReadFrame()
 		if err != nil {
@@ -276,7 +273,7 @@ func (m *Manager) manageReader() {
 			if curr != nil && !curr.IsTerminated() {
 				curr.Cancel(context.Canceled)
 			}
-			if err := m.handleInvokeFrame(&invokePktAssembler, &createStreamInfo, incomingFrame); err != nil {
+			if err := m.handleInvokeFrame(incomingFrame); err != nil {
 				m.terminate(managerClosed.Wrap(err))
 				return
 			}
@@ -305,10 +302,10 @@ func (m *Manager) checkStreamMonotonicity(incomingFrame drpcwire.Frame) bool {
 }
 
 // handleInvokeFrame assembles invoke/metadata frames into complete packets and
-// forwards the finished invoke info to NewServerStream via m.pkts. Metadata
-// packets are accumulated into info; the invoke packet triggers the send.
-func (m *Manager) handleInvokeFrame(pa *drpcwire.PacketAssembler, info *newStreamInfo, fr drpcwire.Frame) error {
-	pkt, packetReady, err := pa.AppendFrame(fr)
+// forwards the finished invoke info to NewServerStream via m.newServerStreamInfo.
+// Metadata packets are accumulated; the invoke packet triggers the send.
+func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
+	pkt, packetReady, err := m.pa.AppendFrame(fr)
 	if err != nil {
 		return err
 	}
@@ -322,22 +319,20 @@ func (m *Manager) handleInvokeFrame(pa *drpcwire.PacketAssembler, info *newStrea
 		if err != nil {
 			return err
 		}
-		info.metadata = meta
+		m.metadata = meta
 		return nil
 	}
 
 	// Invoke packet completes the sequence. Send to NewServerStream.
-	info.sid = pkt.ID.Stream
-	info.data = pkt.Data
-
 	select {
-	case m.newServerStreamInfo <- *info:
+	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: m.metadata}:
 		// Wait for NewServerStream to finish stream creation (including
 		// sbuf.Set) before reading the next frame. This guarantees curr
 		// is set for subsequent non-invoke packets.
 		m.pdone.Recv()
-		pa.Reset()
-		info.Reset()
+
+		m.pa.Reset()
+		m.metadata = nil
 	case <-m.sigs.term.Signal():
 	}
 	return nil
@@ -515,7 +510,7 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 	case <-m.sigs.term.Signal():
 		return nil, "", m.sigs.term.Err()
 
-	case pkt := <-m.newServerStreamInfo:
+	case pkt := <-m.invokes:
 		rpc = string(pkt.data)
 		if pkt.metadata != nil {
 			if m.opts.GRPCMetadataCompatMode {

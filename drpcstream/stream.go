@@ -52,7 +52,7 @@ type Stream struct {
 	read  inspectMutex
 	flush sync.Once
 
-	pb drpcwire.PacketAssembler
+	pa drpcwire.PacketAssembler
 
 	id   drpcwire.ID
 	wr   *drpcwire.Writer
@@ -91,8 +91,8 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		}
 	}
 
-	pb := drpcwire.NewPacketAssembler()
-	pb.SetStreamID(sid)
+	pa := drpcwire.NewPacketAssembler()
+	pa.SetStreamID(sid)
 
 	s := &Stream{
 		ctx: streamCtx{
@@ -103,7 +103,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		fin:  drpcopts.GetStreamFin(&opts.Internal),
 		task: task,
 
-		pb: pb,
+		pa: pa,
 
 		id: drpcwire.ID{Stream: sid},
 		wr: wr.Reset(),
@@ -228,7 +228,7 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 		return nil
 	}
 
-	packet, packetReady, err := s.pb.AppendFrame(fr)
+	packet, packetReady, err := s.pa.AppendFrame(fr)
 	if err != nil {
 		return err
 	}
