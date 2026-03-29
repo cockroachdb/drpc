@@ -76,6 +76,9 @@ type Manager struct {
 	lastFrameID   drpcwire.ID
 	lastFrameKind drpcwire.Kind
 
+	// next client stream ID, incremented atomically
+	lastStreamID atomic.Uint64
+
 	wg sync.WaitGroup // tracks active manageStream goroutines
 
 	sem  drpcsignal.Chan // held by the active stream
@@ -449,7 +452,7 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 		return nil, err
 	}
 
-	return m.newStream(ctx, m.sbuf.Get().ID()+1, drpc.StreamKindClient, rpc)
+	return m.newStream(ctx, m.lastStreamID.Add(1), drpc.StreamKindClient, rpc)
 }
 
 // NewServerStream starts a stream on the managed transport for use by a server.
