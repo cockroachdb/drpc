@@ -45,7 +45,6 @@ type Options struct {
 type Stream struct {
 	ctx  streamCtx
 	opts Options
-	fin  chan<- struct{}
 	task *trace.Task
 
 	write inspectMutex
@@ -100,7 +99,6 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 			tr:      drpcopts.GetStreamTransport(&opts.Internal),
 		},
 		opts: opts,
-		fin:  drpcopts.GetStreamFin(&opts.Internal),
 		task: task,
 
 		pa: pa,
@@ -309,9 +307,6 @@ func (s *Stream) checkFinished() {
 		if s.sigs.fin.Set(nil) {
 			s.log("FIN", func() string { return "" })
 			s.ctx.sig.Set(context.Canceled)
-			if s.fin != nil {
-				s.fin <- struct{}{}
-			}
 			if s.task != nil {
 				s.task.End()
 			}

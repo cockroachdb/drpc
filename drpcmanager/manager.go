@@ -80,7 +80,6 @@ type Manager struct {
 
 	sem  drpcsignal.Chan // held by the active stream
 	sbuf streamBuffer    // largest stream id created
-	sfin chan struct{}   // shared signal for stream finished
 
 	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream
 	invokes chan invokeInfo // completed invoke info from manageReader to NewServerStream
@@ -119,8 +118,6 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 		opts: opts,
 
 		invokes: make(chan invokeInfo),
-
-		sfin: make(chan struct{}, 1),
 	}
 
 	// initialize the stream buffer
@@ -137,7 +134,6 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
-	drpcopts.SetStreamFin(&m.opts.Stream.Internal, m.sfin)
 
 	go m.manageReader()
 
@@ -370,10 +366,10 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 			}
 		}
 		stream.Cancel(err)
-		<-m.sfin
+		<-stream.Finished()
 		m.sem.Recv()
 
-	case <-m.sfin:
+	case <-stream.Finished():
 		m.sem.Recv()
 
 	case <-ctx.Done():
@@ -394,7 +390,7 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 			stream.Cancel(ctx.Err())
 
 			// wait for the stream to signal that it is finished.
-			<-m.sfin
+			<-stream.Finished()
 		} else {
 			// If the stream isn't already finished, we have to terminate the
 			// transport to do an active cancel. If it is already finished,
@@ -407,7 +403,7 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 			}
 
 			// wait for the stream to signal that it is finished.
-			<-m.sfin
+			<-stream.Finished()
 
 			// allow a new stream to begin.
 			m.sem.Recv()
