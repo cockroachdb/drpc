@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -81,8 +82,12 @@ type Manager struct {
 
 	wg sync.WaitGroup // tracks active manageStream goroutines
 
-	sem  drpcsignal.Chan // held by the active stream
-	sbuf streamBuffer    // largest stream id created
+	// reg tracks active streams. Currently holds at most one active stream;
+	// a second may briefly coexist during stream handoff (old stream's
+	// Unregister races with new stream's Register).
+	reg *streamRegistry
+
+	sem drpcsignal.Chan // held by the active stream
 
 	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream
 	invokes chan invokeInfo // completed invoke info from manageReader to NewServerStream
@@ -123,9 +128,6 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 		invokes: make(chan invokeInfo),
 	}
 
-	// initialize the stream buffer
-	m.sbuf.init()
-
 	// this semaphore controls the number of concurrent streams. it MUST be 1.
 	m.sem.Make(1)
 
@@ -134,6 +136,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	m.pdone.Make(1)
 
 	m.pa = drpcwire.NewPacketAssembler()
+	m.reg = newStreamRegistry()
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
@@ -186,7 +189,7 @@ func (m *Manager) acquireSemaphore(ctx context.Context) error {
 // longer make any reads or writes on the transport. It exits early if the
 // context is canceled or the manager is terminated.
 func (m *Manager) waitForPreviousStream(ctx context.Context) (err error) {
-	prev := m.sbuf.Get()
+	prev := m.reg.GetLatest()
 	if prev == nil {
 		return nil
 	}
@@ -217,7 +220,8 @@ func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
 		m.sigs.tport.Set(m.tr.Close())
-		m.sbuf.Close()
+		m.reg.ForEach(func(s *drpcstream.Stream) { s.Close() })
+		m.reg.Close()
 	}
 }
 
@@ -249,7 +253,7 @@ func (m *Manager) manageReader() {
 			return
 		}
 
-		switch curr := m.sbuf.Get(); {
+		switch curr := m.reg.GetLatest(); {
 		// If the frame is for the current stream, deliver it.
 		case curr != nil && incomingFrame.ID.Stream == curr.ID():
 			if err := curr.HandleFrame(incomingFrame); err != nil {
@@ -319,9 +323,9 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	// Invoke packet completes the sequence. Send to NewServerStream.
 	select {
 	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: m.metadata}:
-		// Wait for NewServerStream to finish stream creation (including
-		// sbuf.Set) before reading the next frame. This guarantees curr
-		// is set for subsequent non-invoke packets.
+		// Wait for NewServerStream to finish stream creation before reading the
+		// next frame. This guarantees curr is set for subsequent non-invoke
+		// packets.
 		m.pdone.Recv()
 
 		m.pa.Reset()
@@ -346,10 +350,13 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
 
+	if err := m.reg.Register(sid, stream); err != nil {
+		return nil, err
+	}
+
 	m.wg.Add(1)
 	go m.manageStream(ctx, stream)
 
-	m.sbuf.Set(stream)
 	m.log("STREAM", stream.String)
 
 	return stream, nil
@@ -359,6 +366,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 // is finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 	defer m.wg.Done()
+	defer m.reg.Unregister(stream.ID())
 	select {
 	case <-m.sigs.term.Signal():
 		err := m.sigs.term.Err()
@@ -429,7 +437,7 @@ func (m *Manager) Closed() <-chan struct{} {
 // the return result is only valid until the next call to NewClientStream or
 // NewServerStream.
 func (m *Manager) Unblocked() <-chan struct{} {
-	if prev := m.sbuf.Get(); prev != nil {
+	if prev := m.reg.GetLatest(); prev != nil {
 		return prev.Context().Done()
 	}
 	return closedCh
@@ -506,9 +514,8 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 			}
 		}
 		stream, err := m.newStream(ctx, pkt.sid, drpc.StreamKindServer, rpc)
-		// Signal pdone only after stream registration so that
-		// manageReader sees the new stream via sbuf.Get() when it reads
-		// the next frame.
+		// Signal pdone only after stream registration so that manageReader sees
+		// the new stream in the registry when it reads the next frame.
 		m.pdone.Send()
 		return stream, rpc, err
 	}
