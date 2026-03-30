@@ -82,6 +82,8 @@ func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady boo
 
 	pa.assembling = false
 	pa.pk.ID.Message = fr.ID.Message + 1
-	pa.pk.Data = nil // release buffer; caller owns packet.Data
+	// Reuse the backing array: the caller must consume packet.Data before the
+	// next AppendFrame call, as it will be overwritten.
+	pa.pk.Data = pa.pk.Data[:0]
 	return packet, true, nil
 }
