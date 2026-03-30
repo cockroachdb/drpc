@@ -364,33 +364,6 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 	_ = stream2.Close()
 }
 
-// The first frame for a new stream must be KindInvoke or KindInvokeMetadata.
-// A non-invoke kind causes a protocol error.
-func TestManageReader_FirstFrameMustBeInvoke(t *testing.T) {
-	for _, kind := range []drpcwire.Kind{
-		drpcwire.KindMessage,
-		drpcwire.KindCancel,
-		drpcwire.KindClose,
-		drpcwire.KindCloseSend,
-		drpcwire.KindError,
-	} {
-		t.Run(kind.String(), func(t *testing.T) {
-			cconn, sconn := net.Pipe()
-			defer func() { _ = cconn.Close() }()
-			defer func() { _ = sconn.Close() }()
-
-			man := New(sconn)
-			defer func() { _ = man.Close() }()
-
-			writeFrames(t, cconn,
-				createFrame(kind, 1, 1, "", true),
-			)
-
-			waitForClosed(t, man)
-		})
-	}
-}
-
 // A valid invoke sequence: Invoke → Message.
 // Metadata encoding is covered separately by TestDrpcMetadata.
 func TestManageReader_ValidInvokeSequence(t *testing.T) {

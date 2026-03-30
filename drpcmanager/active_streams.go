@@ -1,0 +1,106 @@
+// Copyright (C) 2026 Cockroach Labs.
+// See LICENSE for copying information.
+
+package drpcmanager
+
+import (
+	"sync"
+
+	"storj.io/drpc/drpcstream"
+)
+
+// activeStreams is a thread-safe map of stream IDs to stream objects.
+// It is used by the Manager to track active streams for lifecycle management.
+type activeStreams struct {
+	mu      sync.RWMutex
+	streams map[uint64]*drpcstream.Stream
+	closed  bool
+}
+
+func newActiveStreams() *activeStreams {
+	return &activeStreams{
+		streams: make(map[uint64]*drpcstream.Stream),
+	}
+}
+
+// Add adds a stream. It returns an error if the collection is closed or if a
+// stream with the same ID already exists.
+func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream) error {
+	if stream == nil {
+		return managerClosed.New("stream can't be nil")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed {
+		return managerClosed.New("add to closed collection")
+	}
+	if _, ok := r.streams[id]; ok {
+		return managerClosed.New("duplicate stream id")
+	}
+	r.streams[id] = stream
+	return nil
+}
+
+// Remove removes a stream. It is a no-op if the stream is not present or if
+// the collection has been closed.
+func (r *activeStreams) Remove(id uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.streams != nil {
+		delete(r.streams, id)
+	}
+}
+
+// Get returns the stream for the given ID and whether it was found.
+func (r *activeStreams) Get(id uint64) (*drpcstream.Stream, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	s, ok := r.streams[id]
+	return s, ok
+}
+
+// GetLatest returns the stream with the highest ID, or nil if empty.
+func (r *activeStreams) GetLatest() *drpcstream.Stream {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var latest *drpcstream.Stream
+	for _, s := range r.streams {
+		if latest == nil || latest.ID() < s.ID() {
+			latest = s
+		}
+	}
+	return latest
+}
+
+// Close marks the collection as closed, preventing future Add calls.
+// It does not cancel any streams.
+func (r *activeStreams) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.closed = true
+}
+
+// ForEach calls fn for each active stream. The collection is read-locked
+// during iteration.
+func (r *activeStreams) ForEach(fn func(*drpcstream.Stream)) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, s := range r.streams {
+		fn(s)
+	}
+}
+
+// Len returns the number of active streams.
+func (r *activeStreams) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return len(r.streams)
+}
