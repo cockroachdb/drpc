@@ -134,8 +134,8 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	// this semaphore controls the number of concurrent streams. it MUST be 1.
 	m.sem.Make(1)
 
-	// a buffer of size 1 allows NewServerStream to signal it is done
-	// without having to coordinate with manageReader.
+	// a buffer of size 1 allows NewServerStream to signal it is done creating a
+	// new server stream without having to coordinate with manageReader.
 	m.pdone.Make(1)
 
 	m.pa = drpcwire.NewPacketAssembler()
