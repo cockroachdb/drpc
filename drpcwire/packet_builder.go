@@ -13,8 +13,9 @@ import (
 //
 // It is not safe for concurrent use.
 type PacketAssembler struct {
-	assembling bool
-	pk         Packet
+	pk                Packet
+	assembling        bool
+	streamInitialized bool
 }
 
 // NewPacketAssembler returns a new PacketAssembler ready to assemble frames.
@@ -30,6 +31,7 @@ func NewPacketAssembler() PacketAssembler {
 // be rejected. If not called, the stream ID is inferred from the first frame.
 func (pa *PacketAssembler) SetStreamID(streamID uint64) {
 	pa.pk.ID.Stream = streamID
+	pa.streamInitialized = true
 }
 
 // Reset clears all assembly state, preparing the assembler for a new stream.
@@ -38,6 +40,7 @@ func (pa *PacketAssembler) Reset() {
 		ID: ID{Stream: 0, Message: 1},
 	}
 	pa.assembling = false
+	pa.streamInitialized = false
 }
 
 // AppendFrame adds a frame to the in-progress packet. It returns the completed
@@ -45,8 +48,9 @@ func (pa *PacketAssembler) Reset() {
 // when more frames are needed to complete the packet.
 func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady bool, err error) {
 	// Enforce stream ID consistency: infer from first frame or reject mismatches.
-	if pa.pk.ID.Stream == 0 {
+	if !pa.streamInitialized {
 		pa.pk.ID.Stream = fr.ID.Stream
+		pa.streamInitialized = true
 	} else if fr.ID.Stream != pa.pk.ID.Stream {
 		return Packet{}, false, drpc.ProtocolError.New(
 			"frame stream mismatch: got stream %d, expected %d", fr.ID.Stream, pa.pk.ID.Stream)
