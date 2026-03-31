@@ -13,7 +13,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
@@ -47,13 +46,6 @@ type Options struct {
 	// the potential cost of higher latencies if there is latent data still
 	// being flushed when the cancel happens.
 	SoftCancel bool
-
-	// InactivityTimeout is the amount of time the manager will wait when
-	// creating a NewServerStream. It only includes the time it is reading
-	// packets from the remote client. In other words, it only includes the time
-	// that the client could delay before invoking an RPC. If zero or negative,
-	// no timeout is used.
-	InactivityTimeout time.Duration
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
@@ -468,19 +460,7 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 		}
 	}()
 
-	var timeoutCh <-chan time.Time
-
-	// set up the timeout on the context if necessary.
-	if timeout := m.opts.InactivityTimeout; timeout > 0 {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		timeoutCh = timer.C
-	}
-
 	select {
-	case <-timeoutCh:
-		return nil, "", context.DeadlineExceeded
-
 	case <-ctx.Done():
 		return nil, "", ctx.Err()
 
