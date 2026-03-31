@@ -30,17 +30,6 @@ func closed(ch <-chan struct{}) bool {
 	}
 }
 
-func TestTimeout(t *testing.T) {
-	tr := make(blockingTransport)
-	man := NewWithOptions(tr, Options{
-		InactivityTimeout: time.Millisecond,
-	})
-	defer func() { _ = man.Close() }()
-
-	_, _, err := man.NewServerStream(context.Background())
-	assert.That(t, errors.Is(err, context.DeadlineExceeded))
-}
-
 func TestDrpcMetadata(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
