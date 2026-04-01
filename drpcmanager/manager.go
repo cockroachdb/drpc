@@ -220,7 +220,6 @@ func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
 		m.sigs.tport.Set(m.tr.Close())
-		m.reg.ForEach(func(s *drpcstream.Stream) { s.Close() })
 		m.reg.Close()
 	}
 }
