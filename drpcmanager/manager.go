@@ -276,14 +276,7 @@ func (m *Manager) manageReader() {
 			}
 
 		default:
-			// A non-invoke frame arrived for a stream that doesn't exist yet
-			// (curr is nil or incomingFrame.ID.Stream > curr.ID). The first
-			// frame of a new stream must be KindInvoke or KindInvokeMetadata.
-			m.terminate(managerClosed.Wrap(drpc.ProtocolError.New(
-				"first frame of a new stream must be Invoke, got %v (ID:%v)",
-				incomingFrame.Kind,
-				incomingFrame.ID)))
-			return
+			m.log("DROP", incomingFrame.String)
 		}
 	}
 }
