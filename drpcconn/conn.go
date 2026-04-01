@@ -13,6 +13,7 @@ import (
 	"storj.io/drpc/drpcenc"
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcmetadata"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcstats"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpcwire"
@@ -24,9 +25,13 @@ type Options struct {
 	// Manager controls the options we pass to the manager of this conn.
 	Manager drpcmanager.Options
 
-	// CollectStats controls whether the server should collect stats on the
+	// CollectStats controls whether the client should collect stats on the
 	// rpcs it creates.
 	CollectStats bool
+
+	// Metrics holds optional metrics the client will populate. If nil, no
+	// metrics are recorded.
+	Metrics *drpcmetrics.ClientMetrics
 }
 
 // Conn is a drpc client connection.
@@ -49,6 +54,12 @@ func New(tr drpc.Transport) *Conn { return NewWithOptions(tr, Options{}) }
 func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 	c := &Conn{
 		tr: tr,
+	}
+
+	if opts.Metrics != nil {
+		mt := &drpcmetrics.MeteredTransport{Transport: tr, BytesSent: opts.Metrics.BytesSent, BytesRecv: opts.Metrics.BytesRecv}
+		tr = mt
+		c.tr = tr
 	}
 
 	if opts.CollectStats {

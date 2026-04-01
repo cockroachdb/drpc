@@ -10,9 +10,16 @@ import (
 	"time"
 
 	"github.com/zeebo/errs"
-
 	"storj.io/drpc/drpcdebug"
+	"storj.io/drpc/drpcmetrics"
 )
+
+// PoolMetrics holds optional metrics for connection pool monitoring.
+type PoolMetrics struct {
+	PoolSize              drpcmetrics.Gauge
+	ConnectionHitsTotal   drpcmetrics.Counter
+	ConnectionMissesTotal drpcmetrics.Counter
+}
 
 // Options contains the options to configure a pool.
 type Options struct {
@@ -28,6 +35,13 @@ type Options struct {
 	// the Pool holds unlimited for any single key. Negative means
 	// no values for any single key.
 	KeyCapacity int
+
+	// Metrics holds optional metrics the pool will populate. If nil,
+	// no metrics are recorded.
+	Metrics *PoolMetrics
+
+	// Labels holds optional labels to be attached to all metrics.
+	Labels map[string]string
 }
 
 // Pool is a connection pool with key type K. It maintains a cache of connections
@@ -43,9 +57,39 @@ type Pool[K comparable, V Conn] struct {
 
 // New constructs a new Pool with the provided Options.
 func New[K comparable, V Conn](opts Options) *Pool[K, V] {
-	return &Pool[K, V]{
+	pool := Pool[K, V]{
 		opts:    opts,
 		entries: make(map[K]*list[K, V]),
+	}
+	// emit the metric (0 value) so it shows up as soon as the pool is created
+	pool.updatePoolSize()
+	return &pool
+}
+
+func (p *Pool[K, V]) recordHit() {
+	if p.opts.Metrics == nil {
+		return
+	}
+	if p.opts.Metrics.ConnectionHitsTotal != nil {
+		p.opts.Metrics.ConnectionHitsTotal.Inc(p.opts.Labels, 1)
+	}
+}
+
+func (p *Pool[K, V]) recordMiss() {
+	if p.opts.Metrics == nil {
+		return
+	}
+	if p.opts.Metrics.ConnectionMissesTotal != nil {
+		p.opts.Metrics.ConnectionMissesTotal.Inc(p.opts.Labels, 1)
+	}
+}
+
+func (p *Pool[K, V]) updatePoolSize() {
+	if p.opts.Metrics == nil {
+		return
+	}
+	if p.opts.Metrics.PoolSize != nil {
+		p.opts.Metrics.PoolSize.Update(p.opts.Labels, int64(p.order.count))
 	}
 }
 
@@ -68,6 +112,7 @@ func (p *Pool[K, V]) Close() (err error) {
 
 	p.entries = make(map[K]*list[K, V])
 	p.order = list[K, V]{}
+	p.updatePoolSize()
 
 	return eg.Err()
 }
@@ -99,6 +144,7 @@ func (p *Pool[K, V]) removeEntry(ent *entry[K, V]) {
 
 	local.removeEntry(ent, (*entry[K, V]).localList)
 	p.order.removeEntry(ent, (*entry[K, V]).globalList)
+	p.updatePoolSize()
 
 	if local.count == 0 {
 		delete(p.entries, ent.key)
@@ -123,6 +169,7 @@ func (p *Pool[K, V]) Take(key K) (V, bool) {
 
 	local := p.entries[key]
 	if local == nil {
+		p.recordMiss()
 		return *new(V), false
 	}
 
@@ -137,6 +184,7 @@ func (p *Pool[K, V]) Take(key K) (V, bool) {
 
 		local.removeEntry(ent, (*entry[K, V]).localList)
 		p.order.removeEntry(ent, (*entry[K, V]).globalList)
+		p.updatePoolSize()
 
 		if ent.exp != nil && !ent.exp.Stop() {
 			continue
@@ -145,9 +193,11 @@ func (p *Pool[K, V]) Take(key K) (V, bool) {
 		}
 
 		p.log("TAKEN", ent.String)
+		p.recordHit()
 		return ent.val, true
 	}
 
+	p.recordMiss()
 	return *new(V), false
 }
 
@@ -177,6 +227,7 @@ func (p *Pool[K, V]) Put(key K, val V) {
 
 		local.removeEntry(ent, (*entry[K, V]).localList)
 		p.order.removeEntry(ent, (*entry[K, V]).globalList)
+		p.updatePoolSize()
 	}
 
 	for p.opts.Capacity != 0 && p.order.count >= p.opts.Capacity {
@@ -187,6 +238,7 @@ func (p *Pool[K, V]) Put(key K, val V) {
 
 		local.removeEntry(ent, (*entry[K, V]).localList)
 		p.order.removeEntry(ent, (*entry[K, V]).globalList)
+		p.updatePoolSize()
 
 		if local.count == 0 {
 			delete(p.entries, ent.key)
@@ -196,6 +248,7 @@ func (p *Pool[K, V]) Put(key K, val V) {
 	ent := &entry[K, V]{key: key, val: val}
 	local.appendEntry(ent, (*entry[K, V]).localList)
 	p.order.appendEntry(ent, (*entry[K, V]).globalList)
+	p.updatePoolSize()
 	p.log("PUT", ent.String)
 
 	if p.opts.Expiration > 0 {

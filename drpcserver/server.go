@@ -15,6 +15,7 @@ import (
 	"storj.io/drpc/drpccache"
 	"storj.io/drpc/drpcctx"
 	"storj.io/drpc/drpcmanager"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcstats"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/internal/drpcopts"
@@ -44,6 +45,35 @@ type Options struct {
 	// *tls.Conn) and may inspect ConnectionState to enforce cipher suite
 	// restrictions. If it returns a non-nil error the connection is rejected.
 	TLSCipherRestrict func(conn net.Conn) error
+
+	// Metrics holds optional metrics the server will populate. If nil, no
+	// metrics are recorded.
+	Metrics *ServerMetrics
+}
+
+// ServerMetrics holds optional metrics that the server will populate during
+// operation.
+// Metrics are defined and registered by the caller (e.g. in CockroachDB) and
+// passed in; this package never imports a metrics library.
+type ServerMetrics struct {
+	BytesSent          drpcmetrics.Counter
+	BytesRecv          drpcmetrics.Counter
+	TLSHandshakeErrors drpcmetrics.Counter
+}
+
+// addTLSHandshakeError increments the TLS handshake error counter.
+func (m *ServerMetrics) addTLSHandshakeError() {
+	if m != nil && m.TLSHandshakeErrors != nil {
+		m.TLSHandshakeErrors.Inc(nil, 1)
+	}
+}
+
+// toMeteredTransport wraps tr with byte counters.
+func (m *ServerMetrics) toMeteredTransport(tr drpc.Transport) drpc.Transport {
+	if m == nil {
+		return tr
+	}
+	return &drpcmetrics.MeteredTransport{Transport: tr, BytesSent: m.BytesSent, BytesRecv: m.BytesRecv}
 }
 
 // Server is an implementation of drpc.Server to serve drpc connections.
@@ -126,10 +156,12 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		// anyway.
 		err := tlsConn.HandshakeContext(ctx)
 		if err != nil {
+			s.opts.Metrics.addTLSHandshakeError()
 			return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
 		}
 		if s.opts.TLSCipherRestrict != nil {
 			if err := s.opts.TLSCipherRestrict(tlsConn); err != nil {
+				s.opts.Metrics.addTLSHandshakeError()
 				return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
 			}
 		}
@@ -139,6 +171,8 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 				ctx, drpcctx.PeerConnectionInfo{Certificates: state.PeerCertificates})
 		}
 	}
+
+	tr = s.opts.Metrics.toMeteredTransport(tr)
 
 	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
 	defer func() { err = errs.Combine(err, man.Close()) }()

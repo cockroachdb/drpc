@@ -9,6 +9,7 @@ import (
 	"storj.io/drpc"
 	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpcmanager"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpcwire"
 )
@@ -31,6 +32,10 @@ type dialOptions struct {
 	dialer func(context.Context, string) (net.Conn, error)
 	// tlsConfig is an optional TLS configuration for secure connections.
 	tlsConfig *tls.Config
+
+	// metrics holds optional metrics the conn will populate. If nil, no
+	// metrics are recorded.
+	metrics *drpcmetrics.ClientMetrics
 }
 
 // DialOption configures how we set up the client connection.
@@ -67,6 +72,14 @@ func WithPerRPCMetadata(metadata map[string]string) DialOption {
 func WithTLSConfig(tlsConfig *tls.Config) DialOption {
 	return func(o *dialOptions) {
 		o.tlsConfig = tlsConfig
+	}
+}
+
+// WithMetrics returns a DialOption that sets client metrics to be populated
+// during connection operation.
+func WithMetrics(metrics *drpcmetrics.ClientMetrics) DialOption {
+	return func(o *dialOptions) {
+		o.metrics = metrics
 	}
 }
 
@@ -131,5 +144,6 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (conn 
 			},
 			SoftCancel: false,
 		},
+		Metrics: options.metrics,
 	}), nil
 }

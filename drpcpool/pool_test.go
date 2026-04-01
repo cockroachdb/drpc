@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/zeebo/assert"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpctest"
 )
@@ -417,6 +416,130 @@ func TestPool_StreamContext(t *testing.T) {
 		_ = sctx.Done()
 		_ = sctx.Value(key{})
 	}
+}
+
+//
+// pool metrics tests
+//
+
+type testPoolCounter struct {
+	total float64
+}
+
+func (c *testPoolCounter) Inc(_ map[string]string, v int64) {
+	c.total += float64(v)
+}
+
+type testPoolGauge struct {
+	total float64
+}
+
+func (g *testPoolGauge) Update(_ map[string]string, v int64) {
+	g.total = float64(v)
+}
+
+func TestPoolMetrics_PutTakeClose(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	poolSize := &testPoolGauge{}
+	hits := &testPoolCounter{}
+	misses := &testPoolCounter{}
+
+	pool := New[string, Conn](Options{
+		Capacity: 10,
+		Metrics: &PoolMetrics{
+			PoolSize:              poolSize,
+			ConnectionHitsTotal:   hits,
+			ConnectionMissesTotal: misses,
+		},
+	})
+
+	// Miss on empty pool.
+	_, ok := pool.Take("key")
+	assert.That(t, !ok)
+	assert.Equal(t, misses.total, 1.0)
+	assert.Equal(t, hits.total, 0.0)
+
+	// Put a connection.
+	conn := &callbackConn{
+		ClosedFn:    func() <-chan struct{} { return nil },
+		UnblockedFn: func() <-chan struct{} { return closedCh },
+	}
+	pool.Put("key", conn)
+	assert.Equal(t, poolSize.total, 1.0)
+
+	// Take it back — should be a hit.
+	val, ok := pool.Take("key")
+	assert.That(t, ok)
+	assert.Equal(t, val, Conn(conn))
+	assert.Equal(t, hits.total, 1.0)
+	assert.Equal(t, poolSize.total, 0.0) // decremented on take
+
+	// Miss again now that pool is empty.
+	_, ok = pool.Take("key")
+	assert.That(t, !ok)
+	assert.Equal(t, misses.total, 2.0)
+
+	// Put two, then Close.
+	conn2 := &callbackConn{
+		ClosedFn:    func() <-chan struct{} { return nil },
+		UnblockedFn: func() <-chan struct{} { return closedCh },
+	}
+	pool.Put("key", conn)
+	pool.Put("key", conn2)
+	assert.Equal(t, poolSize.total, 2.0)
+
+	assert.NoError(t, pool.Close())
+	assert.Equal(t, poolSize.total, 0.0)
+}
+
+func TestPoolMetrics_Eviction(t *testing.T) {
+	poolSize := &testPoolGauge{}
+	misses := &testPoolCounter{}
+
+	pool := New[string, Conn](Options{
+		Capacity:    1,
+		KeyCapacity: 1,
+		Metrics: &PoolMetrics{
+			PoolSize:              poolSize,
+			ConnectionMissesTotal: misses,
+		},
+	})
+	defer func() { _ = pool.Close() }()
+
+	conn1 := &callbackConn{
+		ClosedFn:    func() <-chan struct{} { return nil },
+		UnblockedFn: func() <-chan struct{} { return closedCh },
+	}
+	conn2 := &callbackConn{
+		ClosedFn:    func() <-chan struct{} { return nil },
+		UnblockedFn: func() <-chan struct{} { return closedCh },
+	}
+
+	pool.Put("key", conn1)
+	assert.Equal(t, poolSize.total, 1.0)
+
+	// Putting conn2 with KeyCapacity=1 should evict conn1.
+	pool.Put("key", conn2)
+	// One eviction (-1) + one put (+1) = net 1.
+	assert.Equal(t, poolSize.total, 1.0)
+}
+
+func TestPoolMetrics_NilFields(t *testing.T) {
+	// All PoolMetrics fields are nil — should not panic.
+	pool := New[string, Conn](Options{
+		Metrics: &PoolMetrics{},
+	})
+
+	conn := &callbackConn{
+		ClosedFn:    func() <-chan struct{} { return nil },
+		UnblockedFn: func() <-chan struct{} { return closedCh },
+	}
+	pool.Put("key", conn)
+	pool.Take("key")
+	pool.Take("miss")
+	assert.NoError(t, pool.Close())
 }
 
 func BenchmarkPool(b *testing.B) {
