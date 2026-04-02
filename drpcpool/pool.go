@@ -17,8 +17,8 @@ import (
 // PoolMetrics holds optional metrics for connection pool monitoring.
 type PoolMetrics struct {
 	PoolSize              drpcmetrics.Gauge
-	ConnectionHitsTotal   drpcmetrics.Counter
-	ConnectionMissesTotal drpcmetrics.Counter
+	ConnectionHitsTotal   drpcmetrics.LabeledCounter
+	ConnectionMissesTotal drpcmetrics.LabeledCounter
 }
 
 // Options contains the options to configure a pool.
@@ -36,9 +36,8 @@ type Options struct {
 	// no values for any single key.
 	KeyCapacity int
 
-	// Metrics holds optional metrics the pool will populate. If nil,
-	// no metrics are recorded.
-	Metrics *PoolMetrics
+	// Metrics holds optional metrics the pool will populate.
+	Metrics PoolMetrics
 
 	// Labels holds optional labels to be attached to all metrics.
 	Labels map[string]string
@@ -61,36 +60,39 @@ func New[K comparable, V Conn](opts Options) *Pool[K, V] {
 		opts:    opts,
 		entries: make(map[K]*list[K, V]),
 	}
+
+	pool.initPoolMetrics()
+
 	// emit the metric (0 value) so it shows up as soon as the pool is created
 	pool.updatePoolSize()
 	return &pool
 }
 
+// initPoolMetrics copies the caller-supplied metrics into the pool,
+// substituting no-op implementations for any nil fields.
+func (p *Pool[K, V]) initPoolMetrics() {
+	metrics := &p.opts.Metrics
+	if metrics.PoolSize == nil {
+		metrics.PoolSize = drpcmetrics.NoOpGauge{}
+	}
+	if metrics.ConnectionHitsTotal == nil {
+		metrics.ConnectionHitsTotal = drpcmetrics.NoOpLabeledCounter{}
+	}
+	if metrics.ConnectionMissesTotal == nil {
+		metrics.ConnectionMissesTotal = drpcmetrics.NoOpLabeledCounter{}
+	}
+}
+
 func (p *Pool[K, V]) recordHit() {
-	if p.opts.Metrics == nil {
-		return
-	}
-	if p.opts.Metrics.ConnectionHitsTotal != nil {
-		p.opts.Metrics.ConnectionHitsTotal.Inc(p.opts.Labels, 1)
-	}
+	p.opts.Metrics.ConnectionHitsTotal.Inc(p.opts.Labels, 1)
 }
 
 func (p *Pool[K, V]) recordMiss() {
-	if p.opts.Metrics == nil {
-		return
-	}
-	if p.opts.Metrics.ConnectionMissesTotal != nil {
-		p.opts.Metrics.ConnectionMissesTotal.Inc(p.opts.Labels, 1)
-	}
+	p.opts.Metrics.ConnectionMissesTotal.Inc(p.opts.Labels, 1)
 }
 
 func (p *Pool[K, V]) updatePoolSize() {
-	if p.opts.Metrics == nil {
-		return
-	}
-	if p.opts.Metrics.PoolSize != nil {
-		p.opts.Metrics.PoolSize.Update(p.opts.Labels, int64(p.order.count))
-	}
+	p.opts.Metrics.PoolSize.Update(p.opts.Labels, int64(p.order.count))
 }
 
 func (p *Pool[K, V]) log(what string, cb func() string) {
@@ -120,8 +122,9 @@ func (p *Pool[K, V]) Close() (err error) {
 // Get returns a new Conn that will use the provided dial function to create an
 // underlying conn to be cached by the Pool when Conn methods are invoked. It will
 // share any cached connections with other conns that use the same key.
-func (p *Pool[K, V]) Get(ctx context.Context, key K,
-	dial func(ctx context.Context, key K) (V, error)) Conn {
+func (p *Pool[K, V]) Get(
+	ctx context.Context, key K, dial func(ctx context.Context, key K) (V, error),
+) Conn {
 	return &poolConn[K, V]{
 		key:  key,
 		pool: p,

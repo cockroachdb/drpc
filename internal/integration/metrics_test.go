@@ -27,63 +27,36 @@ import (
 //
 
 type testCounter struct {
-	mu    sync.Mutex
-	calls []metricCall
+	mu     sync.Mutex
+	total_ float64
+	count_ int
 }
 
-type metricCall struct {
-	labels map[string]string
-	value  float64
-}
-
-func (c *testCounter) Inc(labels map[string]string, v int64) {
+func (c *testCounter) Inc(v int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.calls = append(c.calls, metricCall{labels: labels, value: float64(v)})
+	c.total_ += float64(v)
+	c.count_++
 }
 
 func (c *testCounter) total() float64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var t float64
-	for _, call := range c.calls {
-		t += call.value
-	}
-	return t
+	return c.total_
 }
 
 func (c *testCounter) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.calls)
+	return c.count_
 }
 
 //
 // connection helpers
 //
 
-func createMeteredServerConnection(
-	t testing.TB, server DRPCServiceServer, metrics *drpcserver.ServerMetrics,
-) (DRPCServiceClient, func()) {
-	ctx := drpctest.NewTracker(t)
-	c1, c2 := net.Pipe()
-	mux := drpcmux.New()
-	assert.NoError(t, DRPCRegisterService(mux, server))
-	srv := drpcserver.NewWithOptions(mux, drpcserver.Options{
-		Metrics: metrics,
-	})
-	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
-	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
-		Manager: drpcmanager.Options{},
-	})
-	return NewDRPCServiceClient(conn), func() {
-		_ = conn.Close()
-		ctx.Close()
-	}
-}
-
 func createMeteredClientConnection(
-	t testing.TB, server DRPCServiceServer, metrics *drpcmetrics.ClientMetrics,
+	t testing.TB, server DRPCServiceServer, metrics drpcmetrics.ClientMetrics,
 ) (DRPCServiceClient, func()) {
 	ctx := drpctest.NewTracker(t)
 	c1, c2 := net.Pipe()
@@ -92,26 +65,13 @@ func createMeteredClientConnection(
 	srv := drpcserver.New(mux)
 	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
 	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
-		Manager: drpcmanager.Options{},
-		Metrics: metrics,
+		Manager:        drpcmanager.Options{},
+		Metrics:        metrics,
+		CollectMetrics: true,
 	})
 	return NewDRPCServiceClient(conn), func() {
 		_ = conn.Close()
 		ctx.Close()
-	}
-}
-
-// waitForCount waits until counter.count() reaches at least n.
-// Server-side byte metrics are recorded inside transport Read/Write which
-// may not have completed by the time the client observes the response.
-func waitForCount(t testing.TB, c interface{ count() int }, n int) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for c.count() < n {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for count >= %d (got %d)", n, c.count())
-		}
-		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -125,7 +85,7 @@ func TestClientByteMetrics(t *testing.T) {
 
 	sent := &testCounter{}
 	recv := &testCounter{}
-	cli, close := createMeteredClientConnection(t, standardImpl, &drpcmetrics.ClientMetrics{
+	cli, close := createMeteredClientConnection(t, standardImpl, drpcmetrics.ClientMetrics{
 		BytesSent: sent,
 		BytesRecv: recv,
 	})
@@ -162,7 +122,7 @@ func TestClientByteMetricsPartialNil(t *testing.T) {
 	defer ctx.Close()
 
 	sent := &testCounter{}
-	cli, close := createMeteredClientConnection(t, standardImpl, &drpcmetrics.ClientMetrics{
+	cli, close := createMeteredClientConnection(t, standardImpl, drpcmetrics.ClientMetrics{
 		BytesSent: sent,
 		// BytesRecv intentionally nil.
 	})
@@ -174,61 +134,35 @@ func TestClientByteMetricsPartialNil(t *testing.T) {
 	assert.That(t, sent.total() > 0)
 }
 
-func TestServerByteMetrics(t *testing.T) {
+func TestClientByteMetricsNotCollected(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
 	sent := &testCounter{}
 	recv := &testCounter{}
-	cli, close := createMeteredServerConnection(t, standardImpl, &drpcserver.ServerMetrics{
-		BytesSent: sent,
-		BytesRecv: recv,
+
+	c1, c2 := net.Pipe()
+	mux := drpcmux.New()
+	assert.NoError(t, DRPCRegisterService(mux, standardImpl))
+	srv := drpcserver.New(mux)
+	ctx.Run(func(ctx2 context.Context) { _ = srv.ServeOne(ctx2, c1) })
+	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
+		Metrics: drpcmetrics.ClientMetrics{
+			BytesSent: sent,
+			BytesRecv: recv,
+		},
 	})
-	defer close()
+	cli := NewDRPCServiceClient(conn)
 
 	out, err := cli.Method1(ctx, in(1))
 	assert.NoError(t, err)
 	assert.True(t, Equal(out, &Out{Out: 1}))
 
-	// The server's byte counters are incremented inside transport
-	// Read/Write which may not have returned by the time the client
-	// observes the response, so poll briefly.
-	waitForCount(t, sent, 1)
-	waitForCount(t, recv, 1)
-	assert.That(t, sent.total() > 0)
-	assert.That(t, recv.total() > 0)
-}
+	// CollectMetrics is false, so no metrics should be collected.
+	assert.Equal(t, sent.total(), 0.0)
+	assert.Equal(t, recv.total(), 0.0)
 
-func TestServerMetricsAllNilFields(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
-	// Non-nil ServerMetrics with all nil fields — should not panic.
-	cli, close := createMeteredServerConnection(t, standardImpl, &drpcserver.ServerMetrics{})
-	defer close()
-
-	out, err := cli.Method1(ctx, in(1))
-	assert.NoError(t, err)
-	assert.True(t, Equal(out, &Out{Out: 1}))
-}
-
-func TestServerByteMetricsPartialNil(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
-	sent := &testCounter{}
-	// BytesRecv intentionally nil.
-	cli, close := createMeteredServerConnection(t, standardImpl, &drpcserver.ServerMetrics{
-		BytesSent: sent,
-	})
-	defer close()
-
-	out, err := cli.Method1(ctx, in(1))
-	assert.NoError(t, err)
-	assert.True(t, Equal(out, &Out{Out: 1}))
-
-	waitForCount(t, sent, 1)
-	assert.That(t, sent.total() > 0)
+	_ = conn.Close()
 }
 
 func TestServerTLSHandshakeErrorMetric(t *testing.T) {
@@ -237,7 +171,7 @@ func TestServerTLSHandshakeErrorMetric(t *testing.T) {
 	mux := drpcmux.New()
 	assert.NoError(t, DRPCRegisterService(mux, standardImpl))
 	srv := drpcserver.NewWithOptions(mux, drpcserver.Options{
-		Metrics: &drpcserver.ServerMetrics{
+		Metrics: drpcserver.ServerMetrics{
 			TLSHandshakeErrors: tlsErrors,
 		},
 	})

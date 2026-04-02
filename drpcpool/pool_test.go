@@ -448,7 +448,7 @@ func TestPoolMetrics_PutTakeClose(t *testing.T) {
 
 	pool := New[string, Conn](Options{
 		Capacity: 10,
-		Metrics: &PoolMetrics{
+		Metrics: PoolMetrics{
 			PoolSize:              poolSize,
 			ConnectionHitsTotal:   hits,
 			ConnectionMissesTotal: misses,
@@ -501,7 +501,7 @@ func TestPoolMetrics_Eviction(t *testing.T) {
 	pool := New[string, Conn](Options{
 		Capacity:    1,
 		KeyCapacity: 1,
-		Metrics: &PoolMetrics{
+		Metrics: PoolMetrics{
 			PoolSize:              poolSize,
 			ConnectionMissesTotal: misses,
 		},
@@ -529,7 +529,7 @@ func TestPoolMetrics_Eviction(t *testing.T) {
 func TestPoolMetrics_NilFields(t *testing.T) {
 	// All PoolMetrics fields are nil — should not panic.
 	pool := New[string, Conn](Options{
-		Metrics: &PoolMetrics{},
+		Metrics: PoolMetrics{},
 	})
 
 	conn := &callbackConn{

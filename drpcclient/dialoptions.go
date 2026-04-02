@@ -134,6 +134,11 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (conn 
 		}
 	}
 
+	collectMetrics := true
+	if options.metrics == nil {
+		collectMetrics = false
+		options.metrics = &drpcmetrics.ClientMetrics{}
+	}
 	return drpcconn.NewWithOptions(netConn, drpcconn.Options{
 		Manager: drpcmanager.Options{
 			Reader: drpcwire.ReaderOptions{
@@ -144,6 +149,7 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (conn 
 			},
 			SoftCancel: false,
 		},
-		Metrics: options.metrics,
+		CollectMetrics: collectMetrics,
+		Metrics:        *options.metrics,
 	}), nil
 }

@@ -25,13 +25,16 @@ type Options struct {
 	// Manager controls the options we pass to the manager of this conn.
 	Manager drpcmanager.Options
 
+	// TODO: (server): deprecate this
 	// CollectStats controls whether the client should collect stats on the
 	// rpcs it creates.
 	CollectStats bool
 
-	// Metrics holds optional metrics the client will populate. If nil, no
-	// metrics are recorded.
-	Metrics *drpcmetrics.ClientMetrics
+	// CollectMetrics controls whether the client should collect metrics.
+	CollectMetrics bool
+
+	// Metrics holds optional metrics the client will populate.
+	Metrics drpcmetrics.ClientMetrics
 }
 
 // Conn is a drpc client connection.
@@ -41,7 +44,7 @@ type Conn struct {
 	mu   sync.Mutex
 	wbuf []byte
 
-	stats map[string]*drpcstats.Stats
+	stats map[string]*drpcstats.Stats // TODO (server): deprecate
 }
 
 var _ drpc.Conn = (*Conn)(nil)
@@ -56,18 +59,19 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		tr: tr,
 	}
 
-	if opts.Metrics != nil {
-		mt := &drpcmetrics.MeteredTransport{Transport: tr, BytesSent: opts.Metrics.BytesSent, BytesRecv: opts.Metrics.BytesRecv}
-		tr = mt
-		c.tr = tr
+	if opts.CollectMetrics {
+		mt := drpcmetrics.ToMeteredTransport(tr, opts.Metrics.BytesSent,
+			opts.Metrics.BytesRecv)
+		c.tr = mt
 	}
 
+	// TODO: (server): deprecate
 	if opts.CollectStats {
 		drpcopts.SetManagerStatsCB(&opts.Manager.Internal, c.getStats)
 		c.stats = make(map[string]*drpcstats.Stats)
 	}
 
-	c.man = drpcmanager.NewWithOptions(tr, opts.Manager)
+	c.man = drpcmanager.NewWithOptions(c.tr, opts.Manager)
 
 	return c
 }
