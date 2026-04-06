@@ -63,20 +63,6 @@ func (r *activeStreams) Get(id uint64) (*drpcstream.Stream, bool) {
 	return s, ok
 }
 
-// GetLatest returns the stream with the highest ID, or nil if empty.
-func (r *activeStreams) GetLatest() *drpcstream.Stream {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	var latest *drpcstream.Stream
-	for _, s := range r.streams {
-		if latest == nil || latest.ID() < s.ID() {
-			latest = s
-		}
-	}
-	return latest
-}
-
 // Close marks the collection as closed, preventing future Add calls.
 // It does not cancel any streams.
 func (r *activeStreams) Close() {
