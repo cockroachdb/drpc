@@ -135,12 +135,7 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 }
 
 func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string, data []byte, metadata []byte, out drpc.Message) (err error) {
-	if len(metadata) > 0 {
-		if err := stream.RawWrite(drpcwire.KindInvokeMetadata, metadata); err != nil {
-			return err
-		}
-	}
-	if err := stream.RawWrite(drpcwire.KindInvoke, []byte(rpc)); err != nil {
+	if err := stream.WriteInvoke(rpc, metadata); err != nil {
 		return err
 	}
 	if err := stream.RawWrite(drpcwire.KindMessage, data); err != nil {
@@ -171,23 +166,11 @@ func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ 
 		return nil, err
 	}
 
-	if err := c.doNewStream(stream, rpc, metadata); err != nil {
+	if err := stream.WriteInvoke(rpc, metadata); err != nil {
 		return nil, errs.Combine(err, stream.Close())
 	}
 
 	return stream, nil
-}
-
-func (c *Conn) doNewStream(stream *drpcstream.Stream, rpc string, metadata []byte) error {
-	if len(metadata) > 0 {
-		if err := stream.RawWrite(drpcwire.KindInvokeMetadata, metadata); err != nil {
-			return err
-		}
-	}
-	if err := stream.RawWrite(drpcwire.KindInvoke, []byte(rpc)); err != nil {
-		return err
-	}
-	return nil
 }
 
 // encodeMetadata retrieves and encodes metadata from the provided

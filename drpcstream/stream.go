@@ -371,6 +371,22 @@ func (s *Stream) terminate(err error) {
 	s.checkFinished()
 }
 
+// WriteInvoke writes the invoke metadata (if any) and invoke frame
+// atomically under the write lock. This prevents SendCancel from
+// interrupting the invoke sequence.
+func (s *Stream) WriteInvoke(rpc string, metadata []byte) error {
+	defer s.checkFinished()
+	s.write.Lock()
+	defer s.write.Unlock()
+
+	if len(metadata) > 0 {
+		if err := s.rawWriteLocked(drpcwire.KindInvokeMetadata, metadata); err != nil {
+			return err
+		}
+	}
+	return s.rawWriteLocked(drpcwire.KindInvoke, []byte(rpc))
+}
+
 //
 // raw read/write
 //
