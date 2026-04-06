@@ -63,23 +63,6 @@ func (r *streamRegistry) Get(id uint64) (*drpcstream.Stream, bool) {
 	return s, ok
 }
 
-// GetLatest returns the stream with the highest ID, or nil if the registry is
-// empty. It iterates the map because the registry may briefly hold two streams
-// during stream handoff. This method should be removed once multiplexing is
-// supported and callers look up streams by ID directly.
-func (r *streamRegistry) GetLatest() *drpcstream.Stream {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	var latest *drpcstream.Stream
-	for _, s := range r.streams {
-		if latest == nil || latest.ID() < s.ID() {
-			latest = s
-		}
-	}
-	return latest
-}
-
 // Close marks the registry as closed, preventing future Register calls.
 // It does not cancel any streams.
 func (r *streamRegistry) Close() {

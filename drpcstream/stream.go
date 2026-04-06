@@ -104,7 +104,8 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		pa: pa,
 
 		id: drpcwire.ID{Stream: sid},
-		wr: wr.Reset(),
+		// TODO: think more deeply on the consequences here.
+		wr: wr,
 	}
 
 	// initialize the packet buffer
@@ -567,18 +568,13 @@ func (s *Stream) SendError(serr error) (err error) {
 // context.Canceled and sends a cancel error to the remote side for a soft
 // cancel. It is a no-op if the stream is already terminated. It returns true
 // for busy if writes are already blocked and a hard cancel is required.
-func (s *Stream) SendCancel(err error) (busy bool, _ error) {
+func (s *Stream) SendCancel(err error) error {
 	s.log("CALL", func() string { return "SendCancel()" })
 
 	s.mu.Lock()
-	if !s.write.Unlocked() { // if writes are happening, then we have to do a hard cancel.
-		s.mu.Unlock()
-		return true, nil
-	}
-
 	if s.sigs.term.IsSet() {
 		s.mu.Unlock()
-		return false, nil
+		return nil
 	}
 
 	defer s.checkFinished()
@@ -589,7 +585,7 @@ func (s *Stream) SendCancel(err error) (busy bool, _ error) {
 	s.terminate(err)
 	s.mu.Unlock()
 
-	return false, s.checkCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
+	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
 }
 
 // Close terminates the stream and sends that the stream has been closed to the
