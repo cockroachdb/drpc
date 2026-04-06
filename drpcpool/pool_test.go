@@ -550,34 +550,42 @@ func TestPoolMetrics_NilFields(t *testing.T) {
 }
 
 func TestPoolMetrics_ShouldRecordFalse(t *testing.T) {
-	// ShouldRecord returns false — metrics should not be recorded.
-	poolSize := &testPoolGauge{}
-	hits := &testPoolCounter{}
-	misses := &testPoolCounter{}
+	exercise := func(t *testing.T, shouldRecord func() bool) {
+		poolSize := &testPoolGauge{}
+		hits := &testPoolCounter{}
+		misses := &testPoolCounter{}
 
-	pool := New[string, Conn](Options{
-		Capacity: 10,
-		Metrics: PoolMetrics{
-			PoolSize:              poolSize,
-			ConnectionHitsTotal:   hits,
-			ConnectionMissesTotal: misses,
-		},
-		ShouldRecord: func() bool { return false },
-	})
-	defer func() { _ = pool.Close() }()
+		pool := New[string, Conn](Options{
+			Capacity: 10,
+			Metrics: PoolMetrics{
+				PoolSize:              poolSize,
+				ConnectionHitsTotal:   hits,
+				ConnectionMissesTotal: misses,
+			},
+			ShouldRecord: shouldRecord,
+		})
+		defer func() { _ = pool.Close() }()
 
-	conn := &callbackConn{
-		ClosedFn:    func() <-chan struct{} { return nil },
-		UnblockedFn: func() <-chan struct{} { return closedCh },
+		conn := &callbackConn{
+			ClosedFn:    func() <-chan struct{} { return nil },
+			UnblockedFn: func() <-chan struct{} { return closedCh },
+		}
+		pool.Put("key", conn)
+		pool.Take("key")
+		pool.Take("miss")
+
+		// No metrics should have been recorded.
+		assert.Equal(t, poolSize.total, 0.0)
+		assert.Equal(t, hits.total, 0.0)
+		assert.Equal(t, misses.total, 0.0)
 	}
-	pool.Put("key", conn)
-	pool.Take("key")
-	pool.Take("miss")
 
-	// No metrics should have been recorded.
-	assert.Equal(t, poolSize.total, 0.0)
-	assert.Equal(t, hits.total, 0.0)
-	assert.Equal(t, misses.total, 0.0)
+	t.Run("returns_false", func(t *testing.T) {
+		exercise(t, func() bool { return false })
+	})
+	t.Run("nil", func(t *testing.T) {
+		exercise(t, nil)
+	})
 }
 
 func BenchmarkPool(b *testing.B) {
