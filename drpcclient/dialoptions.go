@@ -33,8 +33,9 @@ type dialOptions struct {
 	// tlsConfig is an optional TLS configuration for secure connections.
 	tlsConfig *tls.Config
 
-	// metrics holds optional metrics the conn will populate. If nil, no
-	// metrics are recorded.
+	// metrics holds optional metrics the conn will populate. No metrics are
+	// recorded if this is nil. When shouldRecord is set, metrics are recorded
+	// only when shouldRecord returns true.
 	metrics      *drpcmetrics.ClientMetrics
 	shouldRecord func() bool
 }
