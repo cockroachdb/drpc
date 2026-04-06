@@ -76,9 +76,8 @@ func (p *Pool[K, V]) initPoolMetrics() {
 	if p.opts.ShouldRecord == nil {
 		p.opts.ShouldRecord = func() bool { return false }
 	}
-	if !p.opts.ShouldRecord() {
-		return
-	}
+
+	// initialize the metrics with no-op implementations if they are nil
 	metrics := &p.opts.Metrics
 	if metrics.PoolSize == nil {
 		metrics.PoolSize = drpcmetrics.NoOpGauge{}

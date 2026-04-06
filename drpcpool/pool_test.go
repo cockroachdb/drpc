@@ -588,6 +588,64 @@ func TestPoolMetrics_ShouldRecordFalse(t *testing.T) {
 	})
 }
 
+func TestPoolMetrics_ShouldRecordDynamic(t *testing.T) {
+	recording := false
+	poolSize := &testPoolGauge{}
+	hits := &testPoolCounter{}
+	misses := &testPoolCounter{}
+
+	pool := New[string, Conn](Options{
+		Capacity: 10,
+		Metrics: PoolMetrics{
+			PoolSize:              poolSize,
+			ConnectionHitsTotal:   hits,
+			ConnectionMissesTotal: misses,
+		},
+		ShouldRecord: func() bool { return recording },
+	})
+	defer func() { _ = pool.Close() }()
+
+	newConn := func() *callbackConn {
+		return &callbackConn{
+			ClosedFn:    func() <-chan struct{} { return nil },
+			UnblockedFn: func() <-chan struct{} { return closedCh },
+		}
+	}
+
+	// Recording is off — no metrics should be collected.
+	pool.Put("key", newConn())
+	pool.Take("key")
+	pool.Take("miss")
+	assert.Equal(t, poolSize.total, 0.0)
+	assert.Equal(t, hits.total, 0.0)
+	assert.Equal(t, misses.total, 0.0)
+
+	// Turn recording on — metrics should now be collected.
+	recording = true
+	pool.Put("key", newConn())
+	assert.Equal(t, poolSize.total, 1.0)
+
+	_, ok := pool.Take("key")
+	assert.That(t, ok)
+	assert.Equal(t, hits.total, 1.0)
+	assert.Equal(t, poolSize.total, 0.0)
+
+	_, ok = pool.Take("miss")
+	assert.That(t, !ok)
+	assert.Equal(t, misses.total, 1.0)
+
+	// Turn recording back off — counters should stop incrementing.
+	recording = false
+	pool.Put("key", newConn())
+	assert.Equal(t, poolSize.total, 0.0) // unchanged
+
+	pool.Take("key")
+	assert.Equal(t, hits.total, 1.0) // unchanged
+
+	pool.Take("miss2")
+	assert.Equal(t, misses.total, 1.0) // unchanged
+}
+
 func BenchmarkPool(b *testing.B) {
 	ctx := drpctest.NewTracker(b)
 	defer ctx.Close()

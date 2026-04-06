@@ -61,10 +61,11 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		tr: tr,
 	}
 
+	shouldWrap := opts.ShouldRecord != nil
 	if opts.ShouldRecord == nil {
 		opts.ShouldRecord = func() bool { return false }
 	}
-	if opts.ShouldRecord() {
+	if shouldWrap {
 		mt := drpcmetrics.ToMeteredTransport(tr, opts.Metrics.BytesSent,
 			opts.Metrics.BytesRecv, opts.ShouldRecord)
 		c.tr = mt

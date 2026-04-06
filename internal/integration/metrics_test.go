@@ -165,6 +165,90 @@ func TestClientByteMetricsNotCollected(t *testing.T) {
 	_ = conn.Close()
 }
 
+func TestClientByteMetricsShouldRecordFalse(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	sent := &testCounter{}
+	recv := &testCounter{}
+
+	c1, c2 := net.Pipe()
+	mux := drpcmux.New()
+	assert.NoError(t, DRPCRegisterService(mux, standardImpl))
+	srv := drpcserver.New(mux)
+	ctx.Run(func(ctx2 context.Context) { _ = srv.ServeOne(ctx2, c1) })
+	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
+		Metrics: drpcmetrics.ClientMetrics{
+			BytesSent: sent,
+			BytesRecv: recv,
+		},
+		ShouldRecord: func() bool { return false },
+	})
+	cli := NewDRPCServiceClient(conn)
+
+	out, err := cli.Method1(ctx, in(1))
+	assert.NoError(t, err)
+	assert.True(t, Equal(out, &Out{Out: 1}))
+
+	// ShouldRecord returns false, so no metrics should be collected
+	// even though the transport is wrapped.
+	assert.Equal(t, sent.total(), 0.0)
+	assert.Equal(t, recv.total(), 0.0)
+
+	_ = conn.Close()
+}
+
+func TestClientByteMetricsShouldRecordDynamic(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	recording := false
+	sent := &testCounter{}
+	recv := &testCounter{}
+
+	c1, c2 := net.Pipe()
+	mux := drpcmux.New()
+	assert.NoError(t, DRPCRegisterService(mux, standardImpl))
+	srv := drpcserver.New(mux)
+	ctx.Run(func(ctx2 context.Context) { _ = srv.ServeOne(ctx2, c1) })
+	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
+		Manager: drpcmanager.Options{},
+		Metrics: drpcmetrics.ClientMetrics{
+			BytesSent: sent,
+			BytesRecv: recv,
+		},
+		ShouldRecord: func() bool { return recording },
+	})
+	cli := NewDRPCServiceClient(conn)
+
+	// Recording off — no metrics.
+	out, err := cli.Method1(ctx, in(1))
+	assert.NoError(t, err)
+	assert.True(t, Equal(out, &Out{Out: 1}))
+	assert.Equal(t, sent.total(), 0.0)
+	assert.Equal(t, recv.total(), 0.0)
+
+	// Turn recording on — metrics should now be collected.
+	recording = true
+	out, err = cli.Method1(ctx, in(1))
+	assert.NoError(t, err)
+	assert.True(t, Equal(out, &Out{Out: 1}))
+	assert.That(t, sent.total() > 0)
+	assert.That(t, recv.total() > 0)
+
+	// Turn recording back off — counters should stop incrementing.
+	sentBefore := sent.total()
+	recvBefore := recv.total()
+	recording = false
+	out, err = cli.Method1(ctx, in(1))
+	assert.NoError(t, err)
+	assert.True(t, Equal(out, &Out{Out: 1}))
+	assert.Equal(t, sent.total(), sentBefore)
+	assert.Equal(t, recv.total(), recvBefore)
+
+	_ = conn.Close()
+}
+
 func TestServerTLSHandshakeErrorMetric(t *testing.T) {
 	tlsErrors := &testCounter{}
 
