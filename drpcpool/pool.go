@@ -73,7 +73,10 @@ func New[K comparable, V Conn](opts Options) *Pool[K, V] {
 // initPoolMetrics copies the caller-supplied metrics into the pool,
 // substituting no-op implementations for any nil fields.
 func (p *Pool[K, V]) initPoolMetrics() {
-	if p.opts.ShouldRecord == nil || !p.opts.ShouldRecord() {
+	if p.opts.ShouldRecord == nil {
+		p.opts.ShouldRecord = func() bool { return false }
+	}
+	if !p.opts.ShouldRecord() {
 		return
 	}
 	metrics := &p.opts.Metrics
@@ -89,21 +92,21 @@ func (p *Pool[K, V]) initPoolMetrics() {
 }
 
 func (p *Pool[K, V]) recordHit() {
-	if p.opts.ShouldRecord == nil || !p.opts.ShouldRecord() {
+	if !p.opts.ShouldRecord() {
 		return
 	}
 	p.opts.Metrics.ConnectionHitsTotal.Inc(p.opts.Labels, 1)
 }
 
 func (p *Pool[K, V]) recordMiss() {
-	if p.opts.ShouldRecord == nil || !p.opts.ShouldRecord() {
+	if !p.opts.ShouldRecord() {
 		return
 	}
 	p.opts.Metrics.ConnectionMissesTotal.Inc(p.opts.Labels, 1)
 }
 
 func (p *Pool[K, V]) updatePoolSize() {
-	if p.opts.ShouldRecord == nil || !p.opts.ShouldRecord() {
+	if !p.opts.ShouldRecord() {
 		return
 	}
 	p.opts.Metrics.PoolSize.Update(p.opts.Labels, int64(p.order.count))
