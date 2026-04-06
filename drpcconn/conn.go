@@ -30,8 +30,10 @@ type Options struct {
 	// rpcs it creates.
 	CollectStats bool
 
-	// CollectMetrics controls whether the client should collect metrics.
-	CollectMetrics bool
+	// ShouldRecord, if non-nil, controls whether metrics are recorded.
+	// When it returns true, the transport is wrapped to track bytes
+	// sent and received.
+	ShouldRecord func() bool
 
 	// Metrics holds optional metrics the client will populate.
 	Metrics drpcmetrics.ClientMetrics
@@ -59,9 +61,9 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		tr: tr,
 	}
 
-	if opts.CollectMetrics {
+	if opts.ShouldRecord != nil && opts.ShouldRecord() {
 		mt := drpcmetrics.ToMeteredTransport(tr, opts.Metrics.BytesSent,
-			opts.Metrics.BytesRecv)
+			opts.Metrics.BytesRecv, opts.ShouldRecord)
 		c.tr = mt
 	}
 

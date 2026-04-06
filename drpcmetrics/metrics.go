@@ -6,9 +6,7 @@
 // Package drpcmetrics defines types and helpers for drpc metrics.
 package drpcmetrics
 
-import (
-	"storj.io/drpc"
-)
+import "storj.io/drpc"
 
 // Counter is a metric that can only be incremented (monotonically increasing).
 // The concrete type must provide a thread-safe implementation for the method.
@@ -56,15 +54,18 @@ func (NoOpGauge) Update(labels map[string]string, v int64) {}
 // Read and Write call.
 type meteredTransport struct {
 	drpc.Transport
-	bytesSent Counter
-	bytesRecv Counter
+	bytesSent    Counter
+	bytesRecv    Counter
+	shouldRecord func() bool
 }
 
 // ToMeteredTransport returns a transport that increments bytesSent and
 // bytesRecv on each Write and Read call respectively. Nil counters are
 // replaced with no-op implementations.
-func ToMeteredTransport(tr drpc.Transport, bytesSent,
-	bytesRecv Counter) drpc.Transport {
+func ToMeteredTransport(
+	tr drpc.Transport, bytesSent,
+	bytesRecv Counter, shouldRecord func() bool,
+) drpc.Transport {
 	if bytesSent == nil {
 		bytesSent = NoOpCounter{}
 	}
@@ -72,13 +73,13 @@ func ToMeteredTransport(tr drpc.Transport, bytesSent,
 		bytesRecv = NoOpCounter{}
 	}
 	return &meteredTransport{Transport: tr, bytesSent: bytesSent,
-		bytesRecv: bytesRecv}
+		bytesRecv: bytesRecv, shouldRecord: shouldRecord}
 }
 
 // Read reads from the underlying transport and increments bytesRecv.
 func (t *meteredTransport) Read(p []byte) (n int, err error) {
 	n, err = t.Transport.Read(p)
-	if n > 0 {
+	if n > 0 && t.shouldRecord() {
 		t.bytesRecv.Inc(int64(n))
 	}
 	return n, err
@@ -87,7 +88,7 @@ func (t *meteredTransport) Read(p []byte) (n int, err error) {
 // Write writes to the underlying transport and increments bytesSent.
 func (t *meteredTransport) Write(p []byte) (n int, err error) {
 	n, err = t.Transport.Write(p)
-	if n > 0 {
+	if n > 0 && t.shouldRecord() {
 		t.bytesSent.Inc(int64(n))
 	}
 	return n, err

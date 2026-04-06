@@ -35,7 +35,8 @@ type dialOptions struct {
 
 	// metrics holds optional metrics the conn will populate. If nil, no
 	// metrics are recorded.
-	metrics *drpcmetrics.ClientMetrics
+	metrics      *drpcmetrics.ClientMetrics
+	shouldRecord func() bool
 }
 
 // DialOption configures how we set up the client connection.
@@ -83,6 +84,15 @@ func WithMetrics(metrics *drpcmetrics.ClientMetrics) DialOption {
 	}
 }
 
+// WithShouldRecordFunc returns a DialOption that sets a function to control
+// whether metrics are recorded. If the function returns false, no metrics
+// are collected.
+func WithShouldRecordFunc(shouldRecord func() bool) DialOption {
+	return func(o *dialOptions) {
+		o.shouldRecord = shouldRecord
+	}
+}
+
 // WithContextDialer returns a DialOption that sets a custom dialer function
 // to be used instead of the default net.Dialer.
 func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) DialOption {
@@ -91,7 +101,9 @@ func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) D
 	}
 }
 
-func DialContext(ctx context.Context, address string, opts ...DialOption) (conn *drpcconn.Conn, err error) {
+func DialContext(
+	ctx context.Context, address string, opts ...DialOption,
+) (conn *drpcconn.Conn, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var options dialOptions
@@ -134,9 +146,7 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (conn 
 		}
 	}
 
-	collectMetrics := true
 	if options.metrics == nil {
-		collectMetrics = false
 		options.metrics = &drpcmetrics.ClientMetrics{}
 	}
 	return drpcconn.NewWithOptions(netConn, drpcconn.Options{
@@ -149,7 +159,7 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (conn 
 			},
 			SoftCancel: false,
 		},
-		CollectMetrics: collectMetrics,
-		Metrics:        *options.metrics,
+		ShouldRecord: options.shouldRecord,
+		Metrics:      *options.metrics,
 	}), nil
 }

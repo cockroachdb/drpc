@@ -66,8 +66,8 @@ func createMeteredClientConnection(
 	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
 	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
 		Manager:        drpcmanager.Options{},
-		Metrics:        metrics,
-		CollectMetrics: true,
+		Metrics:      metrics,
+		ShouldRecord: func() bool { return true },
 	})
 	return NewDRPCServiceClient(conn), func() {
 		_ = conn.Close()
@@ -158,7 +158,7 @@ func TestClientByteMetricsNotCollected(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, Equal(out, &Out{Out: 1}))
 
-	// CollectMetrics is false, so no metrics should be collected.
+	// ShouldRecord is nil, so no metrics should be collected.
 	assert.Equal(t, sent.total(), 0.0)
 	assert.Equal(t, recv.total(), 0.0)
 
