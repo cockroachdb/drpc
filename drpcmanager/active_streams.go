@@ -59,27 +59,23 @@ func (r *activeStreams) Get(id uint64) (*drpcstream.Stream, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	if r.closed {
+		return nil, false
+	}
 	s, ok := r.streams[id]
 	return s, ok
 }
 
-// Close marks the collection as closed, preventing future Add calls.
-// It does not cancel any streams.
-func (r *activeStreams) Close() {
+// Close cancels all active streams with the given error, clears the
+// collection, and marks it as closed to prevent future Add calls.
+func (r *activeStreams) Close(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.closed = true
-}
-
-// ForEach calls fn for each active stream. The collection is read-locked
-// during iteration.
-func (r *activeStreams) ForEach(fn func(*drpcstream.Stream)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for _, s := range r.streams {
-		fn(s)
+	for id, s := range r.streams {
+		s.Cancel(err)
+		delete(r.streams, id)
 	}
 }
 

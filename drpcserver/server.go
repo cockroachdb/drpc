@@ -139,7 +139,7 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		}
 	}
 
-	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
+	man := drpcmanager.NewWithOptions(tr, drpcmanager.Server, s.opts.Manager)
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()

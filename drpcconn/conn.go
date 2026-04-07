@@ -56,7 +56,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		c.stats = make(map[string]*drpcstats.Stats)
 	}
 
-	c.man = drpcmanager.NewWithOptions(tr, opts.Manager)
+	c.man = drpcmanager.NewWithOptions(tr, drpcmanager.Client, opts.Manager)
 
 	return c
 }
