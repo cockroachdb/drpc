@@ -1,0 +1,21 @@
+name: Check Do Not Merge
+
+on:
+  pull_request:
+    branches:
+    - main
+    types: [opened, reopened, labeled, unlabeled]
+
+jobs:
+
+  check-do-not-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block merge if do-not-merge label is present
+        env:
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'do-not-merge') }}
+        run: |
+          if [ "$HAS_LABEL" = "true" ]; then
+            echo "::error::PR has the 'do-not-merge' label. Remove it before merging."
+            exit 1
+          fi

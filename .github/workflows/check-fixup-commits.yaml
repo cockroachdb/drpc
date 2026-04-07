@@ -1,0 +1,24 @@
+name: Check Fixup Commits
+
+on:
+  pull_request:
+    branches:
+    - main
+
+jobs:
+
+  check-fixup-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check for fixup or squash commits
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          COMMITS=$(git log --oneline "origin/${{ github.base_ref }}..HEAD" --grep="^fixup!" --grep="^squash!" --format="%h %s")
+          if [ -n "$COMMITS" ]; then
+            echo "::error::PR contains fixup/squash commits that must be squashed before merging:"
+            echo "$COMMITS"
+            exit 1
+          fi
