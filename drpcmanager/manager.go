@@ -81,7 +81,17 @@ type Manager struct {
 		read  drpcsignal.Signal // set after the goroutine reading from the transport is done
 		tport drpcsignal.Signal // set after the transport has been closed
 	}
+
+	kind ManagerKind
 }
+
+type ManagerKind uint8
+
+const (
+	_ ManagerKind = iota
+	Client
+	Server
+)
 
 type invokeAssembler struct {
 	metadata map[string]string        // accumulated invoke metadata
@@ -97,13 +107,13 @@ type invokeInfo struct {
 }
 
 // New returns a new Manager for the transport.
-func New(tr drpc.Transport) *Manager {
-	return NewWithOptions(tr, Options{})
+func New(tr drpc.Transport, kind ManagerKind) *Manager {
+	return NewWithOptions(tr, kind, Options{})
 }
 
 // NewWithOptions returns a new manager for the transport. It uses the provided
 // options to manage details of how it uses it.
-func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
+func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager {
 	m := &Manager{
 		tr:   tr,
 		wr:   drpcwire.NewWriter(tr, opts.WriterBufferSize),
@@ -111,6 +121,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 		opts: opts,
 
 		invokes: make(chan invokeInfo),
+		kind:    kind,
 	}
 
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
@@ -144,7 +155,13 @@ func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
 		m.sigs.tport.Set(m.tr.Close())
-		m.streams.Close()
+		if errors.Is(err, io.EOF) {
+			err = context.Canceled
+			if m.kind == Client {
+				err = drpc.ClosedError.New("connection closed")
+			}
+		}
+		m.streams.Close(err)
 	}
 }
 
@@ -268,17 +285,6 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 	defer m.wg.Done()
 	defer m.streams.Remove(stream.ID())
 	select {
-	case <-m.sigs.term.Signal():
-		err := m.sigs.term.Err()
-		if errors.Is(err, io.EOF) {
-			err = context.Canceled
-			if stream.Kind() == drpc.StreamKindClient {
-				err = drpc.ClosedError.New("connection closed")
-			}
-		}
-		stream.Cancel(err)
-		<-stream.Finished()
-
 	case <-stream.Finished():
 
 	case <-ctx.Done():

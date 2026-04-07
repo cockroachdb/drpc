@@ -76,14 +76,6 @@ type Stream interface {
 	// received on it.
 	Context() context.Context
 
-	// Kind returns the type of the stream ("unknown", "cli", or "srv"). Client
-	// and server streams must be treated differently for error handling and
-	// logging purposes.
-	//
-	// Client streams return Unavailable errors when the remote closes the
-	// connection, while server streams return Canceled errors.
-	Kind() StreamKind
-
 	// MsgSend sends the Message to the remote.
 	MsgSend(msg Message, enc Encoding) error
 
