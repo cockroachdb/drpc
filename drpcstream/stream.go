@@ -47,6 +47,11 @@ type Stream struct {
 	opts Options
 	task *trace.Task
 
+	// write and read serialize operations within a stream. The data path
+	// (MsgSend/MsgRecv) and the control path (SendCancel/Close/SendError)
+	// genuinely race because cancellation arrives from manageStream while the
+	// application may be mid-send. These are inspectMutex (not sync.Mutex) so
+	// that checkFinished can test whether ops are in flight without blocking.
 	write inspectMutex
 	read  inspectMutex
 	flush sync.Once
@@ -62,6 +67,13 @@ type Stream struct {
 	sigs struct {
 		send   drpcsignal.Signal // set when done sending messages
 		recv   drpcsignal.Signal // set when done receiving messages
+		// Stream shutdown is two-phase: term then fin. When termination arrives
+		// (remote error, local cancel, close), there may be an in-flight write
+		// on the transport that is past the term check and inside WriteFrame.
+		// term tells new operations to bail out; fin signals that all in-flight
+		// operations have actually completed. Consumers (manageStream) wait on
+		// fin before cleaning up, guaranteeing no goroutine is touching the
+		// stream afterward.
 		term   drpcsignal.Signal // set when the stream is terminating and no new ops should begin
 		fin    drpcsignal.Signal // set when the stream is finished and all ops are complete
 		cancel drpcsignal.Signal // set when externally canceled
@@ -300,9 +312,11 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 // helpers
 //
 
-// checkFinished checks to see if the stream is terminated, and if so, sets the
-// finished flag. This must be called after every read or write is complete, as
-// well as when the stream becomes terminated.
+// checkFinished bridges the two-phase shutdown. It is called in two places:
+// inside terminate() for when no I/O is in flight (fin fires immediately),
+// and deferred after every read/write unlock for when an operation was in
+// flight at termination time (fin fires once the last operation completes).
+// Whichever call site runs last sees term set and both locks free, and sets fin.
 func (s *Stream) checkFinished() {
 	if s.sigs.term.IsSet() && s.write.Unlocked() && s.read.Unlocked() {
 		if s.sigs.fin.Set(nil) {
