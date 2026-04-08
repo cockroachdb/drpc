@@ -309,10 +309,8 @@ func (m *Manager) Closed() <-chan struct{} {
 }
 
 // Unblocked returns a channel that is closed when the manager is no longer
-// blocked from creating a new stream due to a previous stream's soft cancel. It
-// should not be called concurrently with NewClientStream or NewServerStream and
-// the return result is only valid until the next call to NewClientStream or
-// NewServerStream.
+// blocked. With multiplexing, multiple streams run concurrently and this
+// channel is always closed immediately.
 func (m *Manager) Unblocked() <-chan struct{} {
 	return closedCh
 }

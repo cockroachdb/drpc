@@ -5,7 +5,6 @@ package drpcconn
 
 import (
 	"context"
-	"sync"
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
@@ -13,30 +12,20 @@ import (
 	"storj.io/drpc/drpcenc"
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcmetadata"
-	"storj.io/drpc/drpcstats"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpcwire"
-	"storj.io/drpc/internal/drpcopts"
 )
 
 // Options controls configuration settings for a conn.
 type Options struct {
 	// Manager controls the options we pass to the manager of this conn.
 	Manager drpcmanager.Options
-
-	// CollectStats controls whether the server should collect stats on the
-	// rpcs it creates.
-	CollectStats bool
 }
 
 // Conn is a drpc client connection.
 type Conn struct {
-	tr   drpc.Transport
-	man  *drpcmanager.Manager
-	mu   sync.Mutex
-	wbuf []byte
-
-	stats map[string]*drpcstats.Stats
+	tr  drpc.Transport
+	man *drpcmanager.Manager
 }
 
 var _ drpc.Conn = (*Conn)(nil)
@@ -51,39 +40,9 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		tr: tr,
 	}
 
-	if opts.CollectStats {
-		drpcopts.SetManagerStatsCB(&opts.Manager.Internal, c.getStats)
-		c.stats = make(map[string]*drpcstats.Stats)
-	}
-
 	c.man = drpcmanager.NewWithOptions(tr, drpcmanager.Client, opts.Manager)
 
 	return c
-}
-
-// Stats returns the collected stats grouped by rpc.
-func (c *Conn) Stats() map[string]drpcstats.Stats {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	stats := make(map[string]drpcstats.Stats, len(c.stats))
-	for k, v := range c.stats {
-		stats[k] = v.AtomicClone()
-	}
-	return stats
-}
-
-// getStats returns the drpcopts.Stats struct for the given rpc.
-func (c *Conn) getStats(rpc string) *drpcstats.Stats {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	stats := c.stats[rpc]
-	if stats == nil {
-		stats = new(drpcstats.Stats)
-		c.stats[rpc] = stats
-	}
-	return stats
 }
 
 // Transport returns the transport the conn is using.
@@ -93,15 +52,15 @@ func (c *Conn) Transport() drpc.Transport { return c.tr }
 func (c *Conn) Closed() <-chan struct{} { return c.man.Closed() }
 
 // Unblocked returns a channel that is closed once the connection is no longer
-// blocked by a previously canceled Invoke or NewStream call. It should not
-// be called concurrently with Invoke or NewStream.
+// blocked. With multiplexing, multiple streams run concurrently and this
+// channel is always closed immediately.
 func (c *Conn) Unblocked() <-chan struct{} { return c.man.Unblocked() }
 
 // Close closes the connection.
 func (c *Conn) Close() (err error) { return c.man.Close() }
 
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
-// deserializes it into out. Only one Invoke or Stream may be open at a time.
+// deserializes it into out.
 func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
@@ -117,18 +76,13 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	}
 	defer func() { err = errs.Combine(err, stream.Close()) }()
 
-	// we have to protect c.wbuf here even though the manager only allows one
-	// stream at a time because the stream may async close allowing another
-	// concurrent call to Invoke to proceed.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.wbuf, err = drpcenc.MarshalAppend(in, enc, c.wbuf[:0])
+	// TODO: use buffer pool to reduce allocations
+	data, err := drpcenc.MarshalAppend(in, enc, nil)
 	if err != nil {
 		return err
 	}
 
-	if err := c.doInvoke(stream, enc, rpc, c.wbuf, metadata, out); err != nil {
+	if err := c.doInvoke(stream, enc, rpc, data, metadata, out); err != nil {
 		return err
 	}
 	return nil
@@ -150,8 +104,7 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 	return nil
 }
 
-// NewStream begins a streaming rpc on the connection. Only one Invoke or Stream may
-// be open at a time.
+// NewStream begins a streaming rpc on the connection.
 func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
