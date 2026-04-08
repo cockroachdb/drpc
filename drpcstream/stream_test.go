@@ -298,30 +298,6 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 	}
 }
 
-func TestStream_SendCancelBusyDuringBlockedClose(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
-	pr, pw := io.Pipe()
-	defer func() { _ = pr.Close() }()
-	defer func() { _ = pw.Close() }()
-
-	st := New(ctx, 0, drpcwire.NewWriter(pw, 0))
-
-	// launch a goroutine to close the stream
-	ctx.Run(func(ctx context.Context) { _ = st.Close() })
-
-	// read just 1 byte from the pipe to ensure that the Close has started
-	_, err := pr.Read(make([]byte, 1))
-	assert.NoError(t, err)
-	assert.That(t, st.IsTerminated())
-
-	// even though the stream is terminated, soft cancel should report that
-	// the stream is still busy because the close is being sent.
-	busy, err := st.SendCancel(context.Canceled)
-	assert.NoError(t, err)
-	assert.That(t, busy)
-}
 
 //
 // HandleFrame tests

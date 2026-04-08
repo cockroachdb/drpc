@@ -197,7 +197,7 @@ func runRandomized(t *testing.T, prog []byte, r runner) {
 	defer func() { _ = ps.Close() }()
 
 	wr := drpcwire.NewWriter(pc, 0)
-	man := New(ps)
+	man := New(ps, Server)
 	defer func() { _ = man.Close() }()
 
 	errch := make(chan error, 1)
