@@ -64,9 +64,7 @@ type Manager struct {
 
 	wg sync.WaitGroup // tracks active manageStream goroutines
 
-	// streams tracks active streams. Currently holds at most one active stream;
-	// a second may briefly coexist during stream handoff (old stream's Remove
-	// races with new stream's Add).
+	// streams tracks active streams.
 	streams *activeStreams
 
 	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream

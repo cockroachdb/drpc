@@ -60,7 +60,7 @@ type Stream struct {
 
 	id   drpcwire.ID
 	wr   *drpcwire.Writer
-	pbuf packetBuffer
+	pbuf packetQueue
 	wbuf []byte
 
 	mu   sync.Mutex // protects state transitions
@@ -594,10 +594,9 @@ func (s *Stream) SendError(serr error) (err error) {
 	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindError, false, drpcwire.MarshalError(serr)))
 }
 
-// SendCancel transitions the stream into the canceled state with
-// context.Canceled and sends a cancel error to the remote side for a soft
-// cancel. It is a no-op if the stream is already terminated. It returns true
-// for busy if writes are already blocked and a hard cancel is required.
+// SendCancel terminates the stream and sends a cancel to the remote side. It
+// blocks until any in-progress write completes. It is a no-op if the stream is
+// already terminated.
 func (s *Stream) SendCancel(err error) error {
 	s.log("CALL", func() string { return "SendCancel()" })
 
