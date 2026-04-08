@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,15 +20,6 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
-func closed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
-
 func TestDrpcMetadata(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
@@ -38,10 +28,10 @@ func TestDrpcMetadata(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	cman := New(cconn)
+	cman := New(cconn, Client)
 	defer func() { _ = cman.Close() }()
 
-	sman := NewWithOptions(sconn, Options{
+	sman := NewWithOptions(sconn, Server, Options{
 		GRPCMetadataCompatMode: false,
 	})
 	defer func() { _ = sman.Close() }()
@@ -59,10 +49,7 @@ func TestDrpcMetadata(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
 		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
-
 		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
 	})
 
 	ctx.Run(func(ctx context.Context) {
@@ -98,10 +85,10 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	cman := New(cconn)
+	cman := New(cconn, Client)
 	defer func() { _ = cman.Close() }()
 
-	sman := NewWithOptions(sconn, Options{
+	sman := NewWithOptions(sconn, Server, Options{
 		GRPCMetadataCompatMode: true,
 	})
 	defer func() { _ = sman.Close() }()
@@ -119,10 +106,7 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
 		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
-
 		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
 	})
 
 	ctx.Run(func(ctx context.Context) {
@@ -196,7 +180,7 @@ func TestManageReader_GlobalMonotonicity_SameStream(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	// Consume the invoke and drain messages so HandleFrame doesn't block.
@@ -219,33 +203,6 @@ func TestManageReader_GlobalMonotonicity_SameStream(t *testing.T) {
 	waitForClosed(t, man)
 }
 
-// Cross-stream monotonicity: after seeing stream 2, a frame for stream 1
-// with a higher message ID is still rejected because {1,x} < {2,y}.
-func TestManageReader_GlobalMonotonicity_CrossStream(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
-	cconn, sconn := net.Pipe()
-	defer func() { _ = cconn.Close() }()
-	defer func() { _ = sconn.Close() }()
-
-	man := New(sconn)
-	defer func() { _ = man.Close() }()
-
-	// Consume both invokes so manageReader can proceed.
-	ctx.Run(func(ctx context.Context) {
-		_, _, _ = man.NewServerStream(ctx)
-		_, _, _ = man.NewServerStream(ctx)
-	})
-
-	writeFrames(t, cconn,
-		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
-		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
-		createFrame(drpcwire.KindMessage, 1, 4, "bad", true),
-	)
-
-	waitForClosed(t, man)
-}
 
 // Invoke replay: after [s1,m1,invoke,done=true], lastFrameID is bumped to
 // {1,2}. A replayed [s1,m1,invoke] is caught by the monotonicity check.
@@ -257,7 +214,7 @@ func TestManageReader_InvokeReplayBlocked(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	ctx.Run(func(ctx context.Context) {
@@ -282,7 +239,7 @@ func TestManageReader_ContinuationFramesAccepted(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	recv := make(chan []byte, 1)
@@ -303,8 +260,8 @@ func TestManageReader_ContinuationFramesAccepted(t *testing.T) {
 	assert.DeepEqual(t, <-recv, []byte("hello"))
 }
 
-// Old-stream frames are silently ignored on the client side when the local
-// stream ID has advanced past the incoming frame's stream ID.
+// Old-stream frames are silently ignored when the stream has been cancelled
+// and removed from the registry.
 func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
@@ -313,11 +270,10 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	cman := NewWithOptions(cconn, Options{SoftCancel: true})
+	cman := New(cconn, Client)
 	defer func() { _ = cman.Close() }()
 
-	// Drain all client writes so nothing blocks, and write server
-	// responses once we've seen enough data.
+	// Drain all client writes so nothing blocks.
 	ctx.Run(func(ctx context.Context) {
 		buf := make([]byte, 4096)
 		for {
@@ -328,13 +284,13 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 		}
 	})
 
-	// Create stream 1 on the client, then cancel it so the client
-	// advances to stream 2.
+	// Create stream 1 on the client, then cancel it so it's removed
+	// from the registry.
 	subctx, cancel := context.WithCancel(ctx)
-	_, err := cman.NewClientStream(subctx, "rpc1")
+	stream1, err := cman.NewClientStream(subctx, "rpc1")
 	assert.NoError(t, err)
 	cancel()
-	<-cman.Unblocked()
+	<-stream1.Finished()
 
 	stream2, err := cman.NewClientStream(ctx, "rpc2")
 	assert.NoError(t, err)
@@ -363,7 +319,7 @@ func TestManageReader_ValidInvokeSequence(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	recv := make(chan []byte, 1)
@@ -395,7 +351,7 @@ func TestManageReader_MultiFrameDelivery(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	recv := make(chan []byte, 1)
@@ -428,7 +384,7 @@ func TestManageReader_HigherMsgDiscardsInProgress(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	recv := make(chan []byte, 1)
@@ -459,7 +415,7 @@ func TestManageReader_KindChangeWithinPacket(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	ctx.Run(func(ctx context.Context) {
@@ -492,7 +448,7 @@ func TestManageReader_MultiFrameWithSkippedMessageID(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	recv := make(chan []byte, 1)
@@ -523,7 +479,7 @@ func TestManageReader_InvokeOnExistingStream(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	ctx.Run(func(ctx context.Context) {
@@ -552,7 +508,7 @@ func TestManageReader_WaitsForStreamCreation(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := New(sconn, Server)
 	defer func() { _ = man.Close() }()
 
 	// Write invoke + message immediately. The message arrives before
@@ -578,137 +534,3 @@ func TestManageReader_WaitsForStreamCreation(t *testing.T) {
 	assert.DeepEqual(t, <-recv, []byte("data"))
 }
 
-type blockingTransport chan struct{}
-
-func (b blockingTransport) Read(p []byte) (n int, err error)  { <-b; return 0, io.EOF }
-func (b blockingTransport) Write(p []byte) (n int, err error) { <-b; return 0, io.EOF }
-func (b blockingTransport) Close() error                      { close(b); return nil }
-
-func TestUnblocked_NoCancel(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
-	cconn, sconn := net.Pipe()
-	defer func() { _ = cconn.Close() }()
-	defer func() { _ = sconn.Close() }()
-
-	cman := New(cconn)
-	defer func() { _ = cman.Close() }()
-
-	sman := New(sconn)
-	defer func() { _ = sman.Close() }()
-
-	ctx.Run(func(ctx context.Context) {
-		stream, err := cman.NewClientStream(ctx, "rpc")
-		assert.NoError(t, err)
-		defer func() { _ = stream.Close() }()
-
-		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
-		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
-		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
-
-		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
-	})
-
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := sman.NewServerStream(ctx)
-		assert.NoError(t, err)
-		defer func() { _ = stream.Close() }()
-
-		_, err = stream.RawRecv()
-		assert.NoError(t, err)
-
-		_, err = stream.RawRecv()
-		assert.That(t, errors.Is(err, io.EOF))
-	})
-
-	ctx.Wait()
-}
-
-func TestUnblocked_SoftCancel(t *testing.T) {
-	run := func(t *testing.T, softCancel bool) {
-		ctx := drpctest.NewTracker(t)
-		defer ctx.Close()
-
-		tr := newBlockedTransport()
-		man := NewWithOptions(tr, Options{SoftCancel: softCancel})
-		defer func() { _ = man.Close() }()
-		defer tr.setReadOpen(true)
-		defer tr.setWriteOpen(true)
-
-		for i := 0; i < 10; i++ {
-			func() {
-				subctx, cancel := context.WithCancel(ctx)
-				defer cancel()
-
-				stream, err := man.NewClientStream(subctx, "rpc")
-				if softCancel {
-					assert.NoError(t, err)
-				} else if i > 0 {
-					assert.Error(t, err)
-					return
-				}
-				defer func() { _ = stream.Close() }()
-
-				assert.That(t, !closed(man.Unblocked()))
-				cancel()
-
-				// temporary unblock writing to allow the stream to finish soft cancel
-				tr.setWriteOpen(true)
-				<-man.Unblocked()
-				tr.setWriteOpen(false)
-			}()
-		}
-	}
-
-	t.Run("Enabled", func(t *testing.T) { run(t, true) })
-	t.Run("Disabled", func(t *testing.T) { run(t, false) })
-}
-
-type blockedTransport struct {
-	mu *sync.Mutex
-	co *sync.Cond
-	ro bool
-	wo bool
-}
-
-func newBlockedTransport() *blockedTransport {
-	mu := new(sync.Mutex)
-	co := sync.NewCond(mu)
-	return &blockedTransport{
-		mu: mu,
-		co: co,
-	}
-}
-
-func (b *blockedTransport) setWriteOpen(open bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.wo = open
-	b.co.Broadcast()
-}
-
-func (b *blockedTransport) setReadOpen(open bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.ro = open
-	b.co.Broadcast()
-}
-
-func (b *blockedTransport) wait(p int, rw *bool) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for !*rw {
-		b.co.Wait()
-	}
-	return p, nil
-}
-
-func (b *blockedTransport) Read(p []byte) (n int, err error)  { return b.wait(len(p), &b.ro) }
-func (b *blockedTransport) Write(p []byte) (n int, err error) { return b.wait(len(p), &b.wo) }
-func (b *blockedTransport) Close() error                      { return nil }

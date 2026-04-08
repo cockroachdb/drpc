@@ -5,6 +5,7 @@ package drpcmanager
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/zeebo/assert"
@@ -73,7 +74,7 @@ func TestActiveStreams_DuplicateAdd(t *testing.T) {
 
 func TestActiveStreams_AddAfterClose(t *testing.T) {
 	streams := newActiveStreams()
-	streams.Close()
+	streams.Close(errors.New("closed"))
 
 	err := streams.Add(1, testStream(1))
 	assert.Error(t, err)
@@ -84,7 +85,7 @@ func TestActiveStreams_RemoveAfterClose(t *testing.T) {
 	s := testStream(1)
 	assert.NoError(t, streams.Add(1, s))
 
-	streams.Close()
+	streams.Close(errors.New("closed"))
 
 	// must not panic
 	streams.Remove(1)
@@ -104,31 +105,3 @@ func TestActiveStreams_Len(t *testing.T) {
 	assert.Equal(t, streams.Len(), 1)
 }
 
-func TestActiveStreams_ForEach(t *testing.T) {
-	streams := newActiveStreams()
-	s1 := testStream(1)
-	s2 := testStream(2)
-	s3 := testStream(3)
-
-	assert.NoError(t, streams.Add(1, s1))
-	assert.NoError(t, streams.Add(2, s2))
-	assert.NoError(t, streams.Add(3, s3))
-
-	seen := make(map[uint64]*drpcstream.Stream)
-	streams.ForEach(func(s *drpcstream.Stream) {
-		seen[s.ID()] = s
-	})
-
-	assert.Equal(t, len(seen), 3)
-	assert.Equal(t, seen[1], s1)
-	assert.Equal(t, seen[2], s2)
-	assert.Equal(t, seen[3], s3)
-}
-
-func TestActiveStreams_ForEach_Empty(t *testing.T) {
-	streams := newActiveStreams()
-
-	count := 0
-	streams.ForEach(func(_ *drpcstream.Stream) { count++ })
-	assert.Equal(t, count, 0)
-}
