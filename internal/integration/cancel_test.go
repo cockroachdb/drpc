@@ -15,7 +15,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"storj.io/drpc"
 	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpcpool"
 	"storj.io/drpc/drpctest"
@@ -149,15 +148,6 @@ func TestCancellationPropagation_Stream(t *testing.T) {
 
 	clientctx.Run(func(ctx context.Context) {
 		stream, _ := cli.Method4(ctx)
-
-		// this is a weird case where the rpc does not send or receive or even
-		// close the stream, and neither does the other side, and so we have to
-		// explicitly flush the invoke.
-		type (
-			getStreamer interface{ GetStream() drpc.Stream }
-			rawFlusher  interface{ RawFlush() error }
-		)
-		_ = stream.(getStreamer).GetStream().(rawFlusher).RawFlush()
 
 		called <- struct{}{}
 		select {

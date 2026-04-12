@@ -48,7 +48,6 @@ func TestDrpcMetadata(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvokeMetadata, buf))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
-		assert.NoError(t, stream.RawFlush())
 		assert.NoError(t, stream.Close())
 	})
 
@@ -105,7 +104,6 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvokeMetadata, buf))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
-		assert.NoError(t, stream.RawFlush())
 		assert.NoError(t, stream.Close())
 	})
 

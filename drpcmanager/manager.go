@@ -30,10 +30,6 @@ var managerClosed = errs.Class("manager closed")
 
 // Options controls configuration settings for a manager.
 type Options struct {
-	// WriterBufferSize controls the size of the buffer that we will fill before
-	// flushing. Normal writes to streams typically issue a flush explicitly.
-	WriterBufferSize int
-
 	// Reader are passed to any readers the manager creates.
 	Reader drpcwire.ReaderOptions
 
@@ -55,7 +51,7 @@ type Options struct {
 // to the appropriate stream.
 type Manager struct {
 	tr   drpc.Transport
-	wr   *drpcwire.Writer
+	wr   *drpcwire.MuxWriter
 	rd   *drpcwire.Reader
 	opts Options
 
@@ -114,13 +110,14 @@ func New(tr drpc.Transport, kind ManagerKind) *Manager {
 func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager {
 	m := &Manager{
 		tr:   tr,
-		wr:   drpcwire.NewWriter(tr, opts.WriterBufferSize),
 		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
 
 		invokes: make(chan invokeInfo),
 		kind:    kind,
 	}
+
+	m.wr = drpcwire.NewMuxWriter(tr, m.terminate)
 
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.
@@ -148,10 +145,14 @@ func (m *Manager) log(what string, cb func() string) {
 }
 
 // terminate puts the Manager into a terminal state and closes any resources
-// that need to be closed to signal the state change.
+// that need to be closed to signal the state change. The mux writer is stopped
+// before closing the transport so that WriteFrame immediately rejects new
+// writes; the subsequent transport close unblocks any in-flight Write in the
+// drain goroutine.
 func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
+		m.wr.Stop()
 		m.sigs.tport.Set(m.tr.Close())
 		if errors.Is(err, io.EOF) {
 			err = context.Canceled
@@ -317,8 +318,9 @@ func (m *Manager) Unblocked() <-chan struct{} {
 func (m *Manager) Close() error {
 	m.terminate(managerClosed.New("Close called"))
 
-	m.wg.Wait() // wait for all stream goroutines
-	m.sigs.read.Wait()
+	<-m.wr.Done()      // wait for writer goroutine to exit
+	m.wg.Wait()        // wait for all stream goroutines
+	m.sigs.read.Wait() // wait for reader goroutine to exit
 	m.sigs.tport.Wait()
 
 	return m.sigs.tport.Err()
