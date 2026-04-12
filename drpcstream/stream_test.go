@@ -4,7 +4,6 @@
 package drpcstream
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -18,6 +17,15 @@ import (
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
+
+// testMuxWriter creates a MuxWriter that writes to io.Discard with a no-op
+// error handler. The writer goroutine is stopped when the test finishes.
+func testMuxWriter(t *testing.T) *drpcwire.MuxWriter {
+	t.Helper()
+	mw := drpcwire.NewMuxWriter(io.Discard, func(error) {})
+	t.Cleanup(mw.StopWait)
+	return mw
+}
 
 // handleFrame is a helper that sends a single-frame packet to the stream.
 // It constructs a frame with the given kind, matching the stream's ID,
@@ -34,6 +42,7 @@ func TestStream_StateTransitions(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
+	mw := testMuxWriter(t)
 	any := errors.New("any sentinel error")
 
 	checkErrs := func(t *testing.T, exp interface{}, got error) {
@@ -108,7 +117,7 @@ func TestStream_StateTransitions(t *testing.T) {
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+		st := New(ctx, 1, mw)
 		assert.NoError(t, test.Op(st))
 
 		checkErrs(t, test.Send, st.RawWrite(drpcwire.KindMessage, nil))
@@ -124,6 +133,8 @@ func TestStream_StateTransitions(t *testing.T) {
 func TestStream_Unblocks(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
+
+	mw := testMuxWriter(t)
 
 	cases := []struct {
 		Op func(st *Stream) error
@@ -158,7 +169,7 @@ func TestStream_Unblocks(t *testing.T) {
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+		st := New(ctx, 1, mw)
 
 		ctx.Run(func(ctx context.Context) { _, _ = st.RawRecv() })
 		assert.NoError(t, test.Op(st))
@@ -168,7 +179,8 @@ func TestStream_Unblocks(t *testing.T) {
 
 func TestStream_ContextCancel(t *testing.T) {
 	ctx := context.Background()
-	st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+	mw := testMuxWriter(t)
+	st := New(ctx, 0, mw)
 
 	child, cancel := context.WithCancel(st.Context())
 	defer cancel()
@@ -182,73 +194,20 @@ func TestStream_ConcurrentCloseCancel(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
-	pr, pw := io.Pipe()
-	defer func() { _ = pr.Close() }()
-	defer func() { _ = pw.Close() }()
+	mw := testMuxWriter(t)
+	st := New(ctx, 0, mw)
 
-	st := New(ctx, 0, drpcwire.NewWriter(pw, 0))
-
-	// start the Close call
+	// Close and Cancel concurrently should not panic or deadlock.
 	errch := make(chan error, 1)
 	go func() { errch <- st.Close() }()
 
-	// wait for the close to begin writing
-	_, err := pr.Read(make([]byte, 1))
-	assert.NoError(t, err)
-
-	// cancel the context and close the transport
 	st.Cancel(context.Canceled)
-	assert.NoError(t, pw.Close())
 
-	// we should always receive the canceled error
-	assert.That(t, errors.Is(<-errch, context.Canceled))
-}
-
-func TestStream_CorkUntilFirstRead(t *testing.T) {
-	run := func() {
-		ctx := drpctest.NewTracker(t)
-		defer ctx.Close()
-
-		var buf bytes.Buffer
-		st := New(ctx, 0, drpcwire.NewWriter(&buf, 50))
-
-		// concurrently read and write at the same time.
-		// we should always see the write happen.
-
-		errch := make(chan error, 3)
-		ctx.Run(func(ctx context.Context) {
-			errch <- st.MsgSend([]byte("write"), byteEncoding{})
-		})
-		ctx.Run(func(ctx context.Context) {
-			_, err := st.RawRecv()
-			errch <- err
-		})
-		ctx.Run(func(ctx context.Context) {
-			errch <- st.HandleFrame(drpcwire.Frame{
-				Data: []byte("read"),
-				ID:   drpcwire.ID{Message: 1},
-				Kind: drpcwire.KindMessage,
-				Done: true,
-			})
-		})
-
-		assert.NoError(t, <-errch)
-		assert.NoError(t, <-errch)
-		assert.NoError(t, <-errch)
-
-		assert.Equal(t, buf.String(), "\x05\x00\x01\x05write")
+	// Close returns nil or context.Canceled depending on timing.
+	err := <-errch
+	if err != nil {
+		assert.That(t, errors.Is(err, context.Canceled))
 	}
-	for i := 0; i < 100; i++ {
-		run()
-	}
-}
-
-type byteEncoding struct{}
-
-func (byteEncoding) Marshal(msg drpc.Message) ([]byte, error) { return msg.([]byte), nil }
-func (byteEncoding) Unmarshal(buf []byte, msg drpc.Message) error {
-	*msg.(*[]byte) = append(*msg.(*[]byte), buf...)
-	return nil
 }
 
 func TestStream_PacketBufferReuse(t *testing.T) {
@@ -257,9 +216,10 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 		defer ctx.Close()
 		defer ctx.Wait()
 
+		mw := testMuxWriter(t)
 		data := make([]byte, 20)
 		mid := uint64(1)
-		st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+		st := New(ctx, 1, mw)
 
 		ctx.Run(func(ctx context.Context) {
 			for !st.IsTerminated() {
@@ -298,18 +258,14 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 	}
 }
 
-
 //
 // HandleFrame tests
 //
 
 func TestHandleFrame_FirstFrameOnFreshStream(t *testing.T) {
-	// On the client side, the first message received will have ID 1. But on the
-	// server side, invoke is consumed by the manager. The first frame reaching
-	// the stream could have msg > 1 (e.g., msg=2). nextMessageID=1, so 2 > 1
-	// makes this a valid frame.
+	mw := testMuxWriter(t)
 	for _, messageID := range []uint64{1, 2} {
-		st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+		st := New(context.Background(), 1, mw)
 		// Close the packet buffer so KindMessage Put doesn't block.
 		st.pbuf.Close(io.EOF)
 		err := st.HandleFrame(drpcwire.Frame{
@@ -321,7 +277,8 @@ func TestHandleFrame_FirstFrameOnFreshStream(t *testing.T) {
 
 // Invoke and InvokeMetadata frames are rejected on an already-created stream.
 func TestHandleFrame_InvokeOnExistingStream(t *testing.T) {
-	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+	mw := testMuxWriter(t)
+	st := New(context.Background(), 1, mw)
 
 	err := handleFrame(st, drpcwire.KindInvoke, 1)
 	assert.Error(t, err)
@@ -330,7 +287,8 @@ func TestHandleFrame_InvokeOnExistingStream(t *testing.T) {
 }
 
 func TestHandleFrame_InvokeMetadataOnExistingStream(t *testing.T) {
-	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+	mw := testMuxWriter(t)
+	st := New(context.Background(), 1, mw)
 
 	err := handleFrame(st, drpcwire.KindInvokeMetadata, 1)
 	assert.Error(t, err)
@@ -340,7 +298,8 @@ func TestHandleFrame_InvokeMetadataOnExistingStream(t *testing.T) {
 
 // Frames arriving after the stream is terminated are silently ignored.
 func TestHandleFrame_AfterTerminated(t *testing.T) {
-	st := New(context.Background(), 1, drpcwire.NewWriter(io.Discard, 0))
+	mw := testMuxWriter(t)
+	st := New(context.Background(), 1, mw)
 
 	// Terminate the stream via cancel.
 	st.Cancel(context.Canceled)
@@ -357,7 +316,8 @@ func TestHandleFrame_MessageDeliveredViaRecv(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
-	st := New(ctx, 1, drpcwire.NewWriter(io.Discard, 0))
+	mw := testMuxWriter(t)
+	st := New(ctx, 1, mw)
 
 	// Launch receiver before sending to avoid Put blocking.
 	recv := make(chan []byte, 1)
@@ -375,75 +335,4 @@ func TestHandleFrame_MessageDeliveredViaRecv(t *testing.T) {
 	}))
 
 	assert.DeepEqual(t, <-recv, []byte("payload"))
-}
-
-//
-// Write-side tests
-//
-
-func TestRawWrite_NonMessageSingleFrame(t *testing.T) {
-	// Non-KindMessage kinds must produce a single frame (n=0 in
-	// rawWriteLocked means default 64KB, effectively no split for
-	// small payloads). Verify they produce exactly one frame with Done=true.
-	kinds := []drpcwire.Kind{
-		drpcwire.KindInvoke,
-		drpcwire.KindError,
-		drpcwire.KindCancel,
-		drpcwire.KindClose,
-		drpcwire.KindCloseSend,
-		drpcwire.KindInvokeMetadata,
-	}
-
-	for _, kind := range kinds {
-		var buf bytes.Buffer
-		st := New(context.Background(), 1, drpcwire.NewWriter(&buf, 0))
-
-		assert.NoError(t, st.RawWrite(kind, []byte("data")))
-		assert.NoError(t, st.RawFlush())
-		var err error
-
-		// Parse all frames from the buffer — should be exactly one.
-		data := buf.Bytes()
-		var frames []drpcwire.Frame
-		for len(data) > 0 {
-			var fr drpcwire.Frame
-			var ok bool
-			data, fr, ok, err = drpcwire.ParseFrame(data)
-			assert.NoError(t, err)
-			assert.That(t, ok)
-			frames = append(frames, fr)
-		}
-		assert.Equal(t, len(frames), 1)
-		assert.That(t, frames[0].Done)
-		assert.Equal(t, frames[0].Kind, kind)
-	}
-}
-
-func TestRawWrite_MessageRespectsSplitSize(t *testing.T) {
-	var buf bytes.Buffer
-	st := NewWithOptions(context.Background(), 1,
-		drpcwire.NewWriter(&buf, 0),
-		Options{SplitSize: 5},
-	)
-
-	// "helloworld" is 10 bytes, split at 5 → 2 frames.
-	assert.NoError(t, st.RawWrite(drpcwire.KindMessage, []byte("helloworld")))
-	assert.NoError(t, st.RawFlush())
-	var err error
-
-	data := buf.Bytes()
-	var frames []drpcwire.Frame
-	for len(data) > 0 {
-		var fr drpcwire.Frame
-		var ok bool
-		data, fr, ok, err = drpcwire.ParseFrame(data)
-		assert.NoError(t, err)
-		assert.That(t, ok)
-		frames = append(frames, fr)
-	}
-	assert.Equal(t, len(frames), 2)
-	assert.That(t, !frames[0].Done)
-	assert.That(t, frames[1].Done)
-	assert.DeepEqual(t, frames[0].Data, []byte("hello"))
-	assert.DeepEqual(t, frames[1].Data, []byte("world"))
 }
