@@ -328,6 +328,9 @@ func (m *Manager) Close() error {
 
 // NewClientStream starts a stream on the managed transport for use by a client.
 func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpcstream.Stream, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return m.newStream(ctx, m.lastStreamID.Add(1), drpc.StreamKindClient, rpc)
 }
 

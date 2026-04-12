@@ -297,10 +297,10 @@ func (s *Stream) checkFinished() {
 	}
 }
 
-// checkCancelError will replace the error with one from the cancel signal if it
+// CheckCancelError will replace the error with one from the cancel signal if it
 // is set. This is to prevent errors from reads/writes to a transport after it
 // has been asynchronously closed due to context cancelation.
-func (s *Stream) checkCancelError(err error) error {
+func (s *Stream) CheckCancelError(err error) error {
 	if s.sigs.cancel.IsSet() {
 		return s.sigs.cancel.Err()
 	}
@@ -401,7 +401,7 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 		s.log("SEND", fr.String)
 
 		if err := s.wr.WriteFrame(fr); err != nil {
-			return s.checkCancelError(errs.Wrap(err))
+			return s.CheckCancelError(errs.Wrap(err))
 		} else if fr.Done {
 			return nil
 		}
@@ -496,7 +496,7 @@ func (s *Stream) SendError(serr error) (err error) {
 	s.terminate(termError)
 	s.mu.Unlock()
 
-	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindError, false, drpcwire.MarshalError(serr)))
+	return s.CheckCancelError(s.sendPacketLocked(drpcwire.KindError, false, drpcwire.MarshalError(serr)))
 }
 
 // SendCancel terminates the stream and sends a cancel to the remote side. It
@@ -519,7 +519,7 @@ func (s *Stream) SendCancel(err error) error {
 	s.terminate(err)
 	s.mu.Unlock()
 
-	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
+	return s.CheckCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
 }
 
 // Close terminates the stream and sends that the stream has been closed to the
@@ -540,7 +540,7 @@ func (s *Stream) Close() (err error) {
 	s.terminate(termClosed)
 	s.mu.Unlock()
 
-	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindClose, false, nil))
+	return s.CheckCancelError(s.sendPacketLocked(drpcwire.KindClose, false, nil))
 }
 
 // CloseSend informs the remote that no more messages will be sent. If the remote has
@@ -563,7 +563,7 @@ func (s *Stream) CloseSend() (err error) {
 	s.terminateIfBothClosed()
 	s.mu.Unlock()
 
-	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindCloseSend, false, nil))
+	return s.CheckCancelError(s.sendPacketLocked(drpcwire.KindCloseSend, false, nil))
 }
 
 // Cancel transitions the stream into a state where all writes to the transport will return
