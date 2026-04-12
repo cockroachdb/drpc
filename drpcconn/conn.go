@@ -89,6 +89,7 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 }
 
 func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string, data []byte, metadata []byte, out drpc.Message) (err error) {
+	defer func() { err = stream.CheckCancelError(err) }()
 	if err := stream.WriteInvoke(rpc, metadata); err != nil {
 		return err
 	}
