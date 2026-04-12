@@ -13,7 +13,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"storj.io/drpc/drpcmanager"
-	"storj.io/drpc/drpcstream"
 )
 
 var benchmarkImpl = &serviceImpl{
@@ -65,11 +64,7 @@ var benchmarkImpl = &serviceImpl{
 }
 
 func benchmarkBoth(b *testing.B, fn func(b *testing.B, in *In, client Client)) {
-	options := drpcmanager.Options{
-		Stream: drpcstream.Options{
-			ManualFlush: true,
-		},
-	}
+	options := drpcmanager.Options{}
 
 	for _, size := range []struct {
 		Name  string

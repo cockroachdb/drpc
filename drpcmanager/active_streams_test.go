@@ -6,6 +6,7 @@ package drpcmanager
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/zeebo/assert"
@@ -14,13 +15,19 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
-func testStream(id uint64) *drpcstream.Stream {
-	return drpcstream.New(context.Background(), id, &drpcwire.Writer{})
+func testMuxWriter(t *testing.T) *drpcwire.MuxWriter {
+	mw := drpcwire.NewMuxWriter(io.Discard, func(error) {})
+	t.Cleanup(func() { mw.Stop(); <-mw.Done() })
+	return mw
+}
+
+func testStream(t *testing.T, id uint64) *drpcstream.Stream {
+	return drpcstream.New(context.Background(), id, testMuxWriter(t))
 }
 
 func TestActiveStreams_AddAndGet(t *testing.T) {
 	streams := newActiveStreams()
-	s := testStream(1)
+	s := testStream(t, 1)
 
 	assert.NoError(t, streams.Add(1, s))
 
@@ -39,7 +46,7 @@ func TestActiveStreams_GetMissing(t *testing.T) {
 
 func TestActiveStreams_Remove(t *testing.T) {
 	streams := newActiveStreams()
-	s := testStream(1)
+	s := testStream(t, 1)
 
 	assert.NoError(t, streams.Add(1, s))
 	assert.Equal(t, streams.Len(), 1)
@@ -60,8 +67,8 @@ func TestActiveStreams_RemoveIdempotent(t *testing.T) {
 
 func TestActiveStreams_DuplicateAdd(t *testing.T) {
 	streams := newActiveStreams()
-	s1 := testStream(1)
-	s2 := testStream(1)
+	s1 := testStream(t, 1)
+	s2 := testStream(t, 1)
 
 	assert.NoError(t, streams.Add(1, s1))
 	assert.Error(t, streams.Add(1, s2))
@@ -76,13 +83,13 @@ func TestActiveStreams_AddAfterClose(t *testing.T) {
 	streams := newActiveStreams()
 	streams.Close(errors.New("closed"))
 
-	err := streams.Add(1, testStream(1))
+	err := streams.Add(1, testStream(t, 1))
 	assert.Error(t, err)
 }
 
 func TestActiveStreams_RemoveAfterClose(t *testing.T) {
 	streams := newActiveStreams()
-	s := testStream(1)
+	s := testStream(t, 1)
 	assert.NoError(t, streams.Add(1, s))
 
 	streams.Close(errors.New("closed"))
@@ -95,13 +102,12 @@ func TestActiveStreams_Len(t *testing.T) {
 	streams := newActiveStreams()
 	assert.Equal(t, streams.Len(), 0)
 
-	assert.NoError(t, streams.Add(1, testStream(1)))
+	assert.NoError(t, streams.Add(1, testStream(t, 1)))
 	assert.Equal(t, streams.Len(), 1)
 
-	assert.NoError(t, streams.Add(2, testStream(2)))
+	assert.NoError(t, streams.Add(2, testStream(t, 2)))
 	assert.Equal(t, streams.Len(), 2)
 
 	streams.Remove(1)
 	assert.Equal(t, streams.Len(), 1)
 }
-
