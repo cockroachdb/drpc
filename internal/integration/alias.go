@@ -25,6 +25,7 @@ type (
 	DRPCService_Method2Stream = service.DRPCService_Method2Stream
 	DRPCService_Method3Stream = service.DRPCService_Method3Stream
 	DRPCService_Method4Stream = service.DRPCService_Method4Stream
+	DRPCService_Method4Client = service.DRPCService_Method4Client
 )
 
 var (

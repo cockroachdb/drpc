@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Storj Labs, Inc.
+// Copyright (C) 2026 Cockroach Labs.
 // See LICENSE for copying information.
 
 package drpcwire
@@ -17,8 +17,8 @@ import (
 // blockingWriter blocks in Write until unblock is closed, then returns err.
 type blockingWriter struct {
 	unblock chan struct{}
-	err     error        // error to return once unblocked
-	wrote   chan []byte   // sends a copy of data on each Write entry
+	err     error       // error to return once unblocked
+	wrote   chan []byte // sends a copy of data on each Write entry
 }
 
 func newBlockingWriter() *blockingWriter {

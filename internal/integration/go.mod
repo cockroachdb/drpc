@@ -6,6 +6,7 @@ require (
 	github.com/gogo/protobuf v1.3.2
 	github.com/zeebo/assert v1.3.1
 	github.com/zeebo/errs v1.4.0
+	go.uber.org/goleak v1.3.0
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa
 	google.golang.org/grpc v1.57.2
 	google.golang.org/protobuf v1.33.0
