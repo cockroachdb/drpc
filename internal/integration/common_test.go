@@ -5,7 +5,9 @@ package integration
 
 import (
 	"context"
+	"flag"
 	"io"
+	"math/rand"
 	"net"
 	"strconv"
 	"sync"
@@ -38,7 +40,30 @@ func data(n int64) []byte {
 func in(n int64) *In   { return &In{In: n} }
 func out(n int64) *Out { return &Out{Out: n} }
 
+var transport = flag.String("transport", "", "force transport for tests: pipe, tcp, or empty for random")
+
 func createRawConnection(t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker) *drpcconn.Conn {
+	switch *transport {
+	case "pipe":
+		t.Log("transport: pipe")
+		return createPipeConnection(t, server, ctx)
+	case "tcp":
+		t.Log("transport: tcp")
+		return createTCPConnection(t, server, ctx)
+	case "":
+		if rand.Intn(2) == 0 {
+			t.Log("transport: pipe")
+			return createPipeConnection(t, server, ctx)
+		}
+		t.Log("transport: tcp")
+		return createTCPConnection(t, server, ctx)
+	default:
+		t.Fatalf("unknown -transport value: %q", *transport)
+		return nil
+	}
+}
+
+func createPipeConnection(t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker) *drpcconn.Conn {
 	c1, c2 := net.Pipe()
 	mux := drpcmux.New()
 	assert.NoError(t, DRPCRegisterService(mux, server))
@@ -54,6 +79,29 @@ func createConnection(t testing.TB, server DRPCServiceServer) (DRPCServiceClient
 		_ = conn.Close()
 		ctx.Close()
 	}
+}
+
+func createTCPConnection(t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker) *drpcconn.Conn {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	mux := drpcmux.New()
+	assert.NoError(t, DRPCRegisterService(mux, server))
+	srv := drpcserver.New(mux)
+
+	ctx.Run(func(ctx context.Context) {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_ = srv.ServeOne(ctx, conn)
+	})
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	assert.NoError(t, err)
+
+	return drpcconn.NewWithOptions(conn, drpcconn.Options{})
 }
 
 //

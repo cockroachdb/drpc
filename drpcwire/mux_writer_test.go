@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Storj Labs, Inc.
+// Copyright (C) 2026 Cockroach Labs.
 // See LICENSE for copying information.
 
 package drpcwire
