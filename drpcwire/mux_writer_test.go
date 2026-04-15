@@ -12,15 +12,13 @@ import (
 	"time"
 
 	"github.com/zeebo/assert"
-
-	"storj.io/drpc"
 )
 
 // blockingWriter blocks in Write until unblock is closed, then returns err.
 type blockingWriter struct {
 	unblock chan struct{}
-	err     error        // error to return once unblocked
-	wrote   chan []byte   // sends a copy of data on each Write entry
+	err     error       // error to return once unblocked
+	wrote   chan []byte // sends a copy of data on each Write entry
 }
 
 func newBlockingWriter() *blockingWriter {
@@ -80,7 +78,7 @@ func TestMuxWriter(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Now stop the writer and close the pipe.
-	mw.Stop()
+	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
 	pw.Close()
 	pr.Close()
@@ -90,12 +88,12 @@ func TestMuxWriter(t *testing.T) {
 
 func TestMuxWriter_WriteFrameAfterStop(t *testing.T) {
 	mw := NewMuxWriter(io.Discard, func(error) {})
-	mw.Stop()
+	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
 
 	err := mw.WriteFrame(RandFrame())
 	assert.Error(t, err)
-	assert.That(t, drpc.ClosedError.Has(err))
+	assert.Equal(t, err.Error(), "stopped")
 }
 
 func TestMuxWriter_ConcurrentWriteFrame(t *testing.T) {
@@ -141,7 +139,7 @@ func TestMuxWriter_ConcurrentWriteFrame(t *testing.T) {
 	got := make([]byte, expSize)
 	_, err := io.ReadFull(pr, got)
 	assert.NoError(t, err)
-	mw.Stop()
+	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
 	pw.Close()
 	pr.Close()
@@ -190,7 +188,7 @@ func TestMuxWriter_OnErrorCallingStopDoesNotDeadlock(t *testing.T) {
 	var mw *MuxWriter
 	mw = NewMuxWriter(fw, func(err error) {
 		// Simulate manager.terminate calling Stop.
-		mw.Stop()
+		mw.Stop(errors.New("stopped"))
 	})
 
 	assert.NoError(t, mw.WriteFrame(RandFrame()))
@@ -218,7 +216,7 @@ func TestMuxWriter_BlockedWriteUnblockedByClose(t *testing.T) {
 	}
 
 	// Simulate terminate: Stop, then unblock the writer (like tr.Close()).
-	mw.Stop()
+	mw.Stop(errors.New("stopped"))
 	bw.err = errors.New("closed")
 	close(bw.unblock)
 
@@ -241,7 +239,7 @@ func TestMuxWriter_ConcurrentStop(t *testing.T) {
 	for range n {
 		go func() {
 			defer wg.Done()
-			mw.Stop()
+			mw.Stop(errors.New("stopped"))
 		}()
 	}
 	wg.Wait()
@@ -276,7 +274,7 @@ func TestMuxWriter_StopDiscardsBufferedData(t *testing.T) {
 	}
 
 	// Stop without letting the blocked Write complete.
-	mw.Stop()
+	mw.Stop(errors.New("stopped"))
 	bw.err = errors.New("closed")
 	close(bw.unblock)
 
@@ -322,7 +320,7 @@ func TestMuxWriter_WriteFrameDuringActiveDrain(t *testing.T) {
 	close(g2.ch)
 
 	// Both batches were written. Stop and verify.
-	mw.Stop()
+	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
 }
 

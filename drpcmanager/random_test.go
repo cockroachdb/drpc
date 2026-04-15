@@ -201,7 +201,7 @@ func runRandomized(t *testing.T, prog []byte, r runner) {
 	defer func() { _ = ps.Close() }()
 
 	wr := drpcwire.NewMuxWriter(pc, func(error) {})
-	defer func() { wr.Stop(); <-wr.Done() }()
+	defer func() { wr.Stop(nil); <-wr.Done() }()
 
 	man := New(ps, Server)
 	defer func() { _ = man.Close() }()

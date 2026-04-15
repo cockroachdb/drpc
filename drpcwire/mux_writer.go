@@ -6,18 +6,17 @@ package drpcwire
 import (
 	"io"
 	"sync"
-
-	"storj.io/drpc"
 )
 
 type MuxWriter struct {
-	w       io.Writer
-	buf     []byte
-	mu      sync.Mutex
-	cond    *sync.Cond
-	closed  bool
-	onError func(error)
-	done    chan struct{}
+	w        io.Writer
+	buf      []byte
+	mu       sync.Mutex
+	cond     *sync.Cond
+	closed   bool
+	closeErr error
+	onError  func(error)
+	done     chan struct{}
 }
 
 var defaultBufferCapacity = 4096
@@ -57,6 +56,7 @@ func (mw *MuxWriter) run() {
 				return
 			}
 			mw.closed = true
+			mw.closeErr = err
 			mw.mu.Unlock()
 			if mw.onError != nil {
 				mw.onError(err)
@@ -72,18 +72,18 @@ func (mw *MuxWriter) WriteFrame(fr Frame) (err error) {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
 	if mw.closed {
-		return drpc.ClosedError.New("mux writer closed")
+		return mw.closeErr
 	}
 	mw.buf = AppendFrame(mw.buf, fr)
 	mw.cond.Signal()
 	return nil
 }
 
-func (mw *MuxWriter) Stop() {
+func (mw *MuxWriter) Stop(err error) {
 	mw.mu.Lock()
-	if mw.closed {
-	} else {
+	if !mw.closed {
 		mw.closed = true
+		mw.closeErr = err
 		mw.cond.Broadcast()
 	}
 	mw.mu.Unlock()
@@ -91,9 +91,4 @@ func (mw *MuxWriter) Stop() {
 
 func (mw *MuxWriter) Done() <-chan struct{} {
 	return mw.done
-}
-
-func (mw *MuxWriter) StopWait() {
-	mw.Stop()
-	<-mw.Done()
 }

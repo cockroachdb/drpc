@@ -201,7 +201,6 @@ func TestManageReader_GlobalMonotonicity_SameStream(t *testing.T) {
 	waitForClosed(t, man)
 }
 
-
 // Invoke replay: after [s1,m1,invoke,done=true], lastFrameID is bumped to
 // {1,2}. A replayed [s1,m1,invoke] is caught by the monotonicity check.
 func TestManageReader_InvokeReplayBlocked(t *testing.T) {
@@ -531,4 +530,3 @@ func TestManageReader_WaitsForStreamCreation(t *testing.T) {
 
 	assert.DeepEqual(t, <-recv, []byte("data"))
 }
-
