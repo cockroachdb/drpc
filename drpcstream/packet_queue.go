@@ -29,10 +29,10 @@ type packetQueue struct {
 	mu   sync.Mutex
 	cond sync.Cond
 
-	buf  [][]byte // ring buffer of byte slices
-	head int      // next write position (producer)
-	tail int      // next read position (consumer)
-	count int     // number of occupied slots
+	buf   [][]byte // ring buffer of byte slices
+	head  int      // next write position (producer)
+	tail  int      // next read position (consumer)
+	count int      // number of occupied slots
 
 	held bool  // true between Get and Done
 	err  error // terminal error, set by Close

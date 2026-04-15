@@ -41,7 +41,7 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 
 	ctx.Run(func(ctx context.Context) {
 		wr := drpcwire.NewMuxWriter(ps, nil)
-		defer wr.StopWait()
+		defer func() { wr.Stop(nil); <-wr.Done() }()
 		rd := drpcwire.NewReader(ps)
 
 		_, _ = rd.ReadFrame()    // Invoke
@@ -97,7 +97,7 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 
 	ctx.Run(func(ctx context.Context) {
 		wr := drpcwire.NewMuxWriter(ps, nil)
-		defer wr.StopWait()
+		defer func() { wr.Stop(nil); <-wr.Done() }()
 		rd := drpcwire.NewReader(ps)
 
 		md, err := rd.ReadFrame() // Metadata

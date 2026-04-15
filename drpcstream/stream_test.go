@@ -23,7 +23,7 @@ import (
 func testMuxWriter(t *testing.T) *drpcwire.MuxWriter {
 	t.Helper()
 	mw := drpcwire.NewMuxWriter(io.Discard, func(error) {})
-	t.Cleanup(mw.StopWait)
+	t.Cleanup(func() { mw.Stop(nil); <-mw.Done() })
 	return mw
 }
 
