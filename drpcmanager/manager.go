@@ -152,14 +152,14 @@ func (m *Manager) log(what string, cb func() string) {
 func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
-		m.wr.Stop()
-		m.sigs.tport.Set(m.tr.Close())
 		if errors.Is(err, io.EOF) {
 			err = context.Canceled
 			if m.kind == Client {
 				err = drpc.ClosedError.New("connection closed")
 			}
 		}
+		m.wr.Stop(err)
+		m.sigs.tport.Set(m.tr.Close())
 		m.streams.Close(err)
 	}
 }
@@ -191,7 +191,7 @@ func (m *Manager) manageReader() {
 
 		switch {
 		// if the packet is for an active stream, deliver it.
-		case ok && stream != nil:
+		case ok:
 			if err := stream.HandleFrame(incomingFrame); err != nil {
 				m.terminate(managerClosed.Wrap(err))
 				return

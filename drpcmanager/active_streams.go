@@ -12,9 +12,10 @@ import (
 // activeStreams is a thread-safe map of stream IDs to stream objects.
 // It is used by the Manager to track active streams for lifecycle management.
 type activeStreams struct {
-	mu      sync.RWMutex
-	streams map[uint64]*drpcstream.Stream
-	closed  bool
+	mu       sync.RWMutex
+	streams  map[uint64]*drpcstream.Stream
+	closed   bool
+	closeErr error
 }
 
 func newActiveStreams() *activeStreams {
@@ -34,7 +35,7 @@ func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream) error {
 	defer r.mu.Unlock()
 
 	if r.closed {
-		return managerClosed.New("add to closed collection")
+		return r.closeErr
 	}
 	if _, ok := r.streams[id]; ok {
 		return managerClosed.New("duplicate stream id")
@@ -73,6 +74,7 @@ func (r *activeStreams) Close(err error) {
 	defer r.mu.Unlock()
 
 	r.closed = true
+	r.closeErr = err
 	for id, s := range r.streams {
 		s.Cancel(err)
 		delete(r.streams, id)
