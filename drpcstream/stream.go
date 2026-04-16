@@ -54,7 +54,7 @@ type Stream struct {
 
 	id   drpcwire.ID
 	wr   *drpcwire.Writer
-	pbuf packetBuffer
+	pbuf *spscQueue
 	wbuf []byte
 
 	mu   sync.Mutex // protects state transitions
@@ -103,7 +103,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 	}
 
 	// initialize the packet buffer
-	s.pbuf.init()
+	s.pbuf = newSPSCQueue(defaultPacketBufferSize)
 
 	return s
 }
@@ -232,7 +232,7 @@ func (s *Stream) HandlePacket(pkt drpcwire.Packet) (err error) {
 	s.log("HANDLE", pkt.String)
 
 	if pkt.Kind == drpcwire.KindMessage {
-		s.pbuf.Put(pkt.Data)
+		s.pbuf.Enqueue(pkt.Data)
 		return nil
 	}
 
@@ -457,7 +457,7 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	s.read.Lock()
 	defer s.read.Unlock()
 
-	data, err = s.pbuf.Get()
+	data, err = s.pbuf.Dequeue()
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +509,7 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 	s.read.Lock()
 	defer s.read.Unlock()
 
-	data, err := s.pbuf.Get()
+	data, err := s.pbuf.Dequeue()
 	if err != nil {
 		return err
 	}

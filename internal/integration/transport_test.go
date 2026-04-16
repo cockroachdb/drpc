@@ -7,13 +7,18 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"storj.io/drpc/drpcconn"
+	"storj.io/drpc/drpcmanager"
+	"storj.io/drpc/drpcmux"
+	"storj.io/drpc/drpcserver"
 	"storj.io/drpc/drpctest"
 )
 
@@ -135,5 +140,113 @@ func TestTransport_ErrorCausesCancel(t *testing.T) {
 			isExpectedError = isExpectedError || st.Code() == codes.Canceled || st.Code() == codes.Unavailable
 		}
 		assert.That(t, isExpectedError)
+	}
+}
+
+// TestTransport_ClosedWhileHandlerBlockedBeforeRecv reproduces a deadlock
+// where the server handler is doing work before calling Recv() while
+// manageReader has already read a message from the transport and is blocked
+// in packetBuffer.Put(). When the client closes the transport, manageReader
+// cannot detect the closure because it is stuck in Put(), so the server
+// stream's context is never canceled.
+//
+// This reproduces the issue seen in CockroachDB's TestReceiveSnapshotLogging
+// "cancel during receive" subtest, where the snapshot receiver handler is
+// blocked in BeforeRecvAcceptedSnapshot (a test knob) before calling
+// MsgRecv(), and the delegate's cancellation closes the transport but the
+// server never detects it.
+func TestTransport_ClosedWhileHandlerBlockedBeforeRecv(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	// Test knobs — channels for synchronization, mirroring CockroachDB's
+	// receiveStartedCh and svrContextDone pattern.
+	handlerStarted := make(chan struct{})
+	svrCtxDone := make(chan struct{})
+
+	// Set up server and client manually to use SoftCancel: false on
+	// the client, matching CockroachDB's configuration.
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
+
+	mux := drpcmux.New()
+	assert.NoError(t, DRPCRegisterService(mux, impl{
+		Method2Fn: func(stream DRPCService_Method2Stream) error {
+			// The handler has started but has work to do before
+			// reading messages. In CockroachDB, this corresponds to
+			// the snapshot receiver sending the ACCEPTED response
+			// and hitting the BeforeRecvAcceptedSnapshot test knob
+			// before calling MsgRecv().
+			close(handlerStarted)
+
+			// Block until the stream context is canceled. With the
+			// deadlock bug, this never fires because manageReader
+			// is stuck in packetBuffer.Put() and cannot detect the
+			// transport closure.
+			select {
+			case <-stream.Context().Done():
+				close(svrCtxDone)
+				return stream.Context().Err()
+			}
+		},
+	}))
+	srv := drpcserver.New(mux)
+	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
+
+	// Client connection with SoftCancel: false. When the client
+	// context is canceled, manageStream calls stream.Cancel() and
+	// then m.terminate() which closes the transport — the same
+	// code path as CockroachDB's delegate cancellation.
+	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
+		Manager: drpcmanager.Options{SoftCancel: false},
+	})
+	defer func() { _ = conn.Close() }()
+
+	// Create a cancelable context for the client RPC, simulating
+	// the delegate's context that gets canceled when the test
+	// calls cancel().
+	rpcCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	cli := NewDRPCServiceClient(conn)
+
+	// Start a client-streaming RPC. NewStream buffers the invoke
+	// packet but does not flush it — the flush happens on the first
+	// Send() call.
+	stream, err := cli.Method2(rpcCtx)
+	assert.NoError(t, err)
+
+	// Send a message. This flushes both the invoke and the message
+	// in a single write. The server's manageReader reads the invoke
+	// (which triggers NewServerStream → handleRPC → handler start)
+	// and then the KindMessage (which enters packetBuffer.Put() and
+	// blocks because the handler hasn't called Recv() yet).
+	assert.NoError(t, stream.Send(in(1)))
+
+	// Wait for the handler to start.
+	<-handlerStarted
+
+	// Allow manageReader time to enter packetBuffer.Put() after
+	// delivering the invoke packet.
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel the client RPC context. This triggers:
+	//   manageStream detects ctx.Done()
+	//   → stream.Cancel(ctx.Err()) returns false (not finished)
+	//   → m.terminate(ctx.Err())
+	//   → m.tr.Close() closes the transport
+	// This is the same code path as CockroachDB's delegate
+	// cancellation closing the TCP connection to the receiver.
+	cancel()
+
+	// The server handler's stream context should be canceled.
+	select {
+	case <-svrCtxDone:
+		// Transport closure propagated to the handler.
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: server handler's stream context was not " +
+			"canceled after client transport closed; manageReader is " +
+			"stuck in packetBuffer.Put()")
 	}
 }
