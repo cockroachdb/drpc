@@ -61,7 +61,8 @@ type Manager struct {
 	wg sync.WaitGroup // tracks active manageStream goroutines
 
 	// streams tracks active streams.
-	streams *activeStreams
+	streams  *activeStreams
+	recvPool *drpcstream.BufferPool
 
 	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream
 	invokes chan invokeInfo // completed invoke info from manageReader to NewServerStream
@@ -130,6 +131,7 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 	m.pendingStreams = make(map[uint64]*pendingStream)
 
 	m.streams = newActiveStreams()
+	m.recvPool = drpcstream.NewBufferPool()
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
@@ -268,7 +270,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 		drpcopts.SetStreamStats(&opts.Internal, cb(rpc))
 	}
 
-	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
+	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, m.recvPool, opts)
 
 	if err := m.streams.Add(sid, stream); err != nil {
 		return nil, err

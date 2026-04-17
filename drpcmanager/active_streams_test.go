@@ -22,7 +22,7 @@ func testMuxWriter(t *testing.T) *drpcwire.MuxWriter {
 }
 
 func testStream(t *testing.T, id uint64) *drpcstream.Stream {
-	return drpcstream.New(context.Background(), id, testMuxWriter(t))
+	return drpcstream.New(context.Background(), id, testMuxWriter(t), drpcstream.NewBufferPool())
 }
 
 func TestActiveStreams_AddAndGet(t *testing.T) {
