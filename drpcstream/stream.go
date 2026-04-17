@@ -53,7 +53,7 @@ type Stream struct {
 
 	id   drpcwire.ID
 	wr   *drpcwire.MuxWriter
-	pbuf packetQueue
+	recvQueue ringBuffer
 	wbuf []byte
 
 	mu   sync.Mutex // protects state transitions
@@ -113,7 +113,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, opt
 	}
 
 	// initialize the packet buffer
-	s.pbuf.init()
+	s.recvQueue.init()
 
 	return s
 }
@@ -226,7 +226,7 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 	s.log("HANDLE", pkt.String)
 
 	if pkt.Kind == drpcwire.KindMessage {
-		s.pbuf.Put(pkt.Data)
+		s.recvQueue.Enqueue(pkt.Data)
 		return nil
 	}
 
@@ -254,13 +254,13 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 
 	case drpcwire.KindClose:
 		s.sigs.recv.Set(io.EOF)
-		s.pbuf.Close(io.EOF)
+		s.recvQueue.Close(io.EOF)
 		s.terminate(drpc.ClosedError.New("remote closed the stream"))
 		return nil
 
 	case drpcwire.KindCloseSend:
 		s.sigs.recv.Set(io.EOF)
-		s.pbuf.Close(io.EOF)
+		s.recvQueue.Close(io.EOF)
 		s.terminateIfBothClosed()
 		return nil
 
@@ -346,7 +346,7 @@ func (s *Stream) terminate(err error) {
 	s.sigs.send.Set(err)
 	s.sigs.recv.Set(err)
 	s.sigs.term.Set(err)
-	s.pbuf.Close(err)
+	s.recvQueue.Close(err)
 	s.checkFinished()
 }
 
@@ -414,12 +414,12 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	s.read.Lock()
 	defer s.read.Unlock()
 
-	data, err = s.pbuf.Get()
+	data, err = s.recvQueue.Dequeue()
 	if err != nil {
 		return nil, err
 	}
 	data = append([]byte(nil), data...)
-	s.pbuf.Done()
+	s.recvQueue.Done()
 
 	return data, nil
 }
@@ -456,12 +456,12 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 	s.read.Lock()
 	defer s.read.Unlock()
 
-	data, err := s.pbuf.Get()
+	data, err := s.recvQueue.Dequeue()
 	if err != nil {
 		return err
 	}
 	err = enc.Unmarshal(data, msg)
-	s.pbuf.Done()
+	s.recvQueue.Done()
 
 	return err
 }
