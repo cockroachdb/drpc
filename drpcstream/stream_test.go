@@ -266,8 +266,8 @@ func TestHandleFrame_FirstFrameOnFreshStream(t *testing.T) {
 	mw := testMuxWriter(t)
 	for _, messageID := range []uint64{1, 2} {
 		st := New(context.Background(), 1, mw)
-		// Close the packet buffer so KindMessage Put doesn't block.
-		st.pbuf.Close(io.EOF)
+		// Close the ring buffer so KindMessage Enqueue doesn't block.
+		st.recvQueue.Close(io.EOF)
 		err := st.HandleFrame(drpcwire.Frame{
 			ID: drpcwire.ID{Stream: 1, Message: messageID}, Kind: drpcwire.KindMessage, Done: true,
 		})
