@@ -66,9 +66,10 @@ type Manager struct {
 	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream
 	invokes chan invokeInfo // completed invoke info from manageReader to NewServerStream
 
-	// invokesAssembler is owned by the manageReader goroutine, used in
-	// handleInvokeFrame.
-	invokesAssembler map[uint64]*invokeAssembler
+	// pendingStreams is owned by the manageReader goroutine, used in
+	// handleInvokeFrame. It tracks streams that are being assembled from
+	// invoke/metadata frames but haven't been fully created yet.
+	pendingStreams map[uint64]*pendingStream
 
 	sigs struct {
 		term  drpcsignal.Signal // set when the manager should start terminating
@@ -87,7 +88,10 @@ const (
 	Server
 )
 
-type invokeAssembler struct {
+// pendingStream accumulates invoke and metadata frames for a stream that is
+// being set up but hasn't been fully created yet. Once the invoke packet
+// arrives, the pending stream is forwarded to NewServerStream.
+type pendingStream struct {
 	metadata map[string]string        // accumulated invoke metadata
 	pa       drpcwire.PacketAssembler // assembles invoke/metadata frames into packets
 }
@@ -123,7 +127,7 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 	// new server stream without having to coordinate with manageReader.
 	m.pdone.Make(1)
 
-	m.invokesAssembler = make(map[uint64]*invokeAssembler)
+	m.pendingStreams = make(map[uint64]*pendingStream)
 
 	m.streams = newActiveStreams()
 
@@ -211,15 +215,15 @@ func (m *Manager) manageReader() {
 }
 
 // handleInvokeFrame assembles invoke/metadata frames into complete packets and
-// forwards the finished invoke info to NewServerStream via m.newServerStreamInfo.
-// Metadata packets are accumulated; the invoke packet triggers the send.
+// forwards the finished invoke info to NewServerStream. Metadata packets are
+// accumulated; the invoke packet triggers the send.
 func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
-	ia, ok := m.invokesAssembler[fr.ID.Stream]
+	ps, ok := m.pendingStreams[fr.ID.Stream]
 	if !ok {
-		ia = &invokeAssembler{pa: drpcwire.NewPacketAssembler()}
-		m.invokesAssembler[fr.ID.Stream] = ia
+		ps = &pendingStream{pa: drpcwire.NewPacketAssembler()}
+		m.pendingStreams[fr.ID.Stream] = ps
 	}
-	pkt, packetReady, err := ia.pa.AppendFrame(fr)
+	pkt, packetReady, err := ps.pa.AppendFrame(fr)
 	if err != nil {
 		return err
 	}
@@ -233,19 +237,19 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 		if err != nil {
 			return err
 		}
-		ia.metadata = meta
+		ps.metadata = meta
 		return nil
 	}
 
 	// Invoke packet completes the sequence. Send to NewServerStream.
 	select {
-	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: ia.metadata}:
+	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: ps.metadata}:
 		// Wait for NewServerStream to finish stream creation before reading the
 		// next frame. This guarantees curr is set for subsequent non-invoke
 		// packets.
 		m.pdone.Recv()
-		// TODO: reuse invoke assembler
-		delete(m.invokesAssembler, fr.ID.Stream)
+		// TODO: reuse pending stream
+		delete(m.pendingStreams, fr.ID.Stream)
 	case <-m.sigs.term.Signal():
 	}
 	return nil
@@ -310,6 +314,9 @@ func (m *Manager) Closed() <-chan struct{} {
 // Unblocked returns a channel that is closed when the manager is no longer
 // blocked. With multiplexing, multiple streams run concurrently and this
 // channel is always closed immediately.
+//
+// TODO(shubham): audit whether this is still useful in a multiplexing world.
+// The only meaningful caller is Pool.Take.
 func (m *Manager) Unblocked() <-chan struct{} {
 	return closedCh
 }
