@@ -78,15 +78,15 @@ var _ drpc.Stream = (*Stream)(nil)
 // New returns a new stream bound to the context with the given stream id and
 // will use the writer to write messages on. It is important use monotonically
 // increasing stream ids within a single transport.
-func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter) *Stream {
-	return NewWithOptions(ctx, sid, wr, Options{})
+func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool) *Stream {
+	return NewWithOptions(ctx, sid, wr, pool, Options{})
 }
 
 // NewWithOptions returns a new stream bound to the context with the given
 // stream id and will use the writer to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, opts Options) *Stream {
+func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool, opts Options) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -112,8 +112,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, opt
 		wr: wr,
 	}
 
-	// initialize the packet buffer
-	s.recvQueue.init()
+	s.recvQueue.init(pool)
 
 	return s
 }
@@ -414,11 +413,11 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	s.read.Lock()
 	defer s.read.Unlock()
 
-	data, err = s.recvQueue.Dequeue()
+	b, err := s.recvQueue.Dequeue()
 	if err != nil {
 		return nil, err
 	}
-	data = append([]byte(nil), data...)
+	data = append([]byte(nil), b...)
 	s.recvQueue.Done()
 
 	return data, nil
@@ -456,11 +455,11 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 	s.read.Lock()
 	defer s.read.Unlock()
 
-	data, err := s.recvQueue.Dequeue()
+	b, err := s.recvQueue.Dequeue()
 	if err != nil {
 		return err
 	}
-	err = enc.Unmarshal(data, msg)
+	err = enc.Unmarshal(b, msg)
 	s.recvQueue.Done()
 
 	return err

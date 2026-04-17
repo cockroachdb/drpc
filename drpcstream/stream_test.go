@@ -117,7 +117,7 @@ func TestStream_StateTransitions(t *testing.T) {
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 1, mw)
+		st := New(ctx, 1, mw, NewBufferPool())
 		assert.NoError(t, test.Op(st))
 
 		checkErrs(t, test.Send, st.RawWrite(drpcwire.KindMessage, nil))
@@ -169,7 +169,7 @@ func TestStream_Unblocks(t *testing.T) {
 	}
 
 	for _, test := range cases {
-		st := New(ctx, 1, mw)
+		st := New(ctx, 1, mw, NewBufferPool())
 
 		ctx.Run(func(ctx context.Context) { _, _ = st.RawRecv() })
 		assert.NoError(t, test.Op(st))
@@ -180,7 +180,7 @@ func TestStream_Unblocks(t *testing.T) {
 func TestStream_ContextCancel(t *testing.T) {
 	ctx := context.Background()
 	mw := testMuxWriter(t)
-	st := New(ctx, 0, mw)
+	st := New(ctx, 0, mw, NewBufferPool())
 
 	child, cancel := context.WithCancel(st.Context())
 	defer cancel()
@@ -195,7 +195,7 @@ func TestStream_ConcurrentCloseCancel(t *testing.T) {
 	defer ctx.Close()
 
 	mw := testMuxWriter(t)
-	st := New(ctx, 0, mw)
+	st := New(ctx, 0, mw, NewBufferPool())
 
 	// Close and Cancel concurrently should not panic or deadlock.
 	errch := make(chan error, 1)
@@ -219,7 +219,7 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 		mw := testMuxWriter(t)
 		data := make([]byte, 20)
 		mid := uint64(1)
-		st := New(ctx, 1, mw)
+		st := New(ctx, 1, mw, NewBufferPool())
 
 		ctx.Run(func(ctx context.Context) {
 			for !st.IsTerminated() {
@@ -265,7 +265,7 @@ func TestStream_PacketBufferReuse(t *testing.T) {
 func TestHandleFrame_FirstFrameOnFreshStream(t *testing.T) {
 	mw := testMuxWriter(t)
 	for _, messageID := range []uint64{1, 2} {
-		st := New(context.Background(), 1, mw)
+		st := New(context.Background(), 1, mw, NewBufferPool())
 		// Close the ring buffer so KindMessage Enqueue doesn't block.
 		st.recvQueue.Close(io.EOF)
 		err := st.HandleFrame(drpcwire.Frame{
@@ -278,7 +278,7 @@ func TestHandleFrame_FirstFrameOnFreshStream(t *testing.T) {
 // Invoke and InvokeMetadata frames are rejected on an already-created stream.
 func TestHandleFrame_InvokeOnExistingStream(t *testing.T) {
 	mw := testMuxWriter(t)
-	st := New(context.Background(), 1, mw)
+	st := New(context.Background(), 1, mw, NewBufferPool())
 
 	err := handleFrame(st, drpcwire.KindInvoke, 1)
 	assert.Error(t, err)
@@ -288,7 +288,7 @@ func TestHandleFrame_InvokeOnExistingStream(t *testing.T) {
 
 func TestHandleFrame_InvokeMetadataOnExistingStream(t *testing.T) {
 	mw := testMuxWriter(t)
-	st := New(context.Background(), 1, mw)
+	st := New(context.Background(), 1, mw, NewBufferPool())
 
 	err := handleFrame(st, drpcwire.KindInvokeMetadata, 1)
 	assert.Error(t, err)
@@ -299,7 +299,7 @@ func TestHandleFrame_InvokeMetadataOnExistingStream(t *testing.T) {
 // Frames arriving after the stream is terminated are silently ignored.
 func TestHandleFrame_AfterTerminated(t *testing.T) {
 	mw := testMuxWriter(t)
-	st := New(context.Background(), 1, mw)
+	st := New(context.Background(), 1, mw, NewBufferPool())
 
 	// Terminate the stream via cancel.
 	st.Cancel(context.Canceled)
@@ -317,7 +317,7 @@ func TestHandleFrame_MessageDeliveredViaRecv(t *testing.T) {
 	defer ctx.Close()
 
 	mw := testMuxWriter(t)
-	st := New(ctx, 1, mw)
+	st := New(ctx, 1, mw, NewBufferPool())
 
 	// Launch receiver before sending to avoid Put blocking.
 	recv := make(chan []byte, 1)
