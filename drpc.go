@@ -10,6 +10,16 @@ import (
 	"github.com/zeebo/errs"
 )
 
+// HTTPRoute describes an HTTP route for a DRPC gateway endpoint.
+// Generated code emits functions that return slices of these, one per
+// HTTP binding on a google.api.http-annotated RPC method (including
+// additional_bindings, so a single method can produce multiple entries).
+type HTTPRoute struct {
+	Method  string
+	Path    string
+	Handler any
+}
+
 // These error classes represent some common errors that drpc generates.
 var (
 	Error           = errs.Class("drpc")

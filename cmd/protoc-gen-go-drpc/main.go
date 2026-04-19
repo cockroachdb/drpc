@@ -11,7 +11,9 @@ import (
 	"strconv"
 	"strings"
 
+	"google.golang.org/genproto/googleapis/api/annotations"
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
@@ -344,6 +346,7 @@ func (d *drpc) generateService(service *protogen.Service) {
 
 	d.generateServiceRPCInterfaces(service)
 	d.generateServiceAdapters(service)
+	d.generateGatewayRoutes(service)
 }
 
 //
@@ -669,6 +672,124 @@ func (d *drpc) generateGRPCAdapter(service *protogen.Service) {
 	}
 	d.P("// compile-time assertion")
 	d.P("var _ ", rpcIface, " = (*", adapter, ")(nil)")
+	d.P()
+}
+
+//
+// gateway route generation
+//
+
+func getHTTPRule(method *protogen.Method) *annotations.HttpRule {
+	opts := method.Desc.Options()
+	if opts == nil {
+		return nil
+	}
+	ext := proto.GetExtension(opts, annotations.E_Http)
+	rule, _ := ext.(*annotations.HttpRule)
+	return rule
+}
+
+type httpBinding struct {
+	method string
+	path   string
+}
+
+// httpBindings returns all HTTP method+path bindings declared on a
+// method's google.api.http annotation, including additional_bindings.
+// For example:
+//
+//	rpc Health(HealthRequest) returns (HealthResponse) {
+//	    option (google.api.http) = {
+//	        get: "/_admin/v1/health"
+//	        additional_bindings { get: "/health" }
+//	    };
+//	}
+//
+// produces two bindings: GET /_admin/v1/health and GET /health.
+func httpBindings(rule *annotations.HttpRule) []httpBinding {
+	var bindings []httpBinding
+	if b := extractBinding(rule); b.method != "" {
+		bindings = append(bindings, b)
+	}
+	for _, ab := range rule.AdditionalBindings {
+		if b := extractBinding(ab); b.method != "" {
+			bindings = append(bindings, b)
+		}
+	}
+	return bindings
+}
+
+func extractBinding(rule *annotations.HttpRule) httpBinding {
+	switch p := rule.Pattern.(type) {
+	case *annotations.HttpRule_Get:
+		return httpBinding{"GET", p.Get}
+	case *annotations.HttpRule_Post:
+		return httpBinding{"POST", p.Post}
+	case *annotations.HttpRule_Put:
+		return httpBinding{"PUT", p.Put}
+	case *annotations.HttpRule_Delete:
+		return httpBinding{"DELETE", p.Delete}
+	case *annotations.HttpRule_Patch:
+		return httpBinding{"PATCH", p.Patch}
+	}
+	return httpBinding{}
+}
+
+func (d *drpc) GatewayRoutesFunc(service *protogen.Service) string {
+	return "DRPC" + service.GoName + "GatewayRoutes"
+}
+
+// generateGatewayRoutes emits a DRPC<Service>GatewayRoutes function that
+// returns one drpc.HTTPRoute per HTTP binding on the service's annotated
+// methods. For example, given:
+//
+//	service Status {
+//	    rpc Nodes(NodesRequest) returns (NodesResponse) {
+//	        option (google.api.http) = { get: "/_status/nodes" };
+//	    }
+//	}
+//
+// it emits:
+//
+//	func DRPCStatusGatewayRoutes(client RPCStatusClient) []drpc.HTTPRoute {
+//	    return []drpc.HTTPRoute{
+//	        {Method: "GET", Path: "/_status/nodes", Handler: client.Nodes},
+//	    }
+//	}
+//
+// Streaming RPCs and methods without HTTP annotations are skipped.
+func (d *drpc) generateGatewayRoutes(service *protogen.Service) {
+	// Collect all methods with HTTP annotations, skipping streaming RPCs.
+	type routeEntry struct {
+		binding httpBinding
+		method  *protogen.Method
+	}
+	var routes []routeEntry
+	for _, method := range service.Methods {
+		if method.Desc.IsStreamingClient() || method.Desc.IsStreamingServer() {
+			continue
+		}
+		rule := getHTTPRule(method)
+		if rule == nil {
+			continue
+		}
+		for _, b := range httpBindings(rule) {
+			routes = append(routes, routeEntry{b, method})
+		}
+	}
+	if len(routes) == 0 {
+		return
+	}
+
+	httpRouteType := d.Ident("storj.io/drpc", "HTTPRoute")
+
+	d.P("func ", d.GatewayRoutesFunc(service), "(client ", d.RPCClientIface(service), ") []", httpRouteType, " {")
+	d.P("return []", httpRouteType, "{")
+	for _, r := range routes {
+		d.P("{Method: ", strconv.Quote(r.binding.method), ", Path: ", strconv.Quote(r.binding.path), ", Handler: client.", r.method.GoName, "},")
+	}
+	d.P("}")
+	d.P("}")
 	d.P()
 }
 
