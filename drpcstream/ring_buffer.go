@@ -45,8 +45,9 @@ func (rb *ringBuffer) init(pool *BufferPool) {
 }
 
 // Enqueue copies data into a pooled buffer and places it in the next write
-// slot. If the buffer is full, it blocks until a slot is freed or the buffer
-// is closed. If the buffer is closed, Enqueue returns silently.
+// slot. It only signals the consumer when the buffer transitions from empty
+// to non-empty; subsequent enqueues into a non-empty buffer skip the signal
+// since the consumer is already awake or will find data when it next checks.
 func (rb *ringBuffer) Enqueue(data []byte) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -63,8 +64,12 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 
 	rb.buf[rb.head] = b
 	rb.head = (rb.head + 1) % len(rb.buf)
+	wasEmpty := rb.count == 0
 	rb.count++
-	rb.cond.Broadcast()
+
+	if wasEmpty {
+		rb.cond.Signal()
+	}
 }
 
 // Dequeue returns the next buffered message. The returned *[]byte is owned
@@ -85,7 +90,7 @@ func (rb *ringBuffer) Dequeue() (*[]byte, error) {
 	rb.buf[rb.tail] = nil
 	rb.tail = (rb.tail + 1) % len(rb.buf)
 	rb.count--
-	rb.cond.Broadcast()
+	rb.cond.Signal()
 
 	return b, nil
 }
