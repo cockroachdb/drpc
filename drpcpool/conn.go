@@ -10,103 +10,108 @@ import (
 	"storj.io/drpc/drpcsignal"
 )
 
-// Conn is the type of connections that can be managed by the pool. Connections need to provide an
-// Unblocked function that can be used by the pool to skip connections that are still blocked on
-// canceling the last RPC.
+// Conn is the type of connections that can be managed by the pool.
 type Conn interface {
 	drpc.Conn
 
-	// Unblocked returns a channel that is closed when the conn is available for an Invoke or
-	// NewStream call.
+	// Unblocked returns a channel that is closed when the conn is available
+	// for an Invoke or NewStream call.
 	Unblocked() <-chan struct{}
 }
 
 // poolConn is a wrapper that asks a Pool for an underlying conn when necessary.
-type poolConn[K comparable, V Conn] struct {
+type poolConn[K comparable] struct {
 	done drpcsignal.Chan
 	key  K
-	pool *Pool[K, V]
-	dial func(context.Context, K) (V, error)
+	pool *Pool[K]
+	dial func(context.Context, K) (Conn, error)
 }
 
-// Close sets the poolConn to be in a closed state, inhibiting subsequent Invoke or NewStream calls.
-func (p *poolConn[K, V]) Close() error {
+// Close sets the poolConn to be in a closed state, inhibiting subsequent
+// Invoke or NewStream calls.
+func (p *poolConn[K]) Close() error {
 	p.done.Close()
 	return nil
 }
 
-// Closed returns a channel that is closed after calls to Invoke and NewStream are inhibited.
-func (p *poolConn[K, V]) Closed() <-chan struct{} {
+// Closed returns a channel that is closed after calls to Invoke and NewStream
+// are inhibited.
+func (p *poolConn[K]) Closed() <-chan struct{} {
 	return p.done.Get()
 }
 
-// Unblocked returns a channel that is closed when calls to Invoke and NewStream are not inhibited
-// by a previous cancel. For this conn, previous cancels are always internally handled by the pool,
-// so it is always unblocked.
-func (p *poolConn[K, V]) Unblocked() <-chan struct{} { return closedCh }
+// Unblocked returns a channel that is closed when calls to Invoke and NewStream
+// are not inhibited by a previous cancel. For this conn, previous cancels are
+// always internally handled by the pool, so it is always unblocked.
+func (p *poolConn[K]) Unblocked() <-chan struct{} { return closedCh }
 
-// Invoke grabs a temporary connection from the Pool, calls Invoke on that, and replaces the
-// connection into the pool after.
-func (p *poolConn[K, V]) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in drpc.Message, out drpc.Message) (err error) {
+// acquireConn tries the pool first, dials on miss, and inserts the new
+// connection eagerly so concurrent callers can share it.
+func (p *poolConn[K]) acquireConn(ctx context.Context) (*connState[K], error) {
+	cs, ok := p.pool.acquire(p.key)
+	if ok {
+		return cs, nil
+	}
+
+	conn, err := p.dial(ctx, p.key)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.pool.insertAndAcquire(p.key, conn), nil
+}
+
+// Invoke grabs a connection from the Pool (or dials a new one), calls Invoke,
+// and releases the connection back.
+func (p *poolConn[K]) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in drpc.Message, out drpc.Message) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	if closed(p.done.Get()) {
 		return drpc.ClosedError.New("connection closed")
 	}
 
-	conn, ok := p.pool.Take(p.key)
-	if !ok {
-		conn, err = p.dial(ctx, p.key)
-		if err != nil {
-			return err
-		}
+	cs, err := p.acquireConn(ctx)
+	if err != nil {
+		return err
 	}
-	defer p.pool.Put(p.key, conn)
+	defer p.pool.release(cs)
 
-	return conn.Invoke(ctx, rpc, enc, in, out)
+	return cs.val.Invoke(ctx, rpc, enc, in, out)
 }
 
-// NewStream grabs a temporary connection from the Pool, calls NewStream on that, and returns that
-// stream after setting up a goroutine to return the connection to the Pool after the stream is
-// done. The stream is wrapped so that the returned stream's done channel is only closed after the
-// underlying connection has been returned to the pool, allowing callers to be sure that a
-// connection will be reused if possible.
-func (p *poolConn[K, V]) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
+// NewStream grabs a connection from the Pool (or dials a new one), calls
+// NewStream, and sets up a goroutine to release the connection when the
+// stream finishes.
+func (p *poolConn[K]) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	if closed(p.done.Get()) {
 		return nil, drpc.ClosedError.New("connection closed")
 	}
 
-	conn, ok := p.pool.Take(p.key)
-	if !ok {
-		conn, err = p.dial(ctx, p.key)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	stream, err := conn.NewStream(ctx, rpc, enc)
+	cs, err := p.acquireConn(ctx)
 	if err != nil {
-		p.pool.Put(p.key, conn)
 		return nil, err
 	}
 
-	// we make this stream wrapper and monitor the stream because we need to replace into the pool
-	// before we close the done channel so that people can reliably reuse connections by waiting on
-	// the stream's done channel before issuing the next rpc.
+	stream, err := cs.val.NewStream(ctx, rpc, enc)
+	if err != nil {
+		p.pool.release(cs)
+		return nil, err
+	}
+
 	sw := &streamWrapper{
 		Stream: stream,
 		ctx:    streamWrapperContext{Context: ctx},
 	}
-	go p.monitorStream(stream, conn, &sw.ctx.done)
+	go p.monitorStream(stream, cs, &sw.ctx.done)
 
 	return sw, nil
 }
 
-func (p *poolConn[K, V]) monitorStream(stream drpc.Stream, conn V, done *drpcsignal.Chan) {
+func (p *poolConn[K]) monitorStream(stream drpc.Stream, cs *connState[K], done *drpcsignal.Chan) {
 	<-stream.Context().Done()
-	p.pool.Put(p.key, conn)
+	p.pool.release(cs)
 	done.Close()
 }
 

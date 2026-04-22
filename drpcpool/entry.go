@@ -8,58 +8,15 @@ import (
 	"time"
 )
 
-type entry[K comparable, V Conn] struct {
+// connState tracks a pooled connection and its in-flight stream count.
+type connState[K comparable] struct {
 	key    K
-	val    V
-	exp    *time.Timer
-	global node[K, V]
-	local  node[K, V]
+	val    Conn
+	active int
+	exp    *time.Timer // only ticking when active == 0
 }
 
-func (e *entry[K, V]) String() string {
-	return fmt.Sprintf("<ent %p k:%v c:%v u:%v>",
-		e, e.key, closed(e.val.Closed()), closed(e.val.Unblocked()))
-}
-
-type node[K comparable, V Conn] struct {
-	next *entry[K, V]
-	prev *entry[K, V]
-}
-
-type list[K comparable, V Conn] struct {
-	head  *entry[K, V]
-	tail  *entry[K, V]
-	count int
-}
-
-func (e *entry[K, V]) globalList() *node[K, V] { return &e.global }
-func (e *entry[K, V]) localList() *node[K, V]  { return &e.local }
-
-func (l *list[K, V]) appendEntry(ent *entry[K, V], node func(*entry[K, V]) *node[K, V]) {
-	if l.head == nil {
-		l.head = ent
-	}
-	if l.tail != nil {
-		node(l.tail).next = ent
-		node(ent).prev = l.tail
-	}
-	l.tail = ent
-	l.count++
-}
-
-func (l *list[K, V]) removeEntry(ent *entry[K, V], node func(*entry[K, V]) *node[K, V]) {
-	n := node(ent)
-	if l.head == ent {
-		l.head = n.next
-	}
-	if n.next != nil {
-		node(n.next).prev = n.prev
-	}
-	if l.tail == ent {
-		l.tail = n.prev
-	}
-	if n.prev != nil {
-		node(n.prev).next = n.next
-	}
-	l.count--
+func (cs *connState[K]) String() string {
+	return fmt.Sprintf("<cs %p k:%v active:%d closed:%v>",
+		cs, cs.key, cs.active, closed(cs.val.Closed()))
 }

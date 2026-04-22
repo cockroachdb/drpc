@@ -16,8 +16,8 @@ import (
 
 // Options contains the options to configure a pool.
 type Options struct {
-	// Expiration will remove any values from the Pool after the
-	// value passes. Zero means no expiration.
+	// Expiration will remove any idle values from the Pool after the
+	// duration passes. Zero means no expiration.
 	Expiration time.Duration
 
 	// Capacity is the maximum number of values the Pool can store.
@@ -28,180 +28,219 @@ type Options struct {
 	// the Pool holds unlimited for any single key. Negative means
 	// no values for any single key.
 	KeyCapacity int
+
+	// MaxStreamsPerConn is the maximum number of concurrent streams
+	// allowed on a single pooled connection. Zero means unlimited.
+	// Setting this to 1 gives legacy exclusive-access behavior.
+	MaxStreamsPerConn int
 }
 
-// Pool is a connection pool with key type K. It maintains a cache of connections
-// per key and ensures the total number of connections in the cache is bounded by
-// configurable values. It does not limit the maximum concurrency of the number
-// of connections either in total or per key.
-type Pool[K comparable, V Conn] struct {
-	opts    Options
-	mu      sync.Mutex
-	entries map[K]*list[K, V]
-	order   list[K, V]
+// Pool is a connection pool with key type K. It maintains a set of connections
+// per key and routes new streams to connections with available capacity.
+// Connections stay in the pool while in use and track their active stream count.
+type Pool[K comparable] struct {
+	opts  Options
+	mu    sync.Mutex
+	byKey map[K][]*connState[K]
+	all   []*connState[K]
 }
 
 // New constructs a new Pool with the provided Options.
-func New[K comparable, V Conn](opts Options) *Pool[K, V] {
-	return &Pool[K, V]{
-		opts:    opts,
-		entries: make(map[K]*list[K, V]),
+func New[K comparable](opts Options) *Pool[K] {
+	return &Pool[K]{
+		opts:  opts,
+		byKey: make(map[K][]*connState[K]),
 	}
 }
 
-func (p *Pool[K, V]) log(what string, cb func() string) {
+func (p *Pool[K]) log(what string, cb func() string) {
 	if drpcdebug.Enabled {
 		drpcdebug.Log(func() (_, _, _ string) { return fmt.Sprintf("<pül %p>", p), what, cb() })
 	}
 }
 
-// Close evicts all entries from the Pool's cache, closing them and returning all
+// Close evicts all entries from the Pool, closing them and returning all
 // of the combined errors from closing.
-func (p *Pool[K, V]) Close() (err error) {
+func (p *Pool[K]) Close() (err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	var eg errs.Group
-	for ent := p.order.head; ent != nil; ent = ent.global.next {
-		eg.Add(p.closeEntry(ent))
+	for _, cs := range p.all {
+		eg.Add(p.closeEntry(cs))
 	}
 
-	p.entries = make(map[K]*list[K, V])
-	p.order = list[K, V]{}
+	p.byKey = make(map[K][]*connState[K])
+	p.all = nil
 
 	return eg.Err()
 }
 
 // Get returns a new Conn that will use the provided dial function to create an
-// underlying conn to be cached by the Pool when Conn methods are invoked. It will
-// share any cached connections with other conns that use the same key.
-func (p *Pool[K, V]) Get(ctx context.Context, key K,
-	dial func(ctx context.Context, key K) (V, error)) Conn {
-	return &poolConn[K, V]{
+// underlying conn to be cached by the Pool when Conn methods are invoked. It
+// will share any cached connections with other conns that use the same key.
+func (p *Pool[K]) Get(ctx context.Context, key K,
+	dial func(ctx context.Context, key K) (Conn, error)) Conn {
+	return &poolConn[K]{
 		key:  key,
 		pool: p,
 		dial: dial,
 	}
 }
 
-//
-// helpers
-//
-
-func (p *Pool[K, V]) removeEntry(ent *entry[K, V]) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	local := p.entries[ent.key]
-	if local == nil {
-		return
-	}
-
-	local.removeEntry(ent, (*entry[K, V]).localList)
-	p.order.removeEntry(ent, (*entry[K, V]).globalList)
-
-	if local.count == 0 {
-		delete(p.entries, ent.key)
-	}
-}
-
-// closeEntry ensures the timer and connection are closed, returning any errors.
-func (p *Pool[K, V]) closeEntry(ent *entry[K, V]) error {
-	p.log("CLOSE", ent.String)
-
-	if ent.exp == nil || ent.exp.Stop() {
-		return ent.val.Close()
+func (p *Pool[K]) closeEntry(cs *connState[K]) error {
+	p.log("CLOSE", cs.String)
+	if cs.exp == nil || cs.exp.Stop() {
+		return cs.val.Close()
 	}
 	return nil
 }
 
-// Take acquires a value from the cache if one exists. It returns
-// the zero value for V and false if one does not.
-func (p *Pool[K, V]) Take(key K) (V, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	local := p.entries[key]
-	if local == nil {
-		return *new(V), false
-	}
-
-	// N.B. this loop depends on the fact that removing an entry from
-	// the list does not modify the entry's next pointer. a removed
-	// entry still points into the list, but the things that it points
-	// at no longer point at it.
-	for ent := local.head; ent != nil; ent = ent.local.next {
-		if !closed(ent.val.Unblocked()) {
-			continue
-		}
-
-		local.removeEntry(ent, (*entry[K, V]).localList)
-		p.order.removeEntry(ent, (*entry[K, V]).globalList)
-
-		if ent.exp != nil && !ent.exp.Stop() {
-			continue
-		} else if closed(ent.val.Closed()) {
-			continue
-		}
-
-		p.log("TAKEN", ent.String)
-		return ent.val, true
-	}
-
-	return *new(V), false
+// hasCapacity reports whether cs can accept another stream.
+func (p *Pool[K]) hasCapacity(cs *connState[K]) bool {
+	return p.opts.MaxStreamsPerConn == 0 || cs.active < p.opts.MaxStreamsPerConn
 }
 
-// Put places the connection in to the cache with the provided key, ensuring
-// that the size limits the Pool is configured with are respected.
-func (p *Pool[K, V]) Put(key K, val V) {
-	if p.opts.Capacity < 0 || p.opts.KeyCapacity < 0 {
-		_ = val.Close()
-		return
-	} else if closed(val.Closed()) {
-		return
-	}
-
+// acquire finds a connection for the given key that has available stream
+// capacity and is not closed. Returns the connState and true if found.
+func (p *Pool[K]) acquire(key K) (*connState[K], bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	local := p.entries[key]
-	if local == nil {
-		local = new(list[K, V])
-		p.entries[key] = local
+	for _, cs := range p.byKey[key] {
+		if closed(cs.val.Closed()) {
+			continue
+		}
+		if !p.hasCapacity(cs) {
+			continue
+		}
+		cs.active++
+		if cs.exp != nil {
+			cs.exp.Stop()
+			cs.exp = nil
+		}
+		p.log("ACQUIRE", cs.String)
+		return cs, true
 	}
 
-	for p.opts.KeyCapacity != 0 && local.count >= p.opts.KeyCapacity {
-		ent := local.head
+	return nil, false
+}
 
-		_ = p.closeEntry(ent)
+// insertAndAcquire adds a newly dialed connection to the pool with active=1.
+// It enforces capacity limits by evicting idle connections.
+func (p *Pool[K]) insertAndAcquire(key K, val Conn) *connState[K] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-		local.removeEntry(ent, (*entry[K, V]).localList)
-		p.order.removeEntry(ent, (*entry[K, V]).globalList)
+	if p.opts.Capacity < 0 || p.opts.KeyCapacity < 0 {
+		return &connState[K]{key: key, val: val, active: 1}
 	}
 
-	for p.opts.Capacity != 0 && p.order.count >= p.opts.Capacity {
-		ent := p.order.head
-		local := p.entries[ent.key]
+	p.evictIdleLocked(key)
 
-		_ = p.closeEntry(ent)
+	cs := &connState[K]{key: key, val: val, active: 1}
+	p.byKey[key] = append(p.byKey[key], cs)
+	p.all = append(p.all, cs)
+	p.log("INSERT+ACQUIRE", cs.String)
+	return cs
+}
 
-		local.removeEntry(ent, (*entry[K, V]).localList)
-		p.order.removeEntry(ent, (*entry[K, V]).globalList)
+// release decrements the active count for a connection. If the connection
+// becomes idle and is closed, it is removed. Otherwise an expiration timer
+// is started if configured.
+func (p *Pool[K]) release(cs *connState[K]) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-		if local.count == 0 {
-			delete(p.entries, ent.key)
+	cs.active--
+	p.log("RELEASE", cs.String)
+
+	if cs.active > 0 {
+		return
+	}
+
+	if closed(cs.val.Closed()) {
+		p.removeLocked(cs)
+		return
+	}
+
+	p.evictExcessIdleLocked(cs)
+
+	if p.opts.Expiration > 0 {
+		cs.exp = time.AfterFunc(p.opts.Expiration, func() {
+			_ = cs.val.Close()
+			p.mu.Lock()
+			p.removeLocked(cs)
+			p.mu.Unlock()
+		})
+	}
+}
+
+// evictIdleLocked enforces KeyCapacity and Capacity limits by closing and
+// removing idle (active == 0) connections. Must be called with p.mu held.
+func (p *Pool[K]) evictIdleLocked(key K) {
+	p.evictToLimitLocked(key, nil, 0)
+}
+
+// evictExcessIdleLocked evicts idle entries (other than keep) to bring
+// the pool within KeyCapacity and Capacity limits.
+// Must be called with p.mu held.
+func (p *Pool[K]) evictExcessIdleLocked(keep *connState[K]) {
+	p.evictToLimitLocked(keep.key, keep, 1)
+}
+
+// evictToLimitLocked evicts idle connections until KeyCapacity and Capacity
+// limits are met. headroom is subtracted from each limit (0 = evict at limit,
+// 1 = allow one over). skip is excluded from eviction (may be nil).
+// Must be called with p.mu held.
+func (p *Pool[K]) evictToLimitLocked(key K, skip *connState[K], headroom int) {
+	if p.opts.KeyCapacity > 0 {
+		for len(p.byKey[key]) > p.opts.KeyCapacity-1+headroom {
+			if !p.evictOneIdleLocked(p.byKey[key], skip) {
+				break
+			}
 		}
 	}
 
-	ent := &entry[K, V]{key: key, val: val}
-	local.appendEntry(ent, (*entry[K, V]).localList)
-	p.order.appendEntry(ent, (*entry[K, V]).globalList)
-	p.log("PUT", ent.String)
-
-	if p.opts.Expiration > 0 {
-		ent.exp = time.AfterFunc(p.opts.Expiration, func() {
-			_ = val.Close()
-			p.removeEntry(ent)
-		})
+	if p.opts.Capacity > 0 {
+		for len(p.all) > p.opts.Capacity-1+headroom {
+			if !p.evictOneIdleLocked(p.all, skip) {
+				break
+			}
+		}
 	}
+}
+
+// evictOneIdleLocked closes and removes the first idle entry in entries,
+// skipping skip. Returns true if an entry was evicted.
+func (p *Pool[K]) evictOneIdleLocked(entries []*connState[K], skip *connState[K]) bool {
+	for _, cs := range entries {
+		if cs != skip && cs.active == 0 {
+			_ = p.closeEntry(cs)
+			p.removeLocked(cs)
+			return true
+		}
+	}
+	return false
+}
+
+// removeLocked removes a connState from both byKey and all slices.
+// Must be called with p.mu held.
+func (p *Pool[K]) removeLocked(cs *connState[K]) {
+	p.byKey[cs.key] = removeFromSlice(p.byKey[cs.key], cs)
+	if len(p.byKey[cs.key]) == 0 {
+		delete(p.byKey, cs.key)
+	}
+	p.all = removeFromSlice(p.all, cs)
+}
+
+func removeFromSlice[K comparable](s []*connState[K], cs *connState[K]) []*connState[K] {
+	for i, c := range s {
+		if c == cs {
+			copy(s[i:], s[i+1:])
+			s[len(s)-1] = nil
+			return s[:len(s)-1]
+		}
+	}
+	return s
 }

@@ -71,7 +71,7 @@ func (cb *callbackStream) Context() context.Context { return cb.ctx }
 
 // getConn is a helper to get a new conn from the pool that will send its key over
 // the closed channel when it is closed.
-func getConn(ctx context.Context, pool *Pool[string, Conn], closed chan string, key string) Conn {
+func getConn(ctx context.Context, pool *Pool[string], closed chan string, key string) Conn {
 	return pool.Get(ctx, key, func(ctx context.Context, _ string) (Conn, error) {
 		return &callbackConn{CloseFn: func() error { closed <- key; return nil }}, nil
 	})
@@ -79,7 +79,7 @@ func getConn(ctx context.Context, pool *Pool[string, Conn], closed chan string, 
 
 // useConn is a helper to get a new conn from the pool and use it, sending its
 // key over the closed channel when it is closed.
-func useConn(ctx context.Context, pool *Pool[string, Conn], closed chan string, key string) {
+func useConn(ctx context.Context, pool *Pool[string], closed chan string, key string) {
 	conn := getConn(ctx, pool, closed, key)
 	invoke(ctx, conn)
 }
