@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"storj.io/drpc/drpcpool"
 	"storj.io/drpc/drpctest"
 )
 
@@ -260,4 +262,53 @@ func TestMultiplex_TransportCloseTerminatesAllStreams(t *testing.T) {
 
 	// Connection should close cleanly after transport failure.
 	_ = conn.Close()
+}
+
+func TestMultiplex_PoolMaxStreamsPerConn(t *testing.T) {
+	tctx := drpctest.NewTracker(t)
+	defer tctx.Close()
+
+	const (
+		totalStreams      = 100
+		streamsPerConn    = 10
+		expectedConns     = totalStreams / streamsPerConn
+	)
+
+	started := make(chan struct{}, totalStreams)
+	server := impl{
+		Method4Fn: func(stream DRPCService_Method4Stream) error {
+			started <- struct{}{}
+			<-stream.Context().Done()
+			return nil
+		},
+	}
+
+	var dials atomic.Int32
+	pool := drpcpool.New[string](drpcpool.Options{
+		MaxStreamsPerConn: streamsPerConn,
+	})
+	defer func() { _ = pool.Close() }()
+
+	conn := pool.Get(tctx, "key", func(ctx context.Context, key string) (drpcpool.Conn, error) {
+		dials.Add(1)
+		return createRawConnection(t, server, tctx), nil
+	})
+	cli := NewDRPCServiceClient(conn)
+
+	streams := make([]DRPCService_Method4Client, totalStreams)
+	for i := range streams {
+		s, err := cli.Method4(tctx)
+		assert.NoError(t, err)
+		streams[i] = s
+	}
+
+	for i := 0; i < totalStreams; i++ {
+		<-started
+	}
+
+	assert.Equal(t, int(dials.Load()), expectedConns)
+
+	for _, s := range streams {
+		assert.NoError(t, s.CloseSend())
+	}
 }
