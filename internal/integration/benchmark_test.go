@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"storj.io/drpc/drpcconn"
+	"storj.io/drpc/drpcpool"
 	"storj.io/drpc/drpctest"
 )
 
@@ -340,6 +341,126 @@ func BenchmarkConcurrentStreams(b *testing.B) {
 					for _, st := range streams {
 						_ = st.CloseSend()
 					}
+				})
+			}
+		})
+	}
+}
+
+// BenchmarkPoolMaxStreams measures how MaxStreamsPerConn affects throughput
+// when running a fixed number of concurrent bidi echo streams through a pool.
+// With MaxStreamsPerConn=0 (unlimited), all streams share one TCP connection.
+// With MaxStreamsPerConn=1, each stream gets its own connection (conn-per-stream).
+// Values in between show the trade-off: fewer connections means less TCP overhead
+// but more MuxWriter contention; more connections means less contention but more
+// file descriptors and kernel state.
+func BenchmarkPoolMaxStreams(b *testing.B) {
+	for _, totalStreams := range []int{50, 500} {
+		b.Run(fmt.Sprintf("S%d", totalStreams), func(b *testing.B) {
+			maxStreamsValues := []int{0, 1, 5, 10, 25, 50}
+			if totalStreams > 50 {
+				maxStreamsValues = []int{0, 1, 5, 10, 25, 50, 100, 250, 500}
+			}
+
+			benchBidi := func(b *testing.B, streams []DRPCService_Method4Client) {
+				in := &In{In: 1}
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				var completed atomic.Int64
+				var wg sync.WaitGroup
+				wg.Add(len(streams))
+				for i := range streams {
+					st := streams[i]
+					go func() {
+						defer wg.Done()
+						for completed.Add(1) <= int64(b.N) {
+							if err := st.Send(in); err != nil {
+								b.Error(err)
+								return
+							}
+							if _, err := st.Recv(); err != nil {
+								b.Error(err)
+								return
+							}
+						}
+					}()
+				}
+				wg.Wait()
+				b.StopTimer()
+			}
+
+			b.Run("Raw_ConnPerStream", func(b *testing.B) {
+				ctx := drpctest.NewTracker(b)
+				streams := make([]DRPCService_Method4Client, totalStreams)
+				conns := make([]*drpcconn.Conn, totalStreams)
+				for i := range streams {
+					c := createTCPConnection(b, benchEchoServer, ctx)
+					conns[i] = c
+					st, err := NewDRPCServiceClient(c).Method4(ctx)
+					if err != nil {
+						b.Fatal(err)
+					}
+					streams[i] = st
+				}
+
+				benchBidi(b, streams)
+				for _, c := range conns {
+					_ = c.Close()
+				}
+				ctx.Close()
+			})
+
+			b.Run("Raw_Mux", func(b *testing.B) {
+				ctx := drpctest.NewTracker(b)
+				conn := createTCPConnection(b, benchEchoServer, ctx)
+				cli := NewDRPCServiceClient(conn)
+				streams := make([]DRPCService_Method4Client, totalStreams)
+				for i := range streams {
+					st, err := cli.Method4(ctx)
+					if err != nil {
+						b.Fatal(err)
+					}
+					streams[i] = st
+				}
+
+				benchBidi(b, streams)
+				_ = conn.Close()
+				ctx.Close()
+			})
+
+			for _, maxStreams := range maxStreamsValues {
+				label := fmt.Sprintf("Pool_MaxPerConn_%d", maxStreams)
+				if maxStreams == 0 {
+					label = "Pool_MaxPerConn_unlimited"
+				}
+				b.Run(label, func(b *testing.B) {
+					ctx := drpctest.NewTracker(b)
+
+					pool := drpcpool.New[string](drpcpool.Options{
+						MaxStreamsPerConn: maxStreams,
+					})
+					defer func() { _ = pool.Close() }()
+
+					conn := pool.Get(ctx, "key", func(_ context.Context, _ string) (drpcpool.Conn, error) {
+						return createTCPConnection(b, benchEchoServer, ctx), nil
+					})
+					cli := NewDRPCServiceClient(conn)
+
+					streams := make([]DRPCService_Method4Client, totalStreams)
+					for i := range streams {
+						st, err := cli.Method4(ctx)
+						if err != nil {
+							b.Fatal(err)
+						}
+						streams[i] = st
+					}
+
+					benchBidi(b, streams)
+					for _, st := range streams {
+						_ = st.CloseSend()
+					}
+					ctx.Close()
 				})
 			}
 		})

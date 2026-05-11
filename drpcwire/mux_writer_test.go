@@ -60,30 +60,39 @@ func (w *failWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
-func TestMuxWriter(t *testing.T) {
-	var exp []byte
-	pr, pw := io.Pipe()
-	mw := NewMuxWriter(pw, func(error) {})
+// syncBuf is a goroutine-safe bytes.Buffer.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
 
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuf) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.buf.Bytes()...)
+}
+
+func TestMuxWriter(t *testing.T) {
+	var sb syncBuf
+	mw := NewMuxWriter(&sb, func(error) {})
+
+	var exp []byte
 	for range 1000 {
 		fr := RandFrame()
 		exp = AppendFrame(exp, fr)
 		assert.NoError(t, mw.WriteFrame(fr))
 	}
 
-	// Read exactly len(exp) bytes: this blocks until MuxWriter has drained
-	// all frames through the pipe.
-	got := make([]byte, len(exp))
-	_, err := io.ReadFull(pr, got)
-	assert.NoError(t, err)
-
-	// Now stop the writer and close the pipe.
 	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
-	pw.Close()
-	pr.Close()
 
-	assert.That(t, bytes.Equal(exp, got))
+	assert.That(t, bytes.Equal(exp, sb.Bytes()))
 }
 
 func TestMuxWriter_WriteFrameAfterStop(t *testing.T) {
@@ -97,15 +106,12 @@ func TestMuxWriter_WriteFrameAfterStop(t *testing.T) {
 }
 
 func TestMuxWriter_ConcurrentWriteFrame(t *testing.T) {
-	pr, pw := io.Pipe()
-	mw := NewMuxWriter(pw, func(error) {})
+	var sb syncBuf
+	mw := NewMuxWriter(&sb, func(error) {})
 
 	const numWriters = 10
 	const framesPerWriter = 100
 
-	// Pre-generate frames and compute total expected bytes so we can use
-	// io.ReadFull to block until everything has drained (Stop has abort
-	// semantics, so we can't rely on it to drain).
 	allFrames := make([][]Frame, numWriters)
 	var expSize int
 	for i := range numWriters {
@@ -132,17 +138,13 @@ func TestMuxWriter_ConcurrentWriteFrame(t *testing.T) {
 			}
 		}()
 	}
-
 	wg.Wait()
 
-	// Block until all bytes have been drained through the pipe.
-	got := make([]byte, expSize)
-	_, err := io.ReadFull(pr, got)
-	assert.NoError(t, err)
 	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
-	pw.Close()
-	pr.Close()
+
+	got := sb.Bytes()
+	assert.Equal(t, len(got), expSize)
 
 	// Parse received bytes and count frames.
 	count := 0
@@ -156,14 +158,16 @@ func TestMuxWriter_ConcurrentWriteFrame(t *testing.T) {
 	assert.Equal(t, count, numWriters*framesPerWriter)
 }
 
-func TestMuxWriter_WriteErrorCallsOnError(t *testing.T) {
+func TestMuxWriter_WriteErrorReturnsError(t *testing.T) {
 	writeErr := errors.New("disk full")
 	fw := newFailWriter(1, writeErr)
 
 	gotErr := make(chan error, 1)
 	mw := NewMuxWriter(fw, func(err error) { gotErr <- err })
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	// The caller-leader runs the failing Write itself and surfaces the error.
+	err := mw.WriteFrame(RandFrame())
+	assert.Equal(t, err, writeErr)
 
 	select {
 	case err := <-gotErr:
@@ -179,8 +183,8 @@ func TestMuxWriter_WriteErrorCallsOnError(t *testing.T) {
 	}
 }
 
-// Tests the critical deadlock path from the design doc:
-// run() → Write fails → sets closed → onError → Stop() → noop → run() returns.
+// Tests the critical deadlock path: WriteFrame fails → sets closed → onError
+// → Stop() → noop → run() returns.
 func TestMuxWriter_OnErrorCallingStopDoesNotDeadlock(t *testing.T) {
 	writeErr := errors.New("broken pipe")
 	fw := newFailWriter(1, writeErr)
@@ -191,7 +195,8 @@ func TestMuxWriter_OnErrorCallingStopDoesNotDeadlock(t *testing.T) {
 		mw.Stop(errors.New("stopped"))
 	})
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	err := mw.WriteFrame(RandFrame())
+	assert.Equal(t, err, writeErr)
 
 	select {
 	case <-mw.Done():
@@ -201,21 +206,23 @@ func TestMuxWriter_OnErrorCallingStopDoesNotDeadlock(t *testing.T) {
 }
 
 // Tests the manager's two-phase shutdown: close transport to unblock a blocked
-// Write, then Stop signals the goroutine to exit.
+// Write, then Stop signals the writers to exit.
 func TestMuxWriter_BlockedWriteUnblockedByClose(t *testing.T) {
 	bw := newBlockingWriter()
 	mw := NewMuxWriter(bw, func(error) {})
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	// WriteFrame becomes the caller-leader and blocks in transport.Write.
+	errCh := make(chan error, 1)
+	go func() { errCh <- mw.WriteFrame(RandFrame()) }()
 
-	// Wait for run() to enter Write.
+	// Wait for the caller-leader to enter Write.
 	select {
 	case <-bw.wrote:
 	case <-time.After(5 * time.Second):
-		t.Fatal("run() did not enter Write")
+		t.Fatal("WriteFrame did not enter Write")
 	}
 
-	// Simulate terminate: Stop, then unblock the writer (like tr.Close()).
+	// Simulate terminate: Stop, then unblock the writer.
 	mw.Stop(errors.New("stopped"))
 	bw.err = errors.New("closed")
 	close(bw.unblock)
@@ -225,12 +232,18 @@ func TestMuxWriter_BlockedWriteUnblockedByClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("deadlock: Done did not return")
 	}
+
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteFrame did not return")
+	}
 }
 
 func TestMuxWriter_ConcurrentStop(t *testing.T) {
 	mw := NewMuxWriter(io.Discard, func(error) {})
 
-	// Write a frame so the goroutine has work.
+	// Write a frame so there's been activity before Stop.
 	assert.NoError(t, mw.WriteFrame(RandFrame()))
 
 	const n = 20
@@ -256,20 +269,19 @@ func TestMuxWriter_StopDiscardsBufferedData(t *testing.T) {
 	bw := newBlockingWriter()
 	mw := NewMuxWriter(bw, func(error) {})
 
-	// Write several frames while the writer is blocked on the first Write.
-	for range 10 {
-		assert.NoError(t, mw.WriteFrame(RandFrame()))
-	}
+	// First WriteFrame becomes leader and blocks in Write.
+	errCh := make(chan error, 1)
+	go func() { errCh <- mw.WriteFrame(RandFrame()) }()
 
-	// Wait for run() to enter Write with the first batch.
+	// Wait for the leader to enter Write.
 	select {
 	case <-bw.wrote:
 	case <-time.After(5 * time.Second):
-		t.Fatal("run() did not enter Write")
+		t.Fatal("WriteFrame did not enter Write")
 	}
 
-	// More frames accumulate in buf while Write is blocked.
-	for range 10 {
+	// All subsequent writes go through the slow path and queue immediately.
+	for range 19 {
 		assert.NoError(t, mw.WriteFrame(RandFrame()))
 	}
 
@@ -284,12 +296,17 @@ func TestMuxWriter_StopDiscardsBufferedData(t *testing.T) {
 		t.Fatal("Done did not return")
 	}
 
-	// Only the first batch was written; the rest were discarded by Stop.
-	assert.Equal(t, len(bw.wrote), 0) // no more writes after the first
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteFrame did not return")
+	}
+
+	// Only the first batch was written; the queued frames were discarded.
+	assert.Equal(t, len(bw.wrote), 0)
 }
 
 func TestMuxWriter_WriteFrameDuringActiveDrain(t *testing.T) {
-	// gatedWriter lets us control when each Write completes.
 	type gate struct{ ch chan struct{} }
 	gates := make(chan gate, 10)
 
@@ -302,24 +319,26 @@ func TestMuxWriter_WriteFrameDuringActiveDrain(t *testing.T) {
 
 	mw := NewMuxWriter(gw, func(error) {})
 
-	// Batch 1: write a frame, wait for run() to pick it up and block in Write.
+	// First WriteFrame becomes leader and blocks in Write for batch 1.
 	fr1 := Frame{Data: []byte("batch1"), ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: true}
-	assert.NoError(t, mw.WriteFrame(fr1))
+	leader1Done := make(chan error, 1)
+	go func() { leader1Done <- mw.WriteFrame(fr1) }()
 
-	g1 := <-gates // run() is now blocked in Write for batch 1
+	g1 := <-gates // leader is blocked in Write for batch 1
 
-	// Batch 2: write another frame while batch 1 is still draining.
+	// While leader is blocked, a follower queues batch 2 and Flushes (no-op
+	// because writing=true).
 	fr2 := Frame{Data: []byte("batch2"), ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Done: true}
 	assert.NoError(t, mw.WriteFrame(fr2))
 
-	// Complete batch 1 write.
+	// Complete batch 1; leader's drain loop sees buf still has batch 2 and
+	// calls Write inline before returning.
 	close(g1.ch)
-
-	// run() loops, picks up batch 2, enters Write again.
 	g2 := <-gates
 	close(g2.ch)
 
-	// Both batches were written. Stop and verify.
+	assert.NoError(t, <-leader1Done)
+
 	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
 }

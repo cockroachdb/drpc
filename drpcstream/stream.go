@@ -46,6 +46,10 @@ type Stream struct {
 	// genuinely race because cancellation arrives from manageStream while the
 	// application may be mid-send. These are inspectMutex (not sync.Mutex) so
 	// that checkFinished can test whether ops are in flight without blocking.
+	//
+	// write is held only across Enqueue (queue insertion into the shared
+	// MuxWriter buffer); the subsequent Flush runs without it so SendCancel
+	// does not have to wait for an underlying transport.Write to complete.
 	write inspectMutex
 	read  inspectMutex
 
@@ -63,7 +67,7 @@ type Stream struct {
 		recv drpcsignal.Signal // set when done receiving messages
 		// Stream shutdown is two-phase: term then fin. When termination arrives
 		// (remote error, local cancel, close), there may be an in-flight write
-		// on the transport that is past the term check and inside WriteFrame.
+		// on the transport that is past the term check and inside Enqueue/Flush.
 		// term tells new operations to bail out; fin signals that all in-flight
 		// operations have actually completed. Consumers (manageStream) wait on
 		// fin before cleaning up, guaranteeing no goroutine is touching the
@@ -298,6 +302,20 @@ func (s *Stream) checkFinished() {
 	}
 }
 
+// finishWrite is the deferred tail of every top-level write op. It runs
+// after s.write has been released so the (potentially blocking)
+// transport.Write happens without holding the stream lock — letting
+// SendCancel and other control-path ops acquire s.write promptly.
+//
+// Pair with `defer s.finishWrite(&err)` after s.write has been locked.
+// If Flush returns an error and the op had not already failed, propagate
+// the error through the named return.
+func (s *Stream) finishWrite(rerr *error) {
+	if err := s.wr.Flush(); err != nil && *rerr == nil {
+		*rerr = s.CheckCancelError(errs.Wrap(err))
+	}
+}
+
 // CheckCancelError will replace the error with one from the cancel signal if it
 // is set. This is to prevent errors from reads/writes to a transport after it
 // has been asynchronously closed due to context cancelation.
@@ -327,7 +345,7 @@ func (s *Stream) sendPacketLocked(kind drpcwire.Kind, control bool, data []byte)
 	drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(data)))
 	s.log("SEND", fr.String)
 
-	if err := s.wr.WriteFrame(fr); err != nil {
+	if err := s.wr.Enqueue(fr); err != nil {
 		return errs.Wrap(err)
 	}
 	return nil
@@ -354,8 +372,9 @@ func (s *Stream) terminate(err error) {
 // WriteInvoke writes the invoke metadata (if any) and invoke frame
 // atomically under the write lock. This prevents SendCancel from
 // interrupting the invoke sequence.
-func (s *Stream) WriteInvoke(rpc string, metadata []byte) error {
+func (s *Stream) WriteInvoke(rpc string, metadata []byte) (err error) {
 	defer s.checkFinished()
+	defer s.finishWrite(&err)
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -374,6 +393,7 @@ func (s *Stream) WriteInvoke(rpc string, metadata []byte) error {
 // RawWrite sends the data bytes with the given kind.
 func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
 	defer s.checkFinished()
+	defer s.finishWrite(&err)
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -401,7 +421,7 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
 
-		if err := s.wr.WriteFrame(fr); err != nil {
+		if err := s.wr.Enqueue(fr); err != nil {
 			return s.CheckCancelError(errs.Wrap(err))
 		} else if fr.Done {
 			return nil
@@ -433,6 +453,7 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 	defer s.checkFinished()
+	defer s.finishWrite(&err)
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -490,6 +511,7 @@ func (s *Stream) SendError(serr error) (err error) {
 	}
 
 	defer s.checkFinished()
+	defer s.finishWrite(&err)
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -501,9 +523,10 @@ func (s *Stream) SendError(serr error) (err error) {
 }
 
 // SendCancel terminates the stream and sends a cancel to the remote side. It
-// blocks until any in-progress write completes. It is a no-op if the stream is
-// already terminated.
-func (s *Stream) SendCancel(err error) error {
+// is a no-op if the stream is already terminated. SendCancel only waits on any
+// in-progress Enqueue (sub-µs); the actual cancel frame goes out as soon as
+// the in-progress transport.Write chunk completes.
+func (s *Stream) SendCancel(cause error) (err error) {
 	s.log("CALL", func() string { return "SendCancel()" })
 
 	s.mu.Lock()
@@ -513,11 +536,12 @@ func (s *Stream) SendCancel(err error) error {
 	}
 
 	defer s.checkFinished()
+	defer s.finishWrite(&err)
 	s.write.Lock()
 	defer s.write.Unlock()
 
 	s.sigs.send.Set(io.EOF) // in this state, gRPC returns io.EOF on send.
-	s.terminate(err)
+	s.terminate(cause)
 	s.mu.Unlock()
 
 	return s.CheckCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
@@ -535,6 +559,7 @@ func (s *Stream) Close() (err error) {
 	}
 
 	defer s.checkFinished()
+	defer s.finishWrite(&err)
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -557,6 +582,7 @@ func (s *Stream) CloseSend() (err error) {
 	}
 
 	defer s.checkFinished()
+	defer s.finishWrite(&err)
 	s.write.Lock()
 	defer s.write.Unlock()
 

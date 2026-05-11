@@ -152,9 +152,8 @@ func (m *Manager) log(what string, cb func() string) {
 
 // terminate puts the Manager into a terminal state and closes any resources
 // that need to be closed to signal the state change. The mux writer is stopped
-// before closing the transport so that WriteFrame immediately rejects new
-// writes; the subsequent transport close unblocks any in-flight Write in the
-// drain goroutine.
+// before closing the transport so that Enqueue immediately rejects new writes;
+// the subsequent transport close unblocks any in-flight Write in a Flush.
 func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
@@ -327,7 +326,7 @@ func (m *Manager) Unblocked() <-chan struct{} {
 func (m *Manager) Close() error {
 	m.terminate(managerClosed.New("Close called"))
 
-	<-m.wr.Done()      // wait for writer goroutine to exit
+	<-m.wr.Done()      // wait for writer coordinator to exit
 	m.wg.Wait()        // wait for all stream goroutines
 	m.sigs.read.Wait() // wait for reader goroutine to exit
 	m.sigs.tport.Wait()
