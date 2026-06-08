@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/zeebo/errs"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcctx"
 	"storj.io/drpc/drpcdebug"
@@ -53,7 +52,7 @@ type Stream struct {
 
 	id        drpcwire.ID
 	wr        *drpcwire.MuxWriter
-	pool      *BufferPool
+	pool      *drpcwire.BufferPool
 	recvQueue ringBuffer
 	wbuf      []byte
 
@@ -79,7 +78,9 @@ var _ drpc.Stream = (*Stream)(nil)
 // New returns a new stream bound to the context with the given stream id and
 // will use the writer to write messages on. It is important use monotonically
 // increasing stream ids within a single transport.
-func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool) *Stream {
+func New(
+	ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *drpcwire.BufferPool,
+) *Stream {
 	return NewWithOptions(ctx, sid, wr, pool, Options{})
 }
 
@@ -87,7 +88,9 @@ func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPo
 // stream id and will use the writer to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool, opts Options) *Stream {
+func NewWithOptions(
+	ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *drpcwire.BufferPool, opts Options,
+) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -96,7 +99,9 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, poo
 		}
 	}
 
-	pa := drpcwire.NewPacketAssembler()
+	// When a pool is available, assemble directly into pooled buffers so the
+	// completed packet can be handed off to the recv queue without a copy.
+	pa := drpcwire.NewPacketAssembler(pool)
 	pa.SetStreamID(sid)
 
 	s := &Stream{
@@ -222,13 +227,22 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 // returns any major errors that should terminate the transport the stream is
 // operating on.
 func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
-	drpcopts.GetStreamStats(&s.opts.Internal).AddRead(uint64(len(pkt.Data)))
+	drpcopts.GetStreamStats(&s.opts.Internal).AddRead(uint64(len(*pkt.Data)))
 
 	s.log("HANDLE", pkt.String)
 
 	if pkt.Kind == drpcwire.KindMessage {
+		// The assembler handed us ownership of the pooled buffer; enqueue
+		// it directly without copying.
 		s.recvQueue.Enqueue(pkt.Data)
 		return nil
+	}
+
+	// Control and error packets are consumed here and not handed to the recv
+	// queue; return any pooled buffer once we're done reading pkt.Data. The
+	// defer runs after the switch below, so data stays valid while in use.
+	if pkt.Data != nil {
+		defer s.pool.Put(pkt.Data)
 	}
 
 	s.mu.Lock()
@@ -241,7 +255,7 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 		return err
 
 	case drpcwire.KindError:
-		err := drpcwire.UnmarshalError(pkt.Data)
+		err := drpcwire.UnmarshalError(*pkt.Data)
 		s.sigs.send.Set(io.EOF) // in this state, gRPC returns io.EOF on send.
 		s.terminate(err)
 		return nil

@@ -16,7 +16,6 @@ import (
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcmetadata"
@@ -62,7 +61,7 @@ type Manager struct {
 
 	// streams tracks active streams.
 	streams  *activeStreams
-	recvPool *drpcstream.BufferPool
+	recvPool *drpcwire.BufferPool
 
 	pdone   drpcsignal.Chan // signals when NewServerStream has registered the new stream
 	invokes chan invokeInfo // completed invoke info from manageReader to NewServerStream
@@ -131,7 +130,7 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 	m.pendingStreams = make(map[uint64]*pendingStream)
 
 	m.streams = newActiveStreams()
-	m.recvPool = drpcstream.NewBufferPool()
+	m.recvPool = drpcwire.NewBufferPool()
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
@@ -222,7 +221,7 @@ func (m *Manager) manageReader() {
 func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	ps, ok := m.pendingStreams[fr.ID.Stream]
 	if !ok {
-		ps = &pendingStream{pa: drpcwire.NewPacketAssembler()}
+		ps = &pendingStream{pa: drpcwire.NewPacketAssembler(m.recvPool)}
 		m.pendingStreams[fr.ID.Stream] = ps
 	}
 	pkt, packetReady, err := ps.pa.AppendFrame(fr)
@@ -235,7 +234,8 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 
 	// Metadata arrives before invoke; accumulate it and wait for the invoke.
 	if pkt.Kind == drpcwire.KindInvokeMetadata {
-		meta, err := drpcmetadata.Decode(pkt.Data)
+		meta, err := drpcmetadata.Decode(*pkt.Data)
+		m.recvPool.Put(pkt.Data)
 		if err != nil {
 			return err
 		}
@@ -245,11 +245,12 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 
 	// Invoke packet completes the sequence. Send to NewServerStream.
 	select {
-	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: ps.metadata}:
+	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: *pkt.Data, metadata: ps.metadata}:
 		// Wait for NewServerStream to finish stream creation before reading the
 		// next frame. This guarantees curr is set for subsequent non-invoke
 		// packets.
 		m.pdone.Recv()
+		m.recvPool.Put(pkt.Data)
 		// TODO: reuse pending stream
 		delete(m.pendingStreams, fr.ID.Stream)
 	case <-m.sigs.term.Signal():
@@ -262,7 +263,9 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string) (*drpcstream.Stream, error) {
+func (m *Manager) newStream(
+	ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string,
+) (*drpcstream.Stream, error) {
 	opts := m.opts.Stream
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
@@ -336,7 +339,9 @@ func (m *Manager) Close() error {
 }
 
 // NewClientStream starts a stream on the managed transport for use by a client.
-func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpcstream.Stream, err error) {
+func (m *Manager) NewClientStream(
+	ctx context.Context, rpc string,
+) (stream *drpcstream.Stream, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -346,7 +351,9 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 // NewServerStream starts a stream on the managed transport for use by a server.
 // It does this by waiting for the client to issue an invoke message and
 // returning the details.
-func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Stream, rpc string, err error) {
+func (m *Manager) NewServerStream(
+	ctx context.Context,
+) (stream *drpcstream.Stream, rpc string, err error) {
 	select {
 	case <-ctx.Done():
 		return nil, "", ctx.Err()

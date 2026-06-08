@@ -9,13 +9,23 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
+
+	"storj.io/drpc/drpcwire"
 )
+
+// enqueue mimics the producer: it takes a pooled buffer, fills it, and hands
+// ownership to the ring buffer, matching how handlePacket feeds the queue.
+func enqueue(rb *ringBuffer, data []byte) {
+	b := rb.pool.Get()
+	*b = append(*b, data...)
+	rb.Enqueue(b)
+}
 
 func TestRingBuffer_EnqueueDequeue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
-	rb.Enqueue([]byte("hello"))
+	enqueue(&rb, []byte("hello"))
 
 	data, err := rb.Dequeue()
 	assert.NoError(t, err)
@@ -24,11 +34,11 @@ func TestRingBuffer_EnqueueDequeue(t *testing.T) {
 
 func TestRingBuffer_FIFO(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
-	rb.Enqueue([]byte("first"))
-	rb.Enqueue([]byte("second"))
-	rb.Enqueue([]byte("third"))
+	enqueue(&rb, []byte("first"))
+	enqueue(&rb, []byte("second"))
+	enqueue(&rb, []byte("third"))
 
 	for _, want := range []string{"first", "second", "third"} {
 		data, err := rb.Dequeue()
@@ -39,7 +49,7 @@ func TestRingBuffer_FIFO(t *testing.T) {
 
 func TestRingBuffer_DequeueBlocksUntilEnqueue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
 	got := make(chan []byte, 1)
 	go func() {
@@ -48,23 +58,23 @@ func TestRingBuffer_DequeueBlocksUntilEnqueue(t *testing.T) {
 		got <- *data
 	}()
 
-	rb.Enqueue([]byte("delayed"))
+	enqueue(&rb, []byte("delayed"))
 	assert.DeepEqual(t, <-got, []byte("delayed"))
 }
 
 func TestRingBuffer_EnqueueBlocksWhenFull(t *testing.T) {
 	var rb ringBuffer
 	rb.cond.L = &rb.mu
-	rb.pool = NewBufferPool()
+	rb.pool = drpcwire.NewBufferPool()
 	rb.buf = make([]*[]byte, 2) // capacity 2
 
-	rb.Enqueue([]byte("a"))
-	rb.Enqueue([]byte("b"))
+	enqueue(&rb, []byte("a"))
+	enqueue(&rb, []byte("b"))
 
 	// Third enqueue should block until we drain one.
 	done := make(chan struct{})
 	go func() {
-		rb.Enqueue([]byte("c"))
+		enqueue(&rb, []byte("c"))
 		close(done)
 	}()
 
@@ -88,7 +98,7 @@ func TestRingBuffer_EnqueueBlocksWhenFull(t *testing.T) {
 
 func TestRingBuffer_CloseUnblocksDequeue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
 	errch := make(chan error, 1)
 	go func() {
@@ -103,14 +113,14 @@ func TestRingBuffer_CloseUnblocksDequeue(t *testing.T) {
 func TestRingBuffer_CloseUnblocksEnqueue(t *testing.T) {
 	var rb ringBuffer
 	rb.cond.L = &rb.mu
-	rb.pool = NewBufferPool()
+	rb.pool = drpcwire.NewBufferPool()
 	rb.buf = make([]*[]byte, 1) // capacity 1
 
-	rb.Enqueue([]byte("fill"))
+	enqueue(&rb, []byte("fill"))
 
 	done := make(chan struct{})
 	go func() {
-		rb.Enqueue([]byte("blocked"))
+		enqueue(&rb, []byte("blocked"))
 		close(done)
 	}()
 
@@ -120,9 +130,9 @@ func TestRingBuffer_CloseUnblocksEnqueue(t *testing.T) {
 
 func TestRingBuffer_CloseDrainsQueued(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
-	rb.Enqueue([]byte("queued"))
+	enqueue(&rb, []byte("queued"))
 	rb.Close(io.EOF)
 
 	// Dequeue returns the queued data first.
@@ -138,7 +148,7 @@ func TestRingBuffer_CloseDrainsQueued(t *testing.T) {
 
 func TestRingBuffer_CloseIdempotent(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
 	rb.Close(io.EOF)
 	rb.Close(io.ErrUnexpectedEOF) // should not overwrite
@@ -149,21 +159,21 @@ func TestRingBuffer_CloseIdempotent(t *testing.T) {
 
 func TestRingBuffer_EnqueueAfterClose(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
 	rb.Close(io.EOF)
-	rb.Enqueue([]byte("dropped")) // should not panic or block
+	enqueue(&rb, []byte("dropped")) // should not panic or block
 }
 
 func TestRingBuffer_SlotReuse(t *testing.T) {
 	var rb ringBuffer
 	rb.cond.L = &rb.mu
-	rb.pool = NewBufferPool()
+	rb.pool = drpcwire.NewBufferPool()
 	rb.buf = make([]*[]byte, 2)
 
 	// Fill and drain a few rounds to exercise slot reuse.
 	for round := 0; round < 5; round++ {
-		rb.Enqueue([]byte("data"))
+		enqueue(&rb, []byte("data"))
 		data, err := rb.Dequeue()
 		assert.NoError(t, err)
 		assert.DeepEqual(t, *data, []byte("data"))
@@ -172,7 +182,7 @@ func TestRingBuffer_SlotReuse(t *testing.T) {
 
 func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(drpcwire.NewBufferPool())
 
 	const n = 1000
 	var wg sync.WaitGroup
@@ -181,7 +191,7 @@ func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < n; i++ {
-			rb.Enqueue([]byte{byte(i)})
+			enqueue(&rb, []byte{byte(i)})
 		}
 	}()
 
@@ -199,11 +209,11 @@ func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 }
 
 func TestRingBuffer_WithPool(t *testing.T) {
-	pool := NewBufferPool()
+	pool := drpcwire.NewBufferPool()
 	var rb ringBuffer
 	rb.init(pool)
 
-	rb.Enqueue([]byte("pooled"))
+	enqueue(&rb, []byte("pooled"))
 
 	data, err := rb.Dequeue()
 	assert.NoError(t, err)

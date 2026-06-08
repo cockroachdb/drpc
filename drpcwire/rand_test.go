@@ -75,12 +75,3 @@ func RandFrame() Frame {
 		Done: RandBool(),
 	}
 }
-
-func RandPacket() Packet {
-	kind := RandKind()
-	return Packet{
-		Data: RandBytes(10 * payloadSize[kind]()),
-		ID:   RandID(),
-		Kind: kind,
-	}
-}

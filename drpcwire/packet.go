@@ -149,8 +149,7 @@ func AppendFrame(buf []byte, fr Frame) []byte {
 
 // Packet is a single message sent by drpc.
 type Packet struct {
-	// Data is the payload of the packet.
-	Data []byte
+	Data *[]byte
 
 	// ID is the identifier for the packet.
 	ID ID
@@ -168,5 +167,5 @@ type Packet struct {
 // String returns a human readable form of the packet.
 func (p Packet) String() string {
 	return fmt.Sprintf("<pkt s:%d m:%d data:%d kind:%s>",
-		p.ID.Stream, p.ID.Message, len(p.Data), p.Kind)
+		p.ID.Stream, p.ID.Message, len(*p.Data), p.Kind)
 }

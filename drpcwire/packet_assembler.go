@@ -1,8 +1,6 @@
 package drpcwire
 
-import (
-	"storj.io/drpc"
-)
+import "storj.io/drpc"
 
 // PacketAssembler assembles frames into complete packets, enforcing wire
 // protocol invariants:
@@ -11,19 +9,27 @@ import (
 //   - Message IDs must be monotonically increasing.
 //   - Frame kind must not change within a single packet (multi-frame).
 //
+// When constructed with a BufferPool, the assembler assembles directly into a
+// pooled buffer and transfers its ownership to the returned packet (via
+// Packet.Buf), removing a copy on the receive path. Without a pool it reuses
+// its own backing array, and the caller must consume packet.Data before the
+// next AppendFrame call.
+//
 // It is not safe for concurrent use.
 type PacketAssembler struct {
+	pool              *BufferPool
 	pk                Packet
 	assembling        bool
 	streamInitialized bool
 }
 
 // NewPacketAssembler returns a new PacketAssembler ready to assemble frames.
-func NewPacketAssembler() PacketAssembler {
+func NewPacketAssembler(pool *BufferPool) PacketAssembler {
 	return PacketAssembler{
 		pk: Packet{
 			ID: ID{Stream: 0, Message: 1},
 		},
+		pool: pool,
 	}
 }
 
@@ -36,6 +42,9 @@ func (pa *PacketAssembler) SetStreamID(streamID uint64) {
 
 // Reset clears all assembly state, preparing the assembler for a new stream.
 func (pa *PacketAssembler) Reset() {
+	if pa.pk.Data != nil {
+		pa.pool.Put(pa.pk.Data)
+	}
 	pa.pk = Packet{
 		ID: ID{Stream: 0, Message: 1},
 	}
@@ -46,7 +55,7 @@ func (pa *PacketAssembler) Reset() {
 // AppendFrame adds a frame to the in-progress packet. It returns the completed
 // packet and true when a frame with Done=true is received. It returns false
 // when more frames are needed to complete the packet.
-func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady bool, err error) {
+func (pa *PacketAssembler) AppendFrame(fr Frame) (Packet, bool, error) {
 	// Enforce stream ID consistency: infer from first frame or reject mismatches.
 	if !pa.streamInitialized {
 		pa.pk.ID.Stream = fr.ID.Stream
@@ -60,8 +69,11 @@ func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady boo
 		return Packet{}, false, drpc.ProtocolError.New(
 			"message id monotonicity violation: got %v, expected >= %v", fr.ID.Message, pa.pk.ID.Message)
 	} else if fr.ID.Message > pa.pk.ID.Message || !pa.assembling {
-		// New message: reset the buffer and start assembling.
-		pa.pk.Data = pa.pk.Data[:0]
+		if pa.pk.Data == nil {
+			pa.pk.Data = pa.pool.Get()
+		} else {
+			*pa.pk.Data = (*pa.pk.Data)[:0]
+		}
 		pa.assembling = true
 		pa.pk.ID.Message = fr.ID.Message
 	} else if fr.Kind != pa.pk.Kind {
@@ -69,8 +81,9 @@ func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady boo
 			"frame kind changed mid-packet: got %v, expected %v", fr.Kind, pa.pk.Kind)
 	}
 
-	// TODO(shubham): add buf reuse
-	pa.pk.Data = append(pa.pk.Data, fr.Data...)
+	// Assemble directly into the pooled buffer so the completed packet can
+	// be handed off down the receive path without another copy.
+	*pa.pk.Data = append(*pa.pk.Data, fr.Data...)
 	pa.pk.Kind = fr.Kind
 	pa.pk.Control = fr.Control
 
@@ -78,12 +91,9 @@ func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady boo
 		return Packet{}, false, nil
 	}
 
-	packet = pa.pk
-
+	packet := pa.pk
 	pa.assembling = false
 	pa.pk.ID.Message = fr.ID.Message + 1
-	// Reuse the backing array: the caller must consume packet.Data before the
-	// next AppendFrame call, as it will be overwritten.
-	pa.pk.Data = pa.pk.Data[:0]
+	pa.pk.Data = nil
 	return packet, true, nil
 }

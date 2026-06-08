@@ -13,7 +13,7 @@ import (
 )
 
 func TestPacketAssembler_WrongStreamID(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	_, _, err := pa.AppendFrame(Frame{
@@ -27,7 +27,7 @@ func TestPacketAssembler_WrongStreamID(t *testing.T) {
 }
 
 func TestPacketAssembler_StreamIDInferredFromFirstFrame(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 
 	// First frame sets the stream ID implicitly.
 	_, _, err := pa.AppendFrame(Frame{
@@ -49,7 +49,7 @@ func TestPacketAssembler_StreamIDInferredFromFirstFrame(t *testing.T) {
 
 // A frame with a message ID lower than a previously completed message is rejected.
 func TestPacketAssembler_MessageMonotonicity(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	// m3 completes, next expected becomes 4.
@@ -70,7 +70,7 @@ func TestPacketAssembler_MessageMonotonicity(t *testing.T) {
 // When a higher message ID arrives mid-assembly, the in-progress data is
 // silently discarded and a new packet begins.
 func TestPacketAssembler_HigherMsgDiscardsInProgress(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	// Start accumulating m1.
@@ -86,13 +86,13 @@ func TestPacketAssembler_HigherMsgDiscardsInProgress(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.That(t, ready)
-	assert.DeepEqual(t, pkt.Data, []byte("kept"))
+	assert.DeepEqual(t, *pkt.Data, []byte("kept"))
 }
 
 // Continuation frames (same message ID, mid-assembly) must carry the same
 // kind as the first frame. A kind change mid-packet is a protocol error.
 func TestPacketAssembler_KindChangeWithinPacket(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	_, _, err := pa.AppendFrame(Frame{
@@ -110,7 +110,7 @@ func TestPacketAssembler_KindChangeWithinPacket(t *testing.T) {
 
 // Multiple continuation frames for the same message accumulate data correctly.
 func TestPacketAssembler_MultiFrameDataAccumulation(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	_, ready, err := pa.AppendFrame(Frame{
@@ -130,14 +130,14 @@ func TestPacketAssembler_MultiFrameDataAccumulation(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.That(t, ready)
-	assert.DeepEqual(t, pkt.Data, []byte("hello world"))
+	assert.DeepEqual(t, *pkt.Data, []byte("hello world"))
 }
 
 // Multi-frame assembly works when the message ID is greater than the initial
 // expected ID (e.g., on the server side where invoke consumed earlier message
 // IDs). Continuation frames must accumulate data, not reset on each frame.
 func TestPacketAssembler_MultiFrameWithSkippedMessageID(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	// msg=3 is greater than initial expected message ID=1.
@@ -158,12 +158,12 @@ func TestPacketAssembler_MultiFrameWithSkippedMessageID(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.That(t, ready)
-	assert.DeepEqual(t, pkt.Data, []byte("hello world"))
+	assert.DeepEqual(t, *pkt.Data, []byte("hello world"))
 }
 
 // Once a message completes (done=true), the same message ID is rejected.
 func TestPacketAssembler_DonePreventsReplay(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	// m1 completes → next expected becomes 2.
@@ -185,7 +185,7 @@ func TestPacketAssembler_DonePreventsReplay(t *testing.T) {
 // across messages. A KindMessage followed by a KindClose for the next message
 // should be accepted without error.
 func TestPacketAssembler_KindChangeAcrossMessages(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	// Multi-frame message 1 with KindMessage.
@@ -199,7 +199,7 @@ func TestPacketAssembler_KindChangeAcrossMessages(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.That(t, ready)
-	assert.DeepEqual(t, pkt.Data, []byte("abcd"))
+	assert.DeepEqual(t, *pkt.Data, []byte("abcd"))
 
 	// Message 2 with a different kind — should not trigger kind check.
 	pkt, ready, err = pa.AppendFrame(Frame{
@@ -212,7 +212,7 @@ func TestPacketAssembler_KindChangeAcrossMessages(t *testing.T) {
 
 // Reset clears all state so the assembler can be reused for a new stream.
 func TestPacketAssembler_Reset(t *testing.T) {
-	pa := NewPacketAssembler()
+	pa := NewPacketAssembler(NewBufferPool())
 	pa.SetStreamID(1)
 
 	// Complete a packet on stream 1.
@@ -230,6 +230,6 @@ func TestPacketAssembler_Reset(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.That(t, ready)
-	assert.DeepEqual(t, pkt.Data, []byte("new"))
+	assert.DeepEqual(t, *pkt.Data, []byte("new"))
 	assert.Equal(t, pkt.ID.Stream, uint64(2))
 }

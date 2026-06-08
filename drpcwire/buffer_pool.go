@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cockroach Labs.
 // See LICENSE for copying information.
 
-package drpcstream
+package drpcwire
 
 import "sync"
 

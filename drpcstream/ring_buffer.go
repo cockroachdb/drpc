@@ -3,7 +3,11 @@
 
 package drpcstream
 
-import "sync"
+import (
+	"sync"
+
+	"storj.io/drpc/drpcwire"
+)
 
 // defaultRingBufferCapacity is the number of messages the ring buffer can
 // hold before the producer blocks. This decouples the transport reader
@@ -18,7 +22,8 @@ const defaultRingBufferCapacity = 256
 // Enqueue) and the application goroutine (consumer, calls Dequeue).
 //
 // Buffers are obtained from a shared BufferPool. Enqueue copies data into a
-// pooled buffer; Dequeue returns ownership of that buffer to the caller and
+// pooled buffer, while EnqueueOwned takes ownership of an already-pooled buffer
+// without copying; Dequeue returns ownership of that buffer to the caller and
 // advances the tail immediately. The caller is responsible for returning the
 // buffer to the pool via BufferPool.Put.
 //
@@ -29,16 +34,16 @@ type ringBuffer struct {
 	mu   sync.Mutex
 	cond sync.Cond
 
-	pool  *BufferPool // shared pool; nil means allocate fresh each time
-	buf   []*[]byte   // ring of pooled buffer pointers
-	head  int         // next write position (producer)
-	tail  int         // next read position (consumer)
-	count int         // number of occupied slots
+	pool  *drpcwire.BufferPool // shared pool; nil means allocate fresh each time
+	buf   []*[]byte            // ring of pooled buffer pointers
+	head  int                  // next write position (producer)
+	tail  int                  // next read position (consumer)
+	count int                  // number of occupied slots
 
 	err error // terminal error, set by Close
 }
 
-func (rb *ringBuffer) init(pool *BufferPool) {
+func (rb *ringBuffer) init(pool *drpcwire.BufferPool) {
 	rb.cond.L = &rb.mu
 	rb.pool = pool
 	rb.buf = make([]*[]byte, defaultRingBufferCapacity)
@@ -47,7 +52,7 @@ func (rb *ringBuffer) init(pool *BufferPool) {
 // Enqueue copies data into a pooled buffer and places it in the next write
 // slot. If the buffer is full, it blocks until a slot is freed or the buffer
 // is closed. If the buffer is closed, Enqueue returns silently.
-func (rb *ringBuffer) Enqueue(data []byte) {
+func (rb *ringBuffer) Enqueue(data *[]byte) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
@@ -55,13 +60,11 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 		rb.cond.Wait()
 	}
 	if rb.err != nil {
+		rb.pool.Put(data)
 		return
 	}
 
-	b := rb.pool.Get()
-	*b = append(*b, data...)
-
-	rb.buf[rb.head] = b
+	rb.buf[rb.head] = data
 	rb.head = (rb.head + 1) % len(rb.buf)
 	rb.count++
 	rb.cond.Broadcast()
