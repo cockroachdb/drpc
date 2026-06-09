@@ -672,3 +672,41 @@ func BenchmarkPool(b *testing.B) {
 		invoke(ctx, conn)
 	}
 }
+
+// TestPoolPutAfterClose verifies that a connection returned to the pool after
+// the pool is closed is closed immediately rather than cached. This models a
+// long-lived stream whose connection is checked out (and therefore invisible to
+// Close) when the pool is closed, and only handed back via Put once the stream
+// finally ends. Caching it would re-arm the expiration timer and leak the
+// connection until it fires.
+func TestPoolPutAfterClose(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	// Use a non-zero expiration so a cached connection would linger (and arm a
+	// timer) rather than be evicted by capacity limits.
+	pool := New[string, Conn](Options{Expiration: time.Hour})
+
+	closed := make(chan string, 1)
+	conn := &callbackConn{CloseFn: func() error { closed <- "key"; return nil }}
+
+	// Stage the connection in the pool, then check it out, modeling an in-flight
+	// stream. While checked out the connection lives outside the cache.
+	pool.Put("key", conn)
+	got, ok := pool.Take("key")
+	assert.True(t, ok)
+	assert.Equal(t, got, conn)
+	assert.Equal(t, len(closed), 0)
+
+	// Closing the pool cannot see the checked-out connection.
+	assert.NoError(t, pool.Close())
+	assert.Equal(t, len(closed), 0)
+
+	// Returning it now must close it instead of resurrecting the pool.
+	pool.Put("key", conn)
+	assert.Equal(t, <-closed, "key")
+
+	// And it must not have been retained.
+	_, ok = pool.Take("key")
+	assert.That(t, !ok)
+}

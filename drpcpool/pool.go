@@ -52,6 +52,7 @@ type Options struct {
 type Pool[K comparable, V Conn] struct {
 	opts    Options
 	mu      sync.Mutex
+	closed  bool
 	entries map[K]*list[K, V]
 	order   list[K, V]
 }
@@ -119,9 +120,19 @@ func (p *Pool[K, V]) log(what string, cb func() string) {
 
 // Close evicts all entries from the Pool's cache, closing them and returning all
 // of the combined errors from closing.
+//
+// Close also marks the pool as closed so that any connection subsequently
+// returned via Put is closed immediately rather than cached. This matters
+// because Close can only see the connections currently idle in the cache:
+// connections that are checked out (serving an in-flight Invoke or NewStream)
+// live outside the cache and are returned later via Put. Without the closed
+// flag those late returns would resurrect the pool, re-arming an expiration
+// timer and leaking the connection (and its manager goroutines) until it fires.
 func (p *Pool[K, V]) Close() (err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	p.closed = true
 
 	var eg errs.Group
 	for ent := p.order.head; ent != nil; ent = ent.global.next {
@@ -232,6 +243,13 @@ func (p *Pool[K, V]) Put(key K, val V) {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// If the pool has been closed, don't cache the connection (which would
+	// resurrect the pool and leak the connection); close it instead.
+	if p.closed {
+		_ = val.Close()
+		return
+	}
 
 	local := p.entries[key]
 	if local == nil {
