@@ -48,6 +48,9 @@ func (rb *ringBuffer) init(pool *BufferPool) {
 // slot. If the buffer is full, it blocks until a slot is freed or the buffer
 // is closed. If the buffer is closed, Enqueue returns silently.
 func (rb *ringBuffer) Enqueue(data []byte) {
+	b := rb.pool.Get()
+	*b = append(*b, data...)
+
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
@@ -57,9 +60,6 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 	if rb.err != nil {
 		return
 	}
-
-	b := rb.pool.Get()
-	*b = append(*b, data...)
 
 	rb.buf[rb.head] = b
 	rb.head = (rb.head + 1) % len(rb.buf)
