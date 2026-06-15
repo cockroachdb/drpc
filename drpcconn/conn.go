@@ -39,12 +39,27 @@ type Options struct {
 	Metrics drpcmetrics.ClientMetrics
 }
 
+// manager is the subset of drpcmanager behavior that Conn needs. It is
+// satisfied by both the single-stream TCP *drpcmanager.Manager and the
+// multiplexed *drpcmanager.QUICManager.
+type manager interface {
+	NewClientStream(ctx context.Context, rpc string) (*drpcstream.Stream, error)
+	Close() error
+	Closed() <-chan struct{}
+	Unblocked() <-chan struct{}
+}
+
 // Conn is a drpc client connection.
 type Conn struct {
 	tr   drpc.Transport
-	man  *drpcmanager.Manager
+	man  manager
 	mu   sync.Mutex
 	wbuf []byte
+
+	// concurrent is true for connections over a MultiplexedTransport (e.g.
+	// QUIC), where each RPC gets its own stream and so concurrent Invoke and
+	// NewStream calls are allowed.
+	concurrent bool
 
 	stats map[string]*drpcstats.Stats // TODO (server): deprecate
 }
@@ -78,6 +93,24 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 	}
 
 	c.man = drpcmanager.NewWithOptions(c.tr, opts.Manager)
+
+	return c
+}
+
+// NewFromMultiplexed returns a conn that runs over a MultiplexedTransport (e.g.
+// a QUIC connection), opening a new stream per RPC. Unlike New/NewWithOptions,
+// concurrent Invoke and NewStream calls are allowed: each maps to its own
+// independent stream.
+func NewFromMultiplexed(mt drpc.MultiplexedTransport, opts Options) *Conn {
+	c := &Conn{concurrent: true}
+
+	// TODO: (server): deprecate
+	if opts.CollectStats {
+		drpcopts.SetManagerStatsCB(&opts.Manager.Internal, c.getStats)
+		c.stats = make(map[string]*drpcstats.Stats)
+	}
+
+	c.man = drpcmanager.NewQUIC(mt, opts.Manager)
 
 	return c
 }
@@ -136,11 +169,32 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	if err != nil {
 		return err
 	}
-	defer func() { err = errs.Combine(err, stream.Close()) }()
+	defer func() {
+		cerr := stream.Close()
+		// Over a multiplexed transport the per-RPC stream's Close is cleanup:
+		// the peer may have already torn its side down (sending STOP_SENDING),
+		// making a final KindClose write fail benignly. Don't let that override
+		// a completed RPC. The single-stream (TCP) path keeps the old behavior.
+		if !c.concurrent {
+			err = errs.Combine(err, cerr)
+		}
+	}()
 
-	// we have to protect c.wbuf here even though the manager only allows one
-	// stream at a time because the stream may async close allowing another
-	// concurrent call to Invoke to proceed.
+	if c.concurrent {
+		// Multiplexed transport: each RPC has its own stream, so marshal into a
+		// per-call buffer and do not serialize on c.mu. This is what allows many
+		// unary Invokes to run concurrently, each on its own stream.
+		data, merr := drpcenc.MarshalAppend(in, enc, nil)
+		if merr != nil {
+			return merr
+		}
+		return c.doInvoke(stream, enc, rpc, data, metadata, out)
+	}
+
+	// Single-stream transport (TCP): reuse c.wbuf under c.mu. We have to protect
+	// c.wbuf here even though the manager only allows one stream at a time
+	// because the stream may async close allowing another concurrent call to
+	// Invoke to proceed.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
