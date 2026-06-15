@@ -37,6 +37,16 @@ type Transport interface {
 	io.Closer
 }
 
+// MultiplexedTransport represents a connection that can open and accept
+// independent bidirectional streams (e.g. a QUIC connection). Each returned
+// Transport is a single ordered byte stream within the connection.
+type MultiplexedTransport interface {
+	OpenStream(ctx context.Context) (Transport, error)
+	AcceptStream(ctx context.Context) (Transport, error)
+	Close() error
+	Closed() <-chan struct{}
+}
+
 // Message is a protobuf message. It is expected to be used with an Encoding.
 // This exists so that one can use whatever protobuf library/runtime they want.
 type Message interface{}
