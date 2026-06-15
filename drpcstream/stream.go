@@ -108,6 +108,56 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 	return s
 }
 
+// NewForReader returns a stream that owns its transport: it reads packets from
+// rd (over its own underlying stream) via an internal readLoop and writes via
+// wr, one stream per transport. It is used in multiplexed mode (e.g. one drpc
+// stream per QUIC stream), where each stream has its own reader instead of
+// sharing a manager's reader.
+//
+//   - ctx is the caller's RPC context. When ctx is canceled the stream is
+//     canceled and its transport torn down; in multiplexed mode this is how
+//     cancellation reaches the peer, since there is no manager goroutine
+//     watching ctx.
+//   - tr is closed when the stream finishes for ANY reason (normal completion,
+//     error, or cancellation), releasing the transport and unblocking the
+//     readLoop goroutine so it can exit.
+//
+// In multiplexed mode the fin channel in opts must be left unset (checkFinished
+// nil-guards it), and sid should be 1 so the first written frame matches the
+// reader's initial expected ID{Stream:1, Message:1}.
+func NewForReader(ctx context.Context, sid uint64, tr drpc.Transport, rd *drpcwire.Reader, wr *drpcwire.Writer, opts Options) *Stream {
+	s := NewWithOptions(ctx, sid, wr, opts)
+	go s.readLoop(rd)
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.Cancel(ctx.Err())
+		case <-s.Finished():
+		}
+		_ = tr.Close()
+	}()
+	return s
+}
+
+// readLoop reads packets from the stream's own reader and dispatches them to the
+// HandlePacket state machine. It is used in multiplexed mode where each stream
+// owns its transport, instead of relying on a shared manager reader. It exits
+// when a read or handle error occurs, terminating the stream.
+func (s *Stream) readLoop(rd *drpcwire.Reader) {
+	for {
+		pkt, err := rd.ReadPacketUsing(nil)
+		if err != nil {
+			s.mu.Lock()
+			s.terminate(err)
+			s.mu.Unlock()
+			return
+		}
+		if err := s.HandlePacket(pkt); err != nil {
+			return // HandlePacket already terminated the stream
+		}
+	}
+}
+
 // String returns a string representation of the stream.
 func (s *Stream) String() string {
 	return fmt.Sprintf("<str %p s:%d k:%s r:%s>",
