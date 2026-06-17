@@ -60,6 +60,20 @@ func (w *failWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+func TestMuxWriter_MaxBufferSizeOption(t *testing.T) {
+	// Default is applied when the option is left at zero.
+	mw := NewMuxWriter(io.Discard, func(error) {})
+	assert.Equal(t, mw.maxBuf, 1<<20)
+	mw.Stop(nil)
+	<-mw.Done()
+
+	// An explicit value is honored.
+	mw = NewMuxWriterWithOptions(io.Discard, func(error) {}, WriterOptions{MaximumBufferSize: 4096})
+	assert.Equal(t, mw.maxBuf, 4096)
+	mw.Stop(nil)
+	<-mw.Done()
+}
+
 func TestMuxWriter(t *testing.T) {
 	var exp []byte
 	pr, pw := io.Pipe()
@@ -329,12 +343,10 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
-// setMaxBuffer overrides the high-water mark for the duration of a test and
-// returns a function that restores the previous value.
-func setMaxBuffer(n int) func() {
-	old := defaultMaxBufferCapacity
-	defaultMaxBufferCapacity = n
-	return func() { defaultMaxBufferCapacity = old }
+// newTinyMuxWriter builds a MuxWriter with a 1-byte high-water mark so the
+// next WriteFrame after one full frame parks on backpressure.
+func newTinyMuxWriter(w io.Writer) *MuxWriter {
+	return NewMuxWriterWithOptions(w, func(error) {}, WriterOptions{MaximumBufferSize: 1})
 }
 
 // blockUntilFull writes one frame that run() picks up and stalls on (leaving buf
@@ -365,10 +377,8 @@ func assertBlocked(t *testing.T, done <-chan error) {
 // A full buffer parks WriteFrame until run() drains it, after which the parked
 // call appends and returns.
 func TestMuxWriter_WriteFrameBlocksUntilDrain(t *testing.T) {
-	defer setMaxBuffer(1)()
-
 	bw := newBlockingWriter()
-	mw := NewMuxWriter(bw, func(error) {})
+	mw := newTinyMuxWriter(bw)
 	blockUntilFull(t, mw, bw)
 
 	done := make(chan error, 1)
@@ -391,10 +401,8 @@ func TestMuxWriter_WriteFrameBlocksUntilDrain(t *testing.T) {
 
 // A parked WriteFrame returns errInterrupted when its cancel channel fires.
 func TestMuxWriter_WriteFrameCanceledWhileBlocked(t *testing.T) {
-	defer setMaxBuffer(1)()
-
 	bw := newBlockingWriter()
-	mw := NewMuxWriter(bw, func(error) {})
+	mw := newTinyMuxWriter(bw)
 	blockUntilFull(t, mw, bw)
 
 	cancel := make(chan struct{})
@@ -421,10 +429,8 @@ func TestMuxWriter_WriteFrameCanceledWhileBlocked(t *testing.T) {
 // Stop wakes a parked WriteFrame even while run() is stuck in a slow Write, so
 // shutdown does not depend on the buffer draining.
 func TestMuxWriter_StopUnblocksBlockedWriteFrame(t *testing.T) {
-	defer setMaxBuffer(1)()
-
 	bw := newBlockingWriter()
-	mw := NewMuxWriter(bw, func(error) {})
+	mw := newTinyMuxWriter(bw)
 	blockUntilFull(t, mw, bw)
 
 	done := make(chan error, 1)

@@ -14,29 +14,34 @@ import (
 // write buffers.
 var defaultBufferCapacity = 4096
 
-// defaultMaxBufferCapacity is the high-water mark for the pending write buffer.
-// Once it is reached, WriteFrame blocks the calling stream until run drains the
-// buffer onto the wire. This bounds sender-side memory so a fast producer
-// cannot outrun a slow connection and OOM the process. Peak memory is up to
-// ~2x this value: the pending buffer plus the in-flight buffer being written.
-var defaultMaxBufferCapacity = 1024 * 1024
-
 // errInterrupted is returned by WriteFrame when its cancel channel fires while
 // it is blocked on backpressure. The caller maps it to the appropriate stream
 // error (e.g. via CheckCancelError).
 var errInterrupted = errs.New("sending frames interrupted")
+
+// WriterOptions controls configuration settings for a MuxWriter.
+type WriterOptions struct {
+	// MaximumBufferSize is the high-water mark for the pending write buffer.
+	// Once it is reached, WriteFrame blocks the calling stream until the buffer
+	// drains onto the wire. This bounds sender-side memory so a fast producer
+	// cannot outrun a slow connection and OOM the process. Peak memory is up to
+	// ~2x this value: the pending buffer plus the in-flight buffer being
+	// written. When 0, it defaults to 1 MiB.
+	MaximumBufferSize int
+}
 
 // MuxWriter serializes frames from many concurrent streams onto a single
 // io.Writer. Callers append frames with WriteFrame; a dedicated run goroutine
 // flushes them to the wire, double-buffering so producers can keep appending
 // while a write is in flight.
 //
-// The pending buffer is bounded at defaultMaxBufferCapacity. When it is full,
-// WriteFrame blocks until run frees space, the caller cancels, or the writer is
-// stopped. This is the connection-level backpressure that keeps memory bounded.
+// The pending buffer is bounded at maxBuf. When it is full, WriteFrame blocks
+// until run frees space, the caller cancels, or the writer is stopped. This is
+// the connection-level backpressure that keeps memory bounded.
 type MuxWriter struct {
 	w       io.Writer
 	onError func(error)
+	maxBuf  int // high-water mark for buf; producers block at or above it
 
 	mu       sync.Mutex
 	cond     *sync.Cond    // signaled by WriteFrame when buf becomes non-empty; awaited by run
@@ -48,11 +53,23 @@ type MuxWriter struct {
 	done     chan struct{} // closed when run exits
 }
 
+// NewMuxWriter constructs a MuxWriter with default options.
 func NewMuxWriter(w io.Writer, onError func(error)) *MuxWriter {
+	return NewMuxWriterWithOptions(w, onError, WriterOptions{})
+}
+
+// NewMuxWriterWithOptions constructs a MuxWriter using the provided options to
+// manage buffering.
+func NewMuxWriterWithOptions(w io.Writer, onError func(error), opts WriterOptions) *MuxWriter {
+	if opts.MaximumBufferSize == 0 {
+		opts.MaximumBufferSize = 1 << 20 // Default to 1 MiB.
+	}
+
 	mw := &MuxWriter{
 		w:       w,
-		buf:     make([]byte, 0, defaultBufferCapacity),
 		onError: onError,
+		maxBuf:  opts.MaximumBufferSize,
+		buf:     make([]byte, 0, defaultBufferCapacity),
 		done:    make(chan struct{}),
 		drain:   make(chan struct{}),
 	}
@@ -127,7 +144,7 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel <-chan struct{}) (err error) {
 			mw.mu.Unlock()
 			return mw.closeErr
 		}
-		if len(mw.buf) < defaultMaxBufferCapacity {
+		if len(mw.buf) < mw.maxBuf {
 			mw.buf = AppendFrame(mw.buf, fr)
 			mw.cond.Signal()
 			mw.mu.Unlock()

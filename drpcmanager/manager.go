@@ -33,6 +33,9 @@ type Options struct {
 	// Reader are passed to any readers the manager creates.
 	Reader drpcwire.ReaderOptions
 
+	// Writer are passed to the mux writer the manager creates.
+	Writer drpcwire.WriterOptions
+
 	// Stream are passed to any streams the manager creates.
 	Stream drpcstream.Options
 
@@ -122,7 +125,7 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 		kind:    kind,
 	}
 
-	m.wr = drpcwire.NewMuxWriter(tr, m.terminate)
+	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
 
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.
