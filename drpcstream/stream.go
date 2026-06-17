@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/zeebo/errs"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcctx"
 	"storj.io/drpc/drpcdebug"
@@ -86,7 +85,9 @@ func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPo
 // stream id and will use the writer to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool, opts Options) *Stream {
+func NewWithOptions(
+	ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool, opts Options,
+) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -325,7 +326,7 @@ func (s *Stream) sendPacketLocked(kind drpcwire.Kind, control bool, data []byte)
 	drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(data)))
 	s.log("SEND", fr.String)
 
-	if err := s.wr.WriteFrame(fr); err != nil {
+	if err := s.wr.WriteFrame(fr, s.sigs.term.Signal()); err != nil {
 		return errs.Wrap(err)
 	}
 	return nil
@@ -399,7 +400,7 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
 
-		if err := s.wr.WriteFrame(fr); err != nil {
+		if err := s.wr.WriteFrame(fr, s.sigs.term.Signal()); err != nil {
 			return s.CheckCancelError(errs.Wrap(err))
 		} else if fr.Done {
 			return nil

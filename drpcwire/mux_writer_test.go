@@ -68,7 +68,7 @@ func TestMuxWriter(t *testing.T) {
 	for range 1000 {
 		fr := RandFrame()
 		exp = AppendFrame(exp, fr)
-		assert.NoError(t, mw.WriteFrame(fr))
+		assert.NoError(t, mw.WriteFrame(fr, nil))
 	}
 
 	// Read exactly len(exp) bytes: this blocks until MuxWriter has drained
@@ -91,7 +91,7 @@ func TestMuxWriter_WriteFrameAfterStop(t *testing.T) {
 	mw.Stop(errors.New("stopped"))
 	<-mw.Done()
 
-	err := mw.WriteFrame(RandFrame())
+	err := mw.WriteFrame(RandFrame(), nil)
 	assert.Error(t, err)
 	assert.Equal(t, err.Error(), "stopped")
 }
@@ -128,7 +128,7 @@ func TestMuxWriter_ConcurrentWriteFrame(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := range framesPerWriter {
-				assert.NoError(t, mw.WriteFrame(allFrames[i][j]))
+				assert.NoError(t, mw.WriteFrame(allFrames[i][j], nil))
 			}
 		}()
 	}
@@ -163,7 +163,7 @@ func TestMuxWriter_WriteErrorCallsOnError(t *testing.T) {
 	gotErr := make(chan error, 1)
 	mw := NewMuxWriter(fw, func(err error) { gotErr <- err })
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	assert.NoError(t, mw.WriteFrame(RandFrame(), nil))
 
 	select {
 	case err := <-gotErr:
@@ -191,7 +191,7 @@ func TestMuxWriter_OnErrorCallingStopDoesNotDeadlock(t *testing.T) {
 		mw.Stop(errors.New("stopped"))
 	})
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	assert.NoError(t, mw.WriteFrame(RandFrame(), nil))
 
 	select {
 	case <-mw.Done():
@@ -206,7 +206,7 @@ func TestMuxWriter_BlockedWriteUnblockedByClose(t *testing.T) {
 	bw := newBlockingWriter()
 	mw := NewMuxWriter(bw, func(error) {})
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	assert.NoError(t, mw.WriteFrame(RandFrame(), nil))
 
 	// Wait for run() to enter Write.
 	select {
@@ -231,7 +231,7 @@ func TestMuxWriter_ConcurrentStop(t *testing.T) {
 	mw := NewMuxWriter(io.Discard, func(error) {})
 
 	// Write a frame so the goroutine has work.
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	assert.NoError(t, mw.WriteFrame(RandFrame(), nil))
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -258,7 +258,7 @@ func TestMuxWriter_StopDiscardsBufferedData(t *testing.T) {
 
 	// Write several frames while the writer is blocked on the first Write.
 	for range 10 {
-		assert.NoError(t, mw.WriteFrame(RandFrame()))
+		assert.NoError(t, mw.WriteFrame(RandFrame(), nil))
 	}
 
 	// Wait for run() to enter Write with the first batch.
@@ -270,7 +270,7 @@ func TestMuxWriter_StopDiscardsBufferedData(t *testing.T) {
 
 	// More frames accumulate in buf while Write is blocked.
 	for range 10 {
-		assert.NoError(t, mw.WriteFrame(RandFrame()))
+		assert.NoError(t, mw.WriteFrame(RandFrame(), nil))
 	}
 
 	// Stop without letting the blocked Write complete.
@@ -304,13 +304,13 @@ func TestMuxWriter_WriteFrameDuringActiveDrain(t *testing.T) {
 
 	// Batch 1: write a frame, wait for run() to pick it up and block in Write.
 	fr1 := Frame{Data: []byte("batch1"), ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: true}
-	assert.NoError(t, mw.WriteFrame(fr1))
+	assert.NoError(t, mw.WriteFrame(fr1, nil))
 
 	g1 := <-gates // run() is now blocked in Write for batch 1
 
 	// Batch 2: write another frame while batch 1 is still draining.
 	fr2 := Frame{Data: []byte("batch2"), ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Done: true}
-	assert.NoError(t, mw.WriteFrame(fr2))
+	assert.NoError(t, mw.WriteFrame(fr2, nil))
 
 	// Complete batch 1 write.
 	close(g1.ch)
@@ -328,3 +328,120 @@ func TestMuxWriter_WriteFrameDuringActiveDrain(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// setMaxBuffer overrides the high-water mark for the duration of a test and
+// returns a function that restores the previous value.
+func setMaxBuffer(n int) func() {
+	old := defaultMaxBufferCapacity
+	defaultMaxBufferCapacity = n
+	return func() { defaultMaxBufferCapacity = old }
+}
+
+// blockUntilFull writes one frame that run() picks up and stalls on (leaving buf
+// empty), then a second frame that fills buf past the limit. After it returns,
+// run() is blocked in Write and the next WriteFrame is guaranteed to park. It
+// requires a 1-byte high-water mark and a blockingWriter.
+func blockUntilFull(t *testing.T, mw *MuxWriter, bw *blockingWriter) {
+	t.Helper()
+	assert.NoError(t, mw.WriteFrame(RandFrame(), nil))
+	select {
+	case <-bw.wrote: // run() is now stalled in Write; buf is empty
+	case <-time.After(5 * time.Second):
+		t.Fatal("run() did not enter Write")
+	}
+	assert.NoError(t, mw.WriteFrame(RandFrame(), nil)) // refills buf past the limit
+}
+
+// assertBlocked asserts that the pending WriteFrame on done has not returned.
+func assertBlocked(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatal("WriteFrame returned while it should have been blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A full buffer parks WriteFrame until run() drains it, after which the parked
+// call appends and returns.
+func TestMuxWriter_WriteFrameBlocksUntilDrain(t *testing.T) {
+	defer setMaxBuffer(1)()
+
+	bw := newBlockingWriter()
+	mw := NewMuxWriter(bw, func(error) {})
+	blockUntilFull(t, mw, bw)
+
+	done := make(chan error, 1)
+	go func() { done <- mw.WriteFrame(RandFrame(), nil) }()
+	assertBlocked(t, done)
+
+	// Let the stalled Write complete; run() drains, swaps buf empty, and wakes
+	// the parked writer, which then appends and returns.
+	close(bw.unblock)
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteFrame stayed blocked after drain")
+	}
+
+	mw.Stop(errors.New("stopped"))
+	<-mw.Done()
+}
+
+// A parked WriteFrame returns errInterrupted when its cancel channel fires.
+func TestMuxWriter_WriteFrameCanceledWhileBlocked(t *testing.T) {
+	defer setMaxBuffer(1)()
+
+	bw := newBlockingWriter()
+	mw := NewMuxWriter(bw, func(error) {})
+	blockUntilFull(t, mw, bw)
+
+	cancel := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- mw.WriteFrame(RandFrame(), cancel) }()
+	assertBlocked(t, done)
+
+	close(cancel)
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+		assert.Equal(t, err.Error(), errInterrupted.Error())
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel did not unblock WriteFrame")
+	}
+
+	// Cleanup: let run() finish and exit.
+	bw.err = errors.New("closed")
+	close(bw.unblock)
+	mw.Stop(errors.New("stopped"))
+	<-mw.Done()
+}
+
+// Stop wakes a parked WriteFrame even while run() is stuck in a slow Write, so
+// shutdown does not depend on the buffer draining.
+func TestMuxWriter_StopUnblocksBlockedWriteFrame(t *testing.T) {
+	defer setMaxBuffer(1)()
+
+	bw := newBlockingWriter()
+	mw := NewMuxWriter(bw, func(error) {})
+	blockUntilFull(t, mw, bw)
+
+	done := make(chan error, 1)
+	go func() { done <- mw.WriteFrame(RandFrame(), nil) }()
+	assertBlocked(t, done)
+
+	mw.Stop(errors.New("stopped"))
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+		assert.Equal(t, err.Error(), "stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not unblock WriteFrame")
+	}
+
+	// run() is still stuck in Write; release it so the goroutine exits.
+	bw.err = errors.New("closed")
+	close(bw.unblock)
+	<-mw.Done()
+}

@@ -53,7 +53,7 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 			ID:   drpcwire.ID{Stream: pkt.ID.Stream, Message: 1},
 			Kind: drpcwire.KindMessage,
 			Done: true,
-		})
+		}, nil)
 
 		_, _ = rd.ReadFrame() // Close
 		<-invokeDone          // wait for invoke to return
@@ -65,7 +65,7 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 				ID:   drpcwire.ID{Stream: pkt.ID.Stream, Message: 2},
 				Kind: drpcwire.KindCloseSend,
 				Done: true,
-			})
+			}, nil)
 		}
 
 		_ = ps.Close()
@@ -121,7 +121,7 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 			ID:   drpcwire.ID{Stream: pkt.ID.Stream, Message: 1},
 			Kind: drpcwire.KindMessage,
 			Done: true,
-		})
+		}, nil)
 
 		_, _ = rd.ReadFrame() // Close
 	})

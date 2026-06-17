@@ -54,7 +54,7 @@ func (rc *randClient) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rc.id.incMessage(),
 			Kind: drpcwire.KindInvoke,
 			Done: true,
-		}))
+		}, nil))
 		rc.active = true
 	}
 
@@ -65,7 +65,7 @@ func (rc *randClient) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 				ID:   rc.id.incMessage(),
 				Kind: drpcwire.KindClose,
 				Done: true,
-			}))
+			}, nil))
 		}
 
 		rc.id.incStream()
@@ -75,7 +75,7 @@ func (rc *randClient) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 				ID:   rc.id.incMessage(),
 				Kind: drpcwire.KindInvokeMetadata,
 				Done: done,
-			}))
+			}, nil))
 		}
 
 		assert.NoError(t, wr.WriteFrame(drpcwire.Frame{
@@ -83,7 +83,7 @@ func (rc *randClient) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rc.id.incMessage(),
 			Kind: drpcwire.KindInvoke,
 			Done: done,
-		}))
+		}, nil))
 		rc.active = done
 
 	case 1: // terminate (close send, close, error)
@@ -98,7 +98,7 @@ func (rc *randClient) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rc.id.incMessage(),
 			Kind: kind,
 			Done: done,
-		}))
+		}, nil))
 
 	case 2: // cause the remote side to close
 		assert.NoError(t, wr.WriteFrame(drpcwire.Frame{
@@ -106,7 +106,7 @@ func (rc *randClient) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rc.id.incMessage(),
 			Kind: drpcwire.KindMessage,
 			Done: true,
-		}))
+		}, nil))
 
 	case 3, 4, 5, 6, 7: // send normal message
 		assert.NoError(t, wr.WriteFrame(drpcwire.Frame{
@@ -114,7 +114,7 @@ func (rc *randClient) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rc.id.incMessage(),
 			Kind: drpcwire.KindMessage,
 			Done: done,
-		}))
+		}, nil))
 
 	default:
 		t.Fatalf("unknown command: %d", cmd)
@@ -145,7 +145,7 @@ func (rs *randServer) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rs.id.incMessage(),
 			Kind: drpcwire.KindMessage,
 			Done: done,
-		}))
+		}, nil))
 
 	case 1: // terminate (close send, close, error)
 		kind := [...]drpcwire.Kind{
@@ -160,7 +160,7 @@ func (rs *randServer) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rs.id.incMessage(),
 			Kind: kind,
 			Done: done,
-		}))
+		}, nil))
 
 	case 2: // cause the remote side to close
 		assert.NoError(t, wr.WriteFrame(drpcwire.Frame{
@@ -168,7 +168,7 @@ func (rs *randServer) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rs.id.incMessage(),
 			Kind: drpcwire.KindMessage,
 			Done: true,
-		}))
+		}, nil))
 
 	case 3, 4, 5, 6, 7: // send random message
 		assert.NoError(t, wr.WriteFrame(drpcwire.Frame{
@@ -176,7 +176,7 @@ func (rs *randServer) execute(t *testing.T, wr *drpcwire.MuxWriter, op byte) {
 			ID:   rs.id.incMessage(),
 			Kind: drpcwire.KindMessage,
 			Done: done,
-		}))
+		}, nil))
 
 	default:
 		t.Fatalf("unknown command: %d", cmd)
