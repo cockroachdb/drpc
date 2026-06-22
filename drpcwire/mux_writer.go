@@ -7,17 +7,12 @@ import (
 	"io"
 	"sync"
 
-	"github.com/zeebo/errs"
+	"storj.io/drpc/drpcsignal"
 )
 
 // defaultBufferCapacity is the initial capacity of the pending and in-flight
 // write buffers.
 var defaultBufferCapacity = 4096
-
-// errInterrupted is returned by WriteFrame when its cancel channel fires while
-// it is blocked on backpressure. The caller maps it to the appropriate stream
-// error (e.g. via CheckCancelError).
-var errInterrupted = errs.New("sending frames interrupted")
 
 // WriterOptions controls configuration settings for a MuxWriter.
 type WriterOptions struct {
@@ -135,11 +130,13 @@ func (mw *MuxWriter) run() {
 
 // WriteFrame appends fr to the pending buffer. If the buffer is at its
 // high-water mark it blocks until run frees space, cancel fires, or the writer
-// is stopped. cancel is the caller's termination channel (e.g. a stream's term
-// signal); when it fires WriteFrame returns errInterrupted. A control-bit frame
-// is appended immediately even past the high-water mark, so an abortive cancel
-// is never delayed by backpressure.
-func (mw *MuxWriter) WriteFrame(fr Frame, cancel <-chan struct{}) (err error) {
+// is stopped. cancel is the caller's termination signal (e.g. a stream's send
+// signal); when it fires WriteFrame stops waiting and returns cancel.Err(), so
+// the caller gets the termination cause directly without interpreting a
+// sentinel. cancel may be nil to wait indefinitely for space. A control-bit
+// frame is appended immediately even past the high-water mark, so an abortive
+// cancel is never delayed by backpressure.
+func (mw *MuxWriter) WriteFrame(fr Frame, cancel *drpcsignal.Signal) (err error) {
 	for {
 		mw.mu.Lock()
 		if mw.closed {
@@ -164,17 +161,25 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel <-chan struct{}) (err error) {
 		mw.blocked++
 		mw.mu.Unlock()
 
+		// Resolve the cancel channel lazily, only now that we are parking, so the
+		// common non-blocking path never forces the signal's channel to be
+		// allocated.
+		var cancelCh <-chan struct{}
+		if cancel != nil {
+			cancelCh = cancel.Signal()
+		}
+
 		select {
 		case <-ch:
 			// Space may be available now; loop and re-check.
 			mw.mu.Lock()
 			mw.blocked--
 			mw.mu.Unlock()
-		case <-cancel:
+		case <-cancelCh:
 			mw.mu.Lock()
 			mw.blocked--
 			mw.mu.Unlock()
-			return errInterrupted
+			return cancel.Err()
 		case <-mw.done:
 			mw.mu.Lock()
 			mw.blocked--

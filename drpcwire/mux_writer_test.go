@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/zeebo/assert"
+
+	"storj.io/drpc/drpcsignal"
 )
 
 // blockingWriter blocks in Write until unblock is closed, then returns err.
@@ -399,22 +401,22 @@ func TestMuxWriter_WriteFrameBlocksUntilDrain(t *testing.T) {
 	<-mw.Done()
 }
 
-// A parked WriteFrame returns errInterrupted when its cancel channel fires.
+// A parked WriteFrame returns the cancel signal's error when it fires.
 func TestMuxWriter_WriteFrameCanceledWhileBlocked(t *testing.T) {
 	bw := newBlockingWriter()
 	mw := newTinyMuxWriter(bw)
 	blockUntilFull(t, mw, bw)
 
-	cancel := make(chan struct{})
+	var cancel drpcsignal.Signal
 	done := make(chan error, 1)
-	go func() { done <- mw.WriteFrame(RandFrame(), cancel) }()
+	go func() { done <- mw.WriteFrame(RandFrame(), &cancel) }()
 	assertBlocked(t, done)
 
-	close(cancel)
+	cancelErr := errors.New("canceled")
+	cancel.Set(cancelErr)
 	select {
 	case err := <-done:
-		assert.Error(t, err)
-		assert.Equal(t, err.Error(), errInterrupted.Error())
+		assert.Equal(t, err, cancelErr)
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancel did not unblock WriteFrame")
 	}

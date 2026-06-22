@@ -405,8 +405,13 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
 
-		if err := s.wr.WriteFrame(fr, s.sigs.term.Signal()); err != nil {
-			return s.CheckCancelError(errs.Wrap(err))
+		// Pass the send signal, the write side's own stop signal, so a parked
+		// WriteFrame is woken when sending ends (cancel, error, close) and
+		// returns that signal's error directly. That is io.EOF in the cancel and
+		// error cases, the same error the loop guard above returns, so the parked
+		// and unparked paths agree and there is nothing to remap here.
+		if err := s.wr.WriteFrame(fr, &s.sigs.send); err != nil {
+			return err
 		} else if fr.Done {
 			return nil
 		}

@@ -487,7 +487,10 @@ func TestStream_SendCancelPreemptsBlockedSend(t *testing.T) {
 	}
 	select {
 	case err := <-sendDone:
-		assert.Error(t, err)
+		// The preempted send reports the send signal's error (io.EOF), the same
+		// as a send attempted after termination, per the gRPC convention. The
+		// cancellation cause is available from the receive side.
+		assert.Equal(t, err, io.EOF)
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocked send was not interrupted by SendCancel")
 	}
