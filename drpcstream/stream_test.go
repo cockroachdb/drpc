@@ -452,3 +452,47 @@ func TestStream_CloseNotDroppedUnderBackpressure(t *testing.T) {
 
 	waitForKind(t, bw.wrote, drpcwire.KindClose)
 }
+
+// SendCancel is abortive: it preempts a send blocked on backpressure and
+// returns without waiting for the buffer to drain.
+func TestStream_SendCancelPreemptsBlockedSend(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	bw := newBlockingWriter()
+	mw := drpcwire.NewMuxWriterWithOptions(bw, func(error) {}, drpcwire.WriterOptions{MaximumBufferSize: 1})
+	defer func() { mw.Stop(nil); <-mw.Done() }()
+
+	fillMuxBuffer(t, mw, bw)
+
+	st := New(ctx, 1, mw, NewBufferPool())
+
+	// A send parks in WriteFrame on the full buffer while holding the write lock.
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- st.RawWrite(drpcwire.KindMessage, []byte("payload")) }()
+	assertBlocked(t, sendDone)
+
+	// SendCancel sets the termination signal before taking the write lock, which
+	// interrupts the blocked send and releases the lock; the cancel frame then
+	// bypasses the buffer cap. Both return without the buffer ever draining
+	// (unblock is still closed below).
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- st.SendCancel(context.Canceled) }()
+
+	select {
+	case err := <-cancelDone:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("SendCancel did not preempt the blocked send")
+	}
+	select {
+	case err := <-sendDone:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked send was not interrupted by SendCancel")
+	}
+
+	// The cancel frame is queued; draining lets it reach the wire.
+	close(bw.unblock)
+	waitForKind(t, bw.wrote, drpcwire.KindCancel)
+}

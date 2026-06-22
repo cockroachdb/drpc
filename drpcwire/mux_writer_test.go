@@ -426,6 +426,34 @@ func TestMuxWriter_WriteFrameCanceledWhileBlocked(t *testing.T) {
 	<-mw.Done()
 }
 
+// A control-bit frame is appended immediately even when the buffer is full, so
+// an abortive cancel is never delayed by backpressure.
+func TestMuxWriter_ControlFrameBypassesFullBuffer(t *testing.T) {
+	bw := newBlockingWriter()
+	mw := newTinyMuxWriter(bw)
+	blockUntilFull(t, mw, bw)
+
+	done := make(chan error, 1)
+	go func() {
+		fr := RandFrame()
+		fr.Control = true
+		done <- mw.WriteFrame(fr, nil)
+	}()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("control frame did not bypass the full buffer")
+	}
+
+	// Cleanup: let run() finish the stalled Write and exit.
+	bw.err = errors.New("closed")
+	close(bw.unblock)
+	mw.Stop(errors.New("stopped"))
+	<-mw.Done()
+}
+
 // Stop wakes a parked WriteFrame even while run() is stuck in a slow Write, so
 // shutdown does not depend on the buffer draining.
 func TestMuxWriter_StopUnblocksBlockedWriteFrame(t *testing.T) {

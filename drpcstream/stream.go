@@ -484,6 +484,9 @@ var (
 
 // SendError terminates the stream and sends the error to the remote. It is a
 // no-op if the stream is already terminated.
+//
+// SendError is ordered: a message whose MsgSend returned before this call is
+// delivered to the remote ahead of the error. This is unlike SendCancel.
 func (s *Stream) SendError(serr error) (err error) {
 	s.log("CALL", func() string { return fmt.Sprintf("SendError(%v)", serr) })
 
@@ -504,9 +507,13 @@ func (s *Stream) SendError(serr error) (err error) {
 	return s.CheckCancelError(s.sendPacketLocked(drpcwire.KindError, false, drpcwire.MarshalError(serr)))
 }
 
-// SendCancel terminates the stream and sends a cancel to the remote side. It
-// blocks until any in-progress write completes. It is a no-op if the stream is
-// already terminated.
+// SendCancel terminates the stream and sends a cancel to the remote side. It is
+// a no-op if the stream is already terminated.
+//
+// SendCancel is abortive: unlike the ordered terminal sends it does not queue
+// behind in-flight messages and gives no guarantee that already-sent messages
+// reach the remote first. This matches gRPC, where cancellation does not flush
+// buffered messages.
 func (s *Stream) SendCancel(err error) error {
 	s.log("CALL", func() string { return "SendCancel()" })
 
@@ -517,18 +524,25 @@ func (s *Stream) SendCancel(err error) error {
 	}
 
 	defer s.checkFinished()
-	s.write.Lock()
-	defer s.write.Unlock()
 
+	// Set the send signal before taking the write lock so a send blocked on
+	// backpressure is interrupted and releases the lock, letting the cancel
+	// preempt it instead of waiting for the buffer to drain.
 	s.sigs.send.Set(io.EOF) // in this state, gRPC returns io.EOF on send.
 	s.terminate(err)
 	s.mu.Unlock()
+
+	s.write.Lock()
+	defer s.write.Unlock()
 
 	return s.CheckCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
 }
 
 // Close terminates the stream and sends that the stream has been closed to the
 // remote. It is a no-op if the stream is already terminated.
+//
+// Close is ordered: a message whose MsgSend returned before this call is
+// delivered to the remote ahead of the close.
 func (s *Stream) Close() (err error) {
 	s.log("CALL", func() string { return "Close()" })
 
@@ -551,6 +565,9 @@ func (s *Stream) Close() (err error) {
 // CloseSend informs the remote that no more messages will be sent. If the remote has
 // also already issued a CloseSend, the stream is terminated. It is a no-op if the
 // stream already has sent a CloseSend or if it is terminated.
+//
+// CloseSend is ordered: a message whose MsgSend returned before this call is
+// delivered to the remote ahead of the close-send.
 func (s *Stream) CloseSend() (err error) {
 	s.log("CALL", func() string { return "CloseSend()" })
 

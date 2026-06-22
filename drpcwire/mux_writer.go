@@ -136,7 +136,9 @@ func (mw *MuxWriter) run() {
 // WriteFrame appends fr to the pending buffer. If the buffer is at its
 // high-water mark it blocks until run frees space, cancel fires, or the writer
 // is stopped. cancel is the caller's termination channel (e.g. a stream's term
-// signal); when it fires WriteFrame returns errInterrupted.
+// signal); when it fires WriteFrame returns errInterrupted. A control-bit frame
+// is appended immediately even past the high-water mark, so an abortive cancel
+// is never delayed by backpressure.
 func (mw *MuxWriter) WriteFrame(fr Frame, cancel <-chan struct{}) (err error) {
 	for {
 		mw.mu.Lock()
@@ -144,7 +146,11 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel <-chan struct{}) (err error) {
 			mw.mu.Unlock()
 			return mw.closeErr
 		}
-		if len(mw.buf) < mw.maxBuf {
+		// A control-bit frame (e.g. an abortive KindCancel) is appended even past
+		// the cap so it is never delayed by backpressure. This overshoots the
+		// high-water mark by at most one small control frame per terminating
+		// stream, which is bounded and acceptable.
+		if len(mw.buf) < mw.maxBuf || fr.Control {
 			mw.buf = AppendFrame(mw.buf, fr)
 			mw.cond.Signal()
 			mw.mu.Unlock()
