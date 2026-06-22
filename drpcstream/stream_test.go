@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 	"github.com/zeebo/errs"
@@ -335,4 +336,119 @@ func TestHandleFrame_MessageDeliveredViaRecv(t *testing.T) {
 	}))
 
 	assert.DeepEqual(t, <-recv, []byte("payload"))
+}
+
+//
+// backpressure tests
+//
+
+// blockingWriter blocks in Write until unblock is closed. It sends a copy of
+// each Write's bytes on wrote so the test can observe what reached the wire.
+type blockingWriter struct {
+	unblock chan struct{}
+	wrote   chan []byte
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{
+		unblock: make(chan struct{}),
+		wrote:   make(chan []byte, 16),
+	}
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.wrote <- append([]byte(nil), p...)
+	<-w.unblock
+	return len(p), nil
+}
+
+// fillMuxBuffer drives mw into a full-buffer state. The first frame is picked up
+// by run() and stalls in Write (draining buf to empty); the second frame refills
+// buf past the 1-byte high-water mark. After it returns, run() is blocked in
+// Write and the next WriteFrame parks on backpressure. It requires a MuxWriter
+// with a 1-byte high-water mark over the given blockingWriter.
+func fillMuxBuffer(t *testing.T, mw *drpcwire.MuxWriter, bw *blockingWriter) {
+	t.Helper()
+	fr := drpcwire.Frame{
+		Data: []byte("x"),
+		ID:   drpcwire.ID{Stream: 99, Message: 1},
+		Kind: drpcwire.KindMessage,
+		Done: true,
+	}
+	assert.NoError(t, mw.WriteFrame(fr, nil))
+	select {
+	case <-bw.wrote: // run() is now stalled in Write; buf is empty
+	case <-time.After(5 * time.Second):
+		t.Fatal("run() did not enter Write")
+	}
+	fr.ID.Message = 2
+	assert.NoError(t, mw.WriteFrame(fr, nil)) // refills buf past the limit
+}
+
+// assertBlocked asserts that the pending operation on done has not returned.
+func assertBlocked(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("operation returned while it should have been blocked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// waitForKind drains chunks written to the wire and fails if no frame of the
+// given kind appears before the timeout.
+func waitForKind(t *testing.T, wrote <-chan []byte, kind drpcwire.Kind) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case chunk := <-wrote:
+			for len(chunk) > 0 {
+				rem, fr, ok, err := drpcwire.ParseFrame(chunk)
+				assert.NoError(t, err)
+				if !ok {
+					break
+				}
+				if fr.Kind == kind {
+					return
+				}
+				chunk = rem
+			}
+		case <-deadline:
+			t.Fatalf("frame of kind %s never reached the wire", kind)
+		}
+	}
+}
+
+// A terminal frame must reach the wire even when the connection write buffer is
+// full: Close parks until the buffer drains instead of being dropped.
+func TestStream_CloseNotDroppedUnderBackpressure(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	bw := newBlockingWriter()
+	mw := drpcwire.NewMuxWriterWithOptions(bw, func(error) {}, drpcwire.WriterOptions{MaximumBufferSize: 1})
+	defer func() { mw.Stop(nil); <-mw.Done() }()
+
+	fillMuxBuffer(t, mw, bw)
+
+	st := New(ctx, 1, mw, NewBufferPool())
+
+	done := make(chan error, 1)
+	go func() { done <- st.Close() }()
+
+	// The buffer is full, so the KindClose frame parks instead of being dropped.
+	assertBlocked(t, done)
+
+	// Drain the buffer; the parked KindClose frame now appends and reaches run().
+	close(bw.unblock)
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close stayed blocked after drain")
+	}
+
+	waitForKind(t, bw.wrote, drpcwire.KindClose)
 }

@@ -326,7 +326,12 @@ func (s *Stream) sendPacketLocked(kind drpcwire.Kind, control bool, data []byte)
 	drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(data)))
 	s.log("SEND", fr.String)
 
-	if err := s.wr.WriteFrame(fr, s.sigs.term.Signal()); err != nil {
+	// Terminal frames are sent after terminate() has set the send signal, so we
+	// must not pass that signal as WriteFrame's cancel: it is already set, and a
+	// full buffer would make WriteFrame drop the frame, leaving the remote
+	// without a clean Close/Error/Cancel. Passing nil lets the frame wait for
+	// space so it always reaches the wire.
+	if err := s.wr.WriteFrame(fr, nil); err != nil {
 		return errs.Wrap(err)
 	}
 	return nil
