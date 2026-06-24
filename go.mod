@@ -3,7 +3,7 @@ module storj.io/drpc
 go 1.25.0
 
 require (
-	github.com/quic-go/quic-go v0.0.0-00010101000000-000000000000
+	github.com/quic-go/quic-go v0.59.1
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/assert v1.3.1
 	github.com/zeebo/errs v1.4.0
@@ -24,5 +24,3 @@ require (
 	google.golang.org/genproto v0.0.0-20230526161137-0005af68ea54 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/quic-go/quic-go => ../quic-go
