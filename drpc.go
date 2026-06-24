@@ -140,6 +140,17 @@ type Handler interface {
 	HandleRPC(stream Stream, rpc string) (err error)
 }
 
+// Compression identifies a compression algorithm for per-message compression.
+type Compression int
+
+const (
+	// CompressionNone indicates no compression.
+	CompressionNone Compression = 0
+
+	// CompressionSnappy uses Snappy block-format compression.
+	CompressionSnappy Compression = 1
+)
+
 // Encoding represents a way to marshal/unmarshal Message types.
 type Encoding interface {
 	// Marshal returns the encoded form of msg.

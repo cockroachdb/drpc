@@ -33,8 +33,9 @@ type Options struct {
 
 // Conn is a drpc client connection.
 type Conn struct {
-	tr  drpc.Transport
-	man *drpcmanager.Manager
+	tr   drpc.Transport
+	man  *drpcmanager.Manager
+	opts Options
 }
 
 var _ drpc.Conn = (*Conn)(nil)
@@ -46,7 +47,8 @@ func New(tr drpc.Transport) *Conn { return NewWithOptions(tr, Options{}) }
 // The Options control details of how the conn operates.
 func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 	c := &Conn{
-		tr: tr,
+		tr:   tr,
+		opts: opts,
 	}
 
 	shouldWrap := opts.ShouldRecord != nil
@@ -85,13 +87,15 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
+	comp := c.resolveCompression()
+
 	var metadata []byte
-	metadata, err = c.encodeMetadata(ctx)
+	metadata, err = c.encodeMetadata(ctx, comp)
 	if err != nil {
 		return err
 	}
 
-	stream, err := c.man.NewClientStream(ctx, rpc)
+	stream, err := c.man.NewClientStream(ctx, rpc, comp)
 	if err != nil {
 		return err
 	}
@@ -130,13 +134,15 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
+	comp := c.resolveCompression()
+
 	var metadata []byte
-	metadata, err = c.encodeMetadata(ctx)
+	metadata, err = c.encodeMetadata(ctx, comp)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, err := c.man.NewClientStream(ctx, rpc)
+	stream, err := c.man.NewClientStream(ctx, rpc, comp)
 	if err != nil {
 		return nil, err
 	}
@@ -148,10 +154,27 @@ func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ 
 	return stream, nil
 }
 
+// resolveCompression evaluates CompressionFunc once for the current RPC.
+func (c *Conn) resolveCompression() drpc.Compression {
+	if c.opts.Manager.CompressionFunc != nil {
+		return c.opts.Manager.CompressionFunc()
+	}
+	return drpc.CompressionNone
+}
+
 // encodeMetadata retrieves and encodes metadata from the provided
-// (outgoing/client) context.
-func (c *Conn) encodeMetadata(ctx context.Context) (metadata []byte, err error) {
+// (outgoing/client) context. If compression is configured, the
+// `drpc-compression` metadata key is injected.
+func (c *Conn) encodeMetadata(ctx context.Context, comp drpc.Compression) (metadata []byte, err error) {
 	md, _ := drpcmetadata.GetFromOutgoingContext(ctx)
+	if comp != drpc.CompressionNone {
+		if md == nil {
+			md = make(map[string]string)
+		}
+		md[drpcwire.CompressionMetadataKey] = drpcwire.CompressionName(comp)
+	} else {
+		delete(md, drpcwire.CompressionMetadataKey)
+	}
 	// Look for grpc metadata in the context and merge them with the drpc metadata,
 	// prioritizing drpc values when keys overlap. This is a short-term fix
 	// that will enable us to send and receive metadata when DRPC is enabled,

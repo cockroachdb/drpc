@@ -89,7 +89,7 @@ func TestManagerStreamLifecycle(t *testing.T) {
 	})
 	defer func() { _ = cman.Close() }()
 
-	stream, err := cman.NewClientStream(ctx, "rpc")
+	stream, err := cman.NewClientStream(ctx, "rpc", 0)
 	assert.NoError(t, err)
 	assert.Equal(t, c.started.Load(), int64(1))
 	assert.Equal(t, c.terminated.Load(), int64(0))
@@ -120,9 +120,9 @@ func TestManagerStreamLifecycleOnConnectionClose(t *testing.T) {
 		ShouldRecord: func() bool { return true },
 	})
 
-	_, err := cman.NewClientStream(ctx, "rpc-1")
+	_, err := cman.NewClientStream(ctx, "rpc-1", 0)
 	assert.NoError(t, err)
-	_, err = cman.NewClientStream(ctx, "rpc-2")
+	_, err = cman.NewClientStream(ctx, "rpc-2", 0)
 	assert.NoError(t, err)
 	assert.Equal(t, c.started.Load(), int64(2))
 	assert.Equal(t, c.terminated.Load(), int64(0))
@@ -148,7 +148,7 @@ func TestManagerRejectedStreamNotCounted(t *testing.T) {
 	})
 	assert.NoError(t, cman.Close())
 
-	_, err := cman.NewClientStream(ctx, "rpc")
+	_, err := cman.NewClientStream(ctx, "rpc", 0)
 	assert.Error(t, err)
 	assert.Equal(t, c.started.Load(), int64(0))
 	assert.Equal(t, c.terminated.Load(), int64(0))
@@ -168,7 +168,7 @@ func TestManagerStreamLifecycleGatedOff(t *testing.T) {
 		Metrics:      c.bundle(),
 		ShouldRecord: func() bool { return false },
 	})
-	stream, err := cman.NewClientStream(ctx, "rpc")
+	stream, err := cman.NewClientStream(ctx, "rpc", 0)
 	assert.NoError(t, err)
 	assert.NoError(t, stream.Close())
 	assert.NoError(t, cman.Close())
@@ -194,7 +194,7 @@ func TestManagerReceiveQueueMetrics(t *testing.T) {
 	})
 	defer func() { _ = cman.Close() }()
 
-	stream, err := cman.NewClientStream(ctx, "rpc")
+	stream, err := cman.NewClientStream(ctx, "rpc", 0)
 	assert.NoError(t, err)
 
 	// Fill all 256 slots.

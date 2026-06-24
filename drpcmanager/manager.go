@@ -36,6 +36,15 @@ type Options struct {
 	// Stream are passed to any streams the manager creates.
 	Stream drpcstream.Options
 
+	// CompressionFunc, if set, is called each time a new client stream is
+	// created to determine the compression algorithm for that stream.
+	// This allows compression to be changed dynamically (e.g. after a
+	// version gate activates) without recycling the connection.
+	//
+	// Must be safe for concurrent use: it may be called simultaneously
+	// from multiple goroutines opening streams on the same connection.
+	CompressionFunc func() drpc.Compression
+
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
 
@@ -318,8 +327,9 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string) (*drpcstream.Stream, error) {
+func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string, compression drpc.Compression) (*drpcstream.Stream, error) {
 	opts := m.opts.Stream
+	opts.Compression = compression
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
 	if cb := drpcopts.GetManagerStatsCB(&m.opts.Internal); cb != nil {
@@ -405,11 +415,11 @@ func (m *Manager) Close() error {
 }
 
 // NewClientStream starts a stream on the managed transport for use by a client.
-func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpcstream.Stream, err error) {
+func (m *Manager) NewClientStream(ctx context.Context, rpc string, compression drpc.Compression) (stream *drpcstream.Stream, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return m.newStream(ctx, m.lastStreamID.Add(1), drpc.StreamKindClient, rpc)
+	return m.newStream(ctx, m.lastStreamID.Add(1), drpc.StreamKindClient, rpc, compression)
 }
 
 // NewServerStream starts a stream on the managed transport for use by a server.
@@ -425,7 +435,18 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 
 	case pkt := <-m.invokes:
 		rpc = string(pkt.data)
+		var compression drpc.Compression
 		if pkt.metadata != nil {
+			if name, ok := pkt.metadata[drpcwire.CompressionMetadataKey]; ok {
+				comp, found := drpcwire.CompressionFromName(name)
+				if !found {
+					m.pdone.Send()
+					return nil, "", drpc.ProtocolError.New("unsupported compression: %q", name)
+				}
+				compression = comp
+				delete(pkt.metadata, drpcwire.CompressionMetadataKey)
+			}
+
 			if m.opts.GRPCMetadataCompatMode {
 				// Populate incoming metadata as grpc metadata in the
 				// context. This is a short-term fix that will enable us
@@ -441,7 +462,7 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 				ctx = drpcmetadata.NewIncomingContext(ctx, pkt.metadata)
 			}
 		}
-		stream, err := m.newStream(ctx, pkt.sid, drpc.StreamKindServer, rpc)
+		stream, err := m.newStream(ctx, pkt.sid, drpc.StreamKindServer, rpc, compression)
 		// Signal pdone only after adding the stream so that manageReader sees
 		// the new stream in activeStreams when it reads the next frame.
 		m.pdone.Send()

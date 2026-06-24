@@ -30,6 +30,10 @@ type Options struct {
 	// more allocations. 0 is unlimited.
 	MaximumBufferSize int
 
+	// Compression, if set, enables per-message compression on this stream.
+	// All KindMessage data is compressed on send and decompressed on receive.
+	Compression drpc.Compression
+
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Stream
 }
@@ -54,6 +58,8 @@ type Stream struct {
 	wr        *drpcwire.MuxWriter
 	recvQueue ringBuffer
 	wbuf      []byte
+	cbuf      []byte // compression scratch buffer
+	dbuf      []byte // decompression scratch buffer
 
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
@@ -378,12 +384,18 @@ func (s *Stream) WriteInvoke(rpc string, metadata []byte) error {
 // raw read/write
 //
 
-// RawWrite sends the data bytes with the given kind.
+// RawWrite sends the data bytes with the given kind. If kind is
+// KindMessage and compression is configured, the data is compressed
+// before writing.
 func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
 	defer s.checkFinished()
 	s.write.Lock()
 	defer s.write.Unlock()
 
+	if kind == drpcwire.KindMessage && s.opts.Compression != drpc.CompressionNone {
+		s.cbuf = drpcwire.Compress(s.opts.Compression, s.cbuf[:0], data)
+		data = s.cbuf
+	}
 	return s.rawWriteLocked(kind, data)
 }
 
@@ -431,8 +443,16 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
+	defer s.recvQueue.Done()
+
+	if s.opts.Compression != drpc.CompressionNone {
+		s.dbuf, err = drpcwire.Decompress(s.opts.Compression, s.dbuf[:0], b)
+		if err != nil {
+			return nil, drpc.ProtocolError.Wrap(err)
+		}
+		b = s.dbuf
+	}
 	data = append([]byte(nil), b...)
-	s.recvQueue.Done()
 
 	return data, nil
 }
@@ -455,10 +475,12 @@ func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 	if s.opts.MaximumBufferSize == 0 || len(wbuf) < s.opts.MaximumBufferSize {
 		s.wbuf = wbuf
 	}
-	if err := s.rawWriteLocked(drpcwire.KindMessage, wbuf); err != nil {
-		return err
+	data := wbuf
+	if s.opts.Compression != drpc.CompressionNone {
+		s.cbuf = drpcwire.Compress(s.opts.Compression, s.cbuf[:0], wbuf)
+		data = s.cbuf
 	}
-	return nil
+	return s.rawWriteLocked(drpcwire.KindMessage, data)
 }
 
 // MsgRecv recives some message data and unmarshals it with enc into msg.
@@ -473,8 +495,16 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 	if err != nil {
 		return err
 	}
+	defer s.recvQueue.Done()
+
+	if s.opts.Compression != drpc.CompressionNone {
+		s.dbuf, err = drpcwire.Decompress(s.opts.Compression, s.dbuf[:0], b)
+		if err != nil {
+			return drpc.ProtocolError.Wrap(err)
+		}
+		b = s.dbuf
+	}
 	err = enc.Unmarshal(b, msg)
-	s.recvQueue.Done()
 
 	return err
 }

@@ -199,7 +199,7 @@ func TestConn_encodeMetadata(t *testing.T) {
 	t.Run("no-metadata", func(t *testing.T) {
 		ctx := context.Background()
 
-		metadata, err := conn.encodeMetadata(ctx)
+		metadata, err := conn.encodeMetadata(ctx, drpc.CompressionNone)
 		assert.NoError(t, err)
 		decodedMd, err := drpcmetadata.Decode(metadata)
 		assert.NoError(t, err)
@@ -218,7 +218,7 @@ func TestConn_encodeMetadata(t *testing.T) {
 			},
 		)
 
-		metadata, err := conn.encodeMetadata(ctx)
+		metadata, err := conn.encodeMetadata(ctx, drpc.CompressionNone)
 		assert.NoError(t, err)
 		decodedMd, err := drpcmetadata.Decode(metadata)
 		assert.NoError(t, err)
@@ -238,7 +238,7 @@ func TestConn_encodeMetadata(t *testing.T) {
 				"drpc-key-with-empty-string": "",
 			})
 
-		metadata, err := conn.encodeMetadata(ctx)
+		metadata, err := conn.encodeMetadata(ctx, drpc.CompressionNone)
 		assert.NoError(t, err)
 		decodedMd, err := drpcmetadata.Decode(metadata)
 		assert.NoError(t, err)
@@ -265,7 +265,7 @@ func TestConn_encodeMetadata(t *testing.T) {
 				"common-key2": "common-value",
 			},
 		)
-		metadata, err := conn.encodeMetadata(ctx)
+		metadata, err := conn.encodeMetadata(ctx, drpc.CompressionNone)
 		assert.NoError(t, err)
 		decodedMd, err := drpcmetadata.Decode(metadata)
 		assert.NoError(t, err)

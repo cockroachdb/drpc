@@ -39,7 +39,7 @@ func TestDrpcMetadata(t *testing.T) {
 	defer func() { _ = sman.Close() }()
 
 	ctx.Run(func(ctx context.Context) {
-		stream, err := cman.NewClientStream(ctx, "rpc")
+		stream, err := cman.NewClientStream(ctx, "rpc", drpc.CompressionNone)
 		assert.NoError(t, err)
 		defer func() { _ = stream.Close() }()
 
@@ -95,7 +95,7 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 	defer func() { _ = sman.Close() }()
 
 	ctx.Run(func(ctx context.Context) {
-		stream, err := cman.NewClientStream(ctx, "rpc")
+		stream, err := cman.NewClientStream(ctx, "rpc", drpc.CompressionNone)
 		assert.NoError(t, err)
 		defer func() { _ = stream.Close() }()
 
@@ -286,12 +286,12 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 	// Create stream 1 on the client, then cancel it so it's removed
 	// from the registry.
 	subctx, cancel := context.WithCancel(ctx)
-	stream1, err := cman.NewClientStream(subctx, "rpc1")
+	stream1, err := cman.NewClientStream(subctx, "rpc1", drpc.CompressionNone)
 	assert.NoError(t, err)
 	cancel()
 	<-stream1.Finished()
 
-	stream2, err := cman.NewClientStream(ctx, "rpc2")
+	stream2, err := cman.NewClientStream(ctx, "rpc2", drpc.CompressionNone)
 	assert.NoError(t, err)
 
 	// Write an old-stream frame (s1) then the real response for s2.
@@ -554,7 +554,7 @@ func TestManager_CloseSurfacesUnavailable(t *testing.T) {
 	assert.NoError(t, cman.Close())
 
 	// A stream created after teardown should come back as a closed connection.
-	_, err := cman.NewClientStream(ctx, "rpc")
+	_, err := cman.NewClientStream(ctx, "rpc", drpc.CompressionNone)
 	assert.Error(t, err)
 	assert.That(t, drpc.ClosedError.Has(err))
 

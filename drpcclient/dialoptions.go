@@ -33,6 +33,14 @@ type dialOptions struct {
 	// tlsConfig is an optional TLS configuration for secure connections.
 	tlsConfig *tls.Config
 
+	// compressionFunc, if set, is called per-stream to determine the
+	// compression algorithm. This allows dynamic switching (e.g. after a
+	// version gate activates).
+	//
+	// Must be safe for concurrent use: it may be called simultaneously
+	// from multiple goroutines opening streams on the same connection.
+	compressionFunc func() drpc.Compression
+
 	// metrics holds metrics the conn will populate. Its zero value records
 	// nothing. When shouldRecord is set, metrics are recorded only when it
 	// returns true.
@@ -102,6 +110,16 @@ func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) D
 	}
 }
 
+// WithCompression returns a DialOption that sets a function called
+// per-stream to determine the compression algorithm. This allows
+// compression to be enabled dynamically (e.g. after a version gate
+// activates) without recycling the connection.
+func WithCompression(f func() drpc.Compression) DialOption {
+	return func(o *dialOptions) {
+		o.compressionFunc = f
+	}
+}
+
 func DialContext(
 	ctx context.Context, address string, opts ...DialOption,
 ) (conn *drpcconn.Conn, err error) {
@@ -152,9 +170,8 @@ func DialContext(
 			Reader: drpcwire.ReaderOptions{
 				MaximumBufferSize: math.MaxInt,
 			},
-			Stream: drpcstream.Options{
-				MaximumBufferSize: 0, // unlimited
-			},
+			Stream:          drpcstream.Options{MaximumBufferSize: 0},
+			CompressionFunc: options.compressionFunc,
 		},
 		ShouldRecord: options.shouldRecord,
 		Metrics:      options.metrics,

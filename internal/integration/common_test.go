@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"storj.io/drpc"
 	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpcmetadata"
 	"storj.io/drpc/drpcmux"
@@ -38,18 +39,27 @@ func data(n int64) []byte {
 func in(n int64) *In   { return &In{In: n} }
 func out(n int64) *Out { return &Out{Out: n} }
 
-func createRawConnection(t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker) *drpcconn.Conn {
+func createRawConnection(t testing.TB, server DRPCServiceServer, ctx *drpctest.Tracker, opts ...drpcconn.Options) *drpcconn.Conn {
 	c1, c2 := net.Pipe()
 	mux := drpcmux.New()
 	assert.NoError(t, DRPCRegisterService(mux, server))
 	srv := drpcserver.New(mux)
 	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
-	return drpcconn.NewWithOptions(c2, drpcconn.Options{})
+	var connOpts drpcconn.Options
+	if len(opts) > 0 {
+		connOpts = opts[0]
+	}
+	return drpcconn.NewWithOptions(c2, connOpts)
 }
 
-func createConnection(t testing.TB, server DRPCServiceServer) (DRPCServiceClient, func()) {
+func createConnection(t testing.TB, server DRPCServiceServer, comp ...drpc.Compression) (DRPCServiceClient, func()) {
 	ctx := drpctest.NewTracker(t)
-	conn := createRawConnection(t, server, ctx)
+	var opts drpcconn.Options
+	if len(comp) > 0 {
+		c := comp[0]
+		opts.Manager.CompressionFunc = func() drpc.Compression { return c }
+	}
+	conn := createRawConnection(t, server, ctx, opts)
 	return NewDRPCServiceClient(conn), func() {
 		_ = conn.Close()
 		ctx.Close()
