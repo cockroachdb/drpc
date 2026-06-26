@@ -4,6 +4,7 @@
 package drpcquic
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -22,6 +23,14 @@ func mapQUICError(err error) error {
 	}
 	if errors.Is(err, io.EOF) {
 		return io.EOF
+	}
+
+	// Propagate a context deadline as the bare sentinel so drpc.ToRPCErr (which
+	// matches err by value) maps it to codes.DeadlineExceeded. Without this it is
+	// caught by the net.Error timeout catch-all below and surfaces as a
+	// ClosedError -> codes.Unavailable, hiding the real cause.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
 
 	var se *quic.StreamError
