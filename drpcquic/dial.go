@@ -6,6 +6,7 @@ package drpcquic
 import (
 	"context"
 	"crypto/tls"
+	"net"
 
 	"github.com/quic-go/quic-go"
 )
@@ -21,10 +22,22 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config, opts Options) (
 	return newTransport(conn), nil
 }
 
-// Listen creates a QUIC listener for drpc. tlsConf must provide a certificate;
-// the drpcquic ALPN is injected if NextProtos is empty.
+// Listen creates a QUIC listener for drpc on addr. tlsConf must provide a
+// certificate; the drpcquic ALPN is injected if NextProtos is empty.
 func Listen(addr string, tlsConf *tls.Config, opts Options) (*Listener, error) {
 	l, err := quic.ListenAddr(addr, ensureALPN(tlsConf), opts.quicConfig())
+	if err != nil {
+		return nil, err
+	}
+	return &Listener{lis: l}, nil
+}
+
+// ListenPacket creates a QUIC listener for drpc on a caller-provided UDP socket.
+// Use this when the caller wants to own socket creation (e.g. for address /
+// advertise-address handling). tlsConf must provide a certificate; the drpcquic
+// ALPN is injected if NextProtos is empty.
+func ListenPacket(conn net.PacketConn, tlsConf *tls.Config, opts Options) (*Listener, error) {
+	l, err := quic.Listen(conn, ensureALPN(tlsConf), opts.quicConfig())
 	if err != nil {
 		return nil, err
 	}
