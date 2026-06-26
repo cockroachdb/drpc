@@ -72,17 +72,26 @@ func (m *QUICManager) NewClientStream(ctx context.Context, rpc string) (*drpcstr
 	return drpcstream.NewForReader(ctx, 1, tr, rd, wr, m.streamOpts(drpc.StreamKindClient, rpc, tr)), nil
 }
 
-// NewServerStream accepts a new inbound stream, reads the invoke (and any
-// preceding metadata) packets off it, and hands the SAME reader to the stream's
-// read loop so no buffered bytes are lost and no second reader races the first.
-func (m *QUICManager) NewServerStream(ctx context.Context) (stream *drpcstream.Stream, rpc string, err error) {
-	tr, err := m.mt.AcceptStream(ctx)
-	if err != nil {
-		return nil, "", err
-	}
+// AcceptTransport accepts the next inbound stream and returns its raw transport
+// WITHOUT reading the invoke. Hand the transport to ServerStream from a
+// per-stream goroutine so that reading one stream's invoke never blocks
+// accepting (or serving) the next stream on the same connection. Doing the
+// invoke read here (as a combined accept+read) would serialize the whole
+// connection behind whichever stream is slowest to send its invoke — exactly
+// the head-of-line blocking running over QUIC is meant to avoid.
+func (m *QUICManager) AcceptTransport(ctx context.Context) (drpc.Transport, error) {
+	return m.mt.AcceptStream(ctx)
+}
+
+// ServerStream reads the invoke (and any preceding metadata) packets off an
+// already-accepted transport tr, then hands the SAME reader to the stream's read
+// loop so no buffered bytes are lost and no second reader races the first. On any
+// error it closes tr, so a failed or slow stream leaks nothing and never affects
+// other streams on the connection.
+func (m *QUICManager) ServerStream(ctx context.Context, tr drpc.Transport) (stream *drpcstream.Stream, rpc string, err error) {
 	defer func() {
 		if err != nil {
-			_ = tr.Close() // don't leak the stream on a failed accept/parse
+			_ = tr.Close() // don't leak the stream on a failed parse
 		}
 	}()
 
@@ -133,4 +142,17 @@ func (m *QUICManager) NewServerStream(ctx context.Context) (stream *drpcstream.S
 			return nil, "", drpc.ProtocolError.New("expected invoke, got %s", pkt.Kind)
 		}
 	}
+}
+
+// NewServerStream accepts a new inbound stream and reads its invoke. It is
+// AcceptTransport followed by ServerStream. Prefer the split form when serving
+// many concurrent streams (AcceptTransport in the accept loop, ServerStream in a
+// per-stream goroutine) so the invoke read does not serialize accepts; this
+// combined form remains for single-stream callers and tests.
+func (m *QUICManager) NewServerStream(ctx context.Context) (stream *drpcstream.Stream, rpc string, err error) {
+	tr, err := m.mt.AcceptStream(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return m.ServerStream(ctx, tr)
 }
