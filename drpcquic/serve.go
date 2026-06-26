@@ -45,7 +45,10 @@ func (s *Server) Serve(ctx context.Context, lis *Listener) error {
 		tr, err := lis.Accept(ctx)
 		if err != nil {
 			if errors.Is(err, quic.ErrServerClosed) || ctx.Err() != nil {
-				return err
+				// Clean shutdown (listener closed or context canceled): report it
+				// as success, mirroring drpcserver.Serve, so callers that treat a
+				// non-nil return as fatal don't crash on a normal stop.
+				return nil
 			}
 			if s.opts.Log != nil {
 				s.opts.Log(err)
@@ -53,6 +56,15 @@ func (s *Server) Serve(ctx context.Context, lis *Listener) error {
 			continue
 		}
 		tracker.Run(func(ctx context.Context) {
+			// Surface the QUIC peer's verified certificate chain to handlers the
+			// same way the TCP path does in ServeOne. QUIC carries TLS inside the
+			// connection, so there is no *tls.Conn to assert — read the certs off
+			// the connection state instead. Handlers (e.g. authentication) read
+			// this via drpcctx.GetPeerConnectionInfo.
+			if certs := tr.PeerCertificates(); len(certs) > 0 {
+				ctx = drpcctx.WithPeerConnectionInfo(ctx,
+					drpcctx.PeerConnectionInfo{Certificates: certs})
+			}
 			if serr := s.srv.ServeMultiplexed(ctx, tr); serr != nil && s.opts.Log != nil {
 				s.opts.Log(serr)
 			}

@@ -5,6 +5,7 @@ package drpcquic
 
 import (
 	"context"
+	"crypto/x509"
 	"sync"
 	"time"
 
@@ -47,6 +48,14 @@ func (t *Transport) Close() error { return t.conn.CloseWithError(appNoError, "")
 // Closed returns a channel closed when the QUIC connection closes.
 func (t *Transport) Closed() <-chan struct{} { return t.conn.Context().Done() }
 
+// PeerCertificates returns the verified peer certificate chain from the QUIC
+// connection's TLS handshake, or nil if the peer presented none. The server
+// uses this to surface peer identity to handlers (e.g. for authentication),
+// mirroring what a TLS net.Conn exposes via ConnectionState.
+func (t *Transport) PeerCertificates() []*x509.Certificate {
+	return t.conn.ConnectionState().TLS.PeerCertificates
+}
+
 // streamTransport adapts one *quic.Stream to drpc.Transport. It closes two gaps:
 //
 //   - quic-go Stream.Close() is a half-close (send-side FIN) and does NOT wake a
@@ -82,8 +91,8 @@ func (t *streamTransport) Write(p []byte) (int, error) {
 // goroutine blocked in Read returns immediately. Idempotent.
 func (t *streamTransport) Close() error {
 	t.closeOnce.Do(func() {
-		t.closeErr = t.s.Close()  // half-close: send-direction FIN
-		t.s.CancelRead(canceled)  // STOP_SENDING: wakes a blocked Read
+		t.closeErr = t.s.Close() // half-close: send-direction FIN
+		t.s.CancelRead(canceled) // STOP_SENDING: wakes a blocked Read
 	})
 	return t.closeErr
 }
