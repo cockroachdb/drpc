@@ -50,6 +50,18 @@ type NoOpGauge struct{}
 // Update implements Gauge.
 func (NoOpGauge) Update(labels map[string]string, v int64) {}
 
+// AdditiveGauge is a metric that tracks current state by applying positive and
+// negative deltas. The concrete type must provide a thread-safe implementation.
+type AdditiveGauge interface {
+	Inc(v int64)
+}
+
+// NoOpAdditiveGauge is an AdditiveGauge implementation that does nothing.
+type NoOpAdditiveGauge struct{}
+
+// Inc implements AdditiveGauge.
+func (NoOpAdditiveGauge) Inc(v int64) {}
+
 // meteredTransport wraps a Transport and increments byte counters on each
 // Read and Write call.
 type meteredTransport struct {
@@ -94,9 +106,31 @@ func (t *meteredTransport) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// ClientMetrics holds optional metrics that the client connection will
-// populate during operation.
-type ClientMetrics struct {
+// ConnectionMetrics holds metrics populated by a DRPC connection. The caller
+// binds each handle to its desired labels before passing the bundle to DRPC.
+// Its zero value records nothing.
+type ConnectionMetrics struct {
 	BytesSent Counter
 	BytesRecv Counter
+
+	StreamsStarted    Counter
+	StreamsTerminated Counter
+}
+
+// WithDefaults returns a copy with nil metric handles replaced by no-op
+// implementations.
+func (m ConnectionMetrics) WithDefaults() ConnectionMetrics {
+	if m.BytesSent == nil {
+		m.BytesSent = NoOpCounter{}
+	}
+	if m.BytesRecv == nil {
+		m.BytesRecv = NoOpCounter{}
+	}
+	if m.StreamsStarted == nil {
+		m.StreamsStarted = NoOpCounter{}
+	}
+	if m.StreamsTerminated == nil {
+		m.StreamsTerminated = NoOpCounter{}
+	}
+	return m
 }

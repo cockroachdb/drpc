@@ -16,6 +16,7 @@ import (
 	"storj.io/drpc"
 	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcmetadata"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcsignal"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpcwire"
@@ -37,6 +38,14 @@ type Options struct {
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
+
+	// Metrics holds metrics populated by this connection. Its zero value
+	// records nothing.
+	Metrics drpcmetrics.ConnectionMetrics
+
+	// ShouldRecord controls whether connection metrics are recorded. A nil
+	// function disables collection.
+	ShouldRecord func() bool
 
 	// GRPCMetadataCompatMode enables/disable gRPC compatibility for metadata
 	// handling. When enabled, the server stream will decode incoming metadata
@@ -78,6 +87,9 @@ type Manager struct {
 	}
 
 	kind ManagerKind
+
+	metrics      drpcmetrics.ConnectionMetrics
+	shouldRecord func() bool
 }
 
 type ManagerKind uint8
@@ -119,6 +131,12 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 
 		invokes: make(chan invokeInfo),
 		kind:    kind,
+
+		metrics:      opts.Metrics.WithDefaults(),
+		shouldRecord: opts.ShouldRecord,
+	}
+	if m.shouldRecord == nil {
+		m.shouldRecord = func() bool { return false }
 	}
 
 	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
@@ -295,6 +313,10 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 		return nil, err
 	}
 
+	if m.shouldRecord() {
+		m.metrics.StreamsStarted.Inc(1)
+	}
+
 	m.wg.Add(1)
 	go m.manageStream(ctx, stream)
 
@@ -307,6 +329,11 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 // is finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 	defer m.wg.Done()
+	defer func() {
+		if m.shouldRecord() {
+			m.metrics.StreamsTerminated.Inc(1)
+		}
+	}()
 	defer m.streams.Remove(stream.ID())
 	select {
 	case <-stream.Finished():

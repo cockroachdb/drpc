@@ -22,13 +22,13 @@ type Options struct {
 	// Manager controls the options we pass to the manager of this conn.
 	Manager drpcmanager.Options
 
-	// ShouldRecord, if non-nil, controls whether metrics are recorded.
-	// When it returns true, the transport is wrapped to track bytes
-	// sent and received.
+	// ShouldRecord controls whether connection metrics are recorded. A nil
+	// function disables collection.
 	ShouldRecord func() bool
 
-	// Metrics holds optional metrics the client will populate.
-	Metrics drpcmetrics.ClientMetrics
+	// Metrics holds metrics the connection will populate. Its zero value
+	// records nothing.
+	Metrics drpcmetrics.ConnectionMetrics
 }
 
 // Conn is a drpc client connection.
@@ -59,6 +59,8 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		c.tr = mt
 	}
 
+	opts.Manager.Metrics = opts.Metrics
+	opts.Manager.ShouldRecord = opts.ShouldRecord
 	c.man = drpcmanager.NewWithOptions(c.tr, drpcmanager.Client, opts.Manager)
 
 	return c

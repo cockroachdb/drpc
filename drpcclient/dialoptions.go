@@ -33,10 +33,10 @@ type dialOptions struct {
 	// tlsConfig is an optional TLS configuration for secure connections.
 	tlsConfig *tls.Config
 
-	// metrics holds optional metrics the conn will populate. No metrics are
-	// recorded if this is nil. When shouldRecord is set, metrics are recorded
-	// only when shouldRecord returns true.
-	metrics      *drpcmetrics.ClientMetrics
+	// metrics holds metrics the conn will populate. Its zero value records
+	// nothing. When shouldRecord is set, metrics are recorded only when it
+	// returns true.
+	metrics      drpcmetrics.ConnectionMetrics
 	shouldRecord func() bool
 }
 
@@ -77,17 +77,17 @@ func WithTLSConfig(tlsConfig *tls.Config) DialOption {
 	}
 }
 
-// WithMetrics returns a DialOption that sets client metrics to be populated
-// during connection operation.
-func WithMetrics(metrics *drpcmetrics.ClientMetrics) DialOption {
+// WithMetrics returns a DialOption that sets metrics to be populated during
+// connection operation.
+func WithMetrics(metrics drpcmetrics.ConnectionMetrics) DialOption {
 	return func(o *dialOptions) {
 		o.metrics = metrics
 	}
 }
 
 // WithShouldRecordFunc returns a DialOption that sets a function to control
-// whether metrics are recorded. If the function returns false, no metrics
-// are collected.
+// whether connection metrics are recorded. If the function returns false, no
+// metrics are collected.
 func WithShouldRecordFunc(shouldRecord func() bool) DialOption {
 	return func(o *dialOptions) {
 		o.shouldRecord = shouldRecord
@@ -147,9 +147,6 @@ func DialContext(
 		}
 	}
 
-	if options.metrics == nil {
-		options.metrics = &drpcmetrics.ClientMetrics{}
-	}
 	return drpcconn.NewWithOptions(netConn, drpcconn.Options{
 		Manager: drpcmanager.Options{
 			Reader: drpcwire.ReaderOptions{
@@ -160,6 +157,6 @@ func DialContext(
 			},
 		},
 		ShouldRecord: options.shouldRecord,
-		Metrics:      *options.metrics,
+		Metrics:      options.metrics,
 	}), nil
 }
