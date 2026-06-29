@@ -28,6 +28,12 @@ type WriterOptions struct {
 	// parked on backpressure whenever that count changes. It runs under the
 	// writer lock, so it must be cheap and must not block.
 	OnBlockedLen func(n int)
+
+	// OnQueueLen, if non-nil, is called with the current pending-buffer length
+	// in bytes whenever it changes: after a frame is appended and after a flush
+	// swaps the buffer out. It runs under the writer lock, so it must be cheap
+	// and must not block.
+	OnQueueLen func(n int)
 }
 
 // MuxWriter serializes frames from many concurrent streams onto a single
@@ -42,6 +48,7 @@ type MuxWriter struct {
 	w            io.Writer
 	onError      func(error)
 	onBlockedLen func(n int)
+	onQueueLen   func(n int)
 	maxBuf       int // high-water mark for buf; producers block at or above it
 
 	mu       sync.Mutex
@@ -70,6 +77,7 @@ func NewMuxWriterWithOptions(w io.Writer, onError func(error), opts WriterOption
 		w:            w,
 		onError:      onError,
 		onBlockedLen: opts.OnBlockedLen,
+		onQueueLen:   opts.OnQueueLen,
 		maxBuf:       opts.MaximumBufferSize,
 		buf:          make([]byte, 0, defaultBufferCapacity),
 		done:         make(chan struct{}),
@@ -105,6 +113,12 @@ func (mw *MuxWriter) run() {
 		}
 
 		if mw.closed {
+			// The writer is stopping with whatever was still pending discarded.
+			// Report an empty queue so a torn-down connection's gauge does not
+			// leave a stale non-zero reading behind.
+			if mw.onQueueLen != nil {
+				mw.onQueueLen(0)
+			}
 			mw.mu.Unlock()
 			return
 		}
@@ -112,18 +126,31 @@ func (mw *MuxWriter) run() {
 		// Swap the full pending buffer for the empty spare so producers can
 		// refill buf (now free) while we write the swapped-out bytes below.
 		mw.buf, spare = spare, mw.buf
+		if mw.onQueueLen != nil {
+			mw.onQueueLen(len(mw.buf)) // buffer drained: now zero
+		}
 		mw.unblockWritesLocked()
 		mw.mu.Unlock()
 
 		if _, err := mw.w.Write(spare); err != nil {
 			mw.mu.Lock()
 			if mw.closed {
+				// Stop raced in and already closed us; still zero the queue so a
+				// torn-down connection's gauge does not stick at its last reading.
+				if mw.onQueueLen != nil {
+					mw.onQueueLen(0)
+				}
 				mw.mu.Unlock()
 				return
 			}
 			mw.closed = true
 			mw.closeErr = err
 			mw.unblockWritesLocked()
+			// The connection is dead; nothing pending will ever flush. Report an
+			// empty queue so the gauge does not stick at its last reading.
+			if mw.onQueueLen != nil {
+				mw.onQueueLen(0)
+			}
 			mw.mu.Unlock()
 			if mw.onError != nil {
 				mw.onError(err)
@@ -156,6 +183,9 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel *drpcsignal.Signal) (err error)
 		// stream, which is bounded and acceptable.
 		if len(mw.buf) < mw.maxBuf || fr.Control {
 			mw.buf = AppendFrame(mw.buf, fr)
+			if mw.onQueueLen != nil {
+				mw.onQueueLen(len(mw.buf))
+			}
 			mw.cond.Signal()
 			mw.mu.Unlock()
 			return nil

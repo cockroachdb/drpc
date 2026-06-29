@@ -38,6 +38,14 @@ func (NoOpLabeledCounter) Inc(labels map[string]string, v int64) {}
 // sets the gauge to the given absolute value. Callers hold a handle already
 // bound to its labels, so no labels are passed on the hot path. The concrete
 // type must provide a thread-safe implementation.
+//
+// Update writes an absolute value, so a Gauge handle must be owned by a single
+// writer (a single connection). Two connections sharing one handle would clobber
+// each other's value rather than sum, because each call overwrites the last.
+// Callers that need a per-peer aggregate across connections should bind one
+// handle per connection and let their aggregation layer sum the children (this
+// is how the CockroachDB binding works); they must not pass one handle to
+// multiple concurrent connections.
 type Gauge interface {
 	Update(v int64)
 }
@@ -117,6 +125,12 @@ type ClientMetrics struct {
 // caller, so the hot path passes no labels and allocates nothing. A nil bundle,
 // or any nil field, records nothing (see WithDefaults). ShouldRecord gates all
 // collection at runtime; when it returns false no handle is touched.
+//
+// The bundle is per-connection: a given MuxMetrics must be handed to exactly one
+// connection. The Gauge fields in particular are absolute-set (see Gauge) and
+// would be clobbered if shared across concurrent connections. The connection
+// drives the gauges back to zero when its writer stops, so a torn-down
+// connection does not leave a stale non-zero reading behind.
 type MuxMetrics struct {
 	StreamsOpened Counter
 	StreamsClosed Counter
@@ -124,8 +138,11 @@ type MuxMetrics struct {
 	RecvBlocked   Counter
 	// Blocked is the number of stream writers currently parked on connection
 	// write backpressure (the pending write buffer is at its high-water mark).
-	Blocked      Gauge
-	ShouldRecord func() bool
+	Blocked Gauge
+	// WriteQueueBytes is the number of bytes currently buffered in the pending
+	// write queue, awaiting flush to the wire.
+	WriteQueueBytes Gauge
+	ShouldRecord    func() bool
 }
 
 // WithDefaults returns a bundle with every nil field replaced by a no-op
@@ -151,6 +168,9 @@ func (m *MuxMetrics) WithDefaults() *MuxMetrics {
 	}
 	if out.Blocked == nil {
 		out.Blocked = NoOpGauge{}
+	}
+	if out.WriteQueueBytes == nil {
+		out.WriteQueueBytes = NoOpGauge{}
 	}
 	if out.ShouldRecord == nil {
 		out.ShouldRecord = func() bool { return true }

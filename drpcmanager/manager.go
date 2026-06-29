@@ -149,13 +149,19 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 		}
 	}
 
-	// The blocked-writers gauge tracks how many stream writers are parked on
-	// connection write backpressure. The writer invokes this under its lock, so
-	// the hook only does a gated, non-blocking gauge update.
-	blocked := m.mux.Blocked
+	// The write-queue gauges track connection write pressure: how many stream
+	// writers are parked on backpressure and how many bytes are buffered
+	// awaiting flush. The writer invokes these under its lock, so each hook only
+	// does a gated, non-blocking gauge update.
+	blocked, queueBytes := m.mux.Blocked, m.mux.WriteQueueBytes
 	opts.Writer.OnBlockedLen = func(n int) {
 		if sr() {
 			blocked.Update(int64(n))
+		}
+	}
+	opts.Writer.OnQueueLen = func(n int) {
+		if sr() {
+			queueBytes.Update(int64(n))
 		}
 	}
 	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)

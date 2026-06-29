@@ -44,17 +44,18 @@ func drainConn(ctx *drpctest.Tracker, c net.Conn) {
 }
 
 type muxCounters struct {
-	opened, closed, failed, recvBlocked, writeBlocked atomic.Int64
+	opened, closed, failed, recvBlocked, writeBlocked, writeQueueBytes atomic.Int64
 }
 
 func (m *muxCounters) bundle(shouldRecord func() bool) *drpcmetrics.MuxMetrics {
 	return &drpcmetrics.MuxMetrics{
-		StreamsOpened: muxCounter{&m.opened},
-		StreamsClosed: muxCounter{&m.closed},
-		StreamsFailed: muxCounter{&m.failed},
-		RecvBlocked:   muxCounter{&m.recvBlocked},
-		Blocked:       muxGauge{&m.writeBlocked},
-		ShouldRecord:  shouldRecord,
+		StreamsOpened:   muxCounter{&m.opened},
+		StreamsClosed:   muxCounter{&m.closed},
+		StreamsFailed:   muxCounter{&m.failed},
+		RecvBlocked:     muxCounter{&m.recvBlocked},
+		Blocked:         muxGauge{&m.writeBlocked},
+		WriteQueueBytes: muxGauge{&m.writeQueueBytes},
+		ShouldRecord:    shouldRecord,
 	}
 }
 
@@ -301,4 +302,70 @@ func TestManagerWriteBlockedGatedOff(t *testing.T) {
 	// gating off the gauge must remain zero. Give it ample time to park.
 	time.Sleep(250 * time.Millisecond)
 	assert.Equal(t, c.writeBlocked.Load(), int64(0))
+}
+
+// TestManagerWriteQueueBytes verifies the end-to-end pending-bytes path: with a
+// transport whose writes never drain, frames accumulate in the pending write
+// buffer and the WriteQueueBytes gauge goes positive.
+func TestManagerWriteQueueBytes(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+	// Intentionally never read from sconn so the writer stalls and bytes pile up.
+
+	var c muxCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		Writer:     drpcwire.WriterOptions{MaximumBufferSize: 64},
+		MuxMetrics: c.bundle(func() bool { return true }),
+	})
+	defer func() { _ = cman.Close() }()
+
+	stream, err := cman.NewClientStream(ctx, "rpc")
+	assert.NoError(t, err)
+
+	ctx.Run(func(context.Context) {
+		for {
+			if err := stream.RawWrite(drpcwire.KindMessage, []byte("payload")); err != nil {
+				return
+			}
+		}
+	})
+
+	waitForCount(t, &c.writeQueueBytes, 1)
+}
+
+// TestManagerWriteQueueBytesGatedOff verifies that with gating off the
+// WriteQueueBytes gauge is never touched, even though bytes do accumulate in
+// the pending write buffer.
+func TestManagerWriteQueueBytesGatedOff(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	var c muxCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		Writer:     drpcwire.WriterOptions{MaximumBufferSize: 64},
+		MuxMetrics: c.bundle(func() bool { return false }),
+	})
+	defer func() { _ = cman.Close() }()
+
+	stream, err := cman.NewClientStream(ctx, "rpc")
+	assert.NoError(t, err)
+
+	ctx.Run(func(context.Context) {
+		for {
+			if err := stream.RawWrite(drpcwire.KindMessage, []byte("payload")); err != nil {
+				return
+			}
+		}
+	})
+
+	time.Sleep(250 * time.Millisecond)
+	assert.Equal(t, c.writeQueueBytes.Load(), int64(0))
 }
