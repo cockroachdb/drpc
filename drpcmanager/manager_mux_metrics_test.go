@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 
@@ -37,7 +38,7 @@ func drainConn(ctx *drpctest.Tracker, c net.Conn) {
 }
 
 type muxCounters struct {
-	opened, closed, failed atomic.Int64
+	opened, closed, failed, recvBlocked atomic.Int64
 }
 
 func (m *muxCounters) bundle(shouldRecord func() bool) *drpcmetrics.MuxMetrics {
@@ -45,7 +46,20 @@ func (m *muxCounters) bundle(shouldRecord func() bool) *drpcmetrics.MuxMetrics {
 		StreamsOpened: muxCounter{&m.opened},
 		StreamsClosed: muxCounter{&m.closed},
 		StreamsFailed: muxCounter{&m.failed},
+		RecvBlocked:   muxCounter{&m.recvBlocked},
 		ShouldRecord:  shouldRecord,
+	}
+}
+
+// waitForCount polls n until it reaches target or the deadline expires.
+func waitForCount(t *testing.T, n *atomic.Int64, target int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for n.Load() < target {
+		if time.Now().After(deadline) {
+			t.Fatalf("counter reached %d, want %d", n.Load(), target)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -144,4 +158,68 @@ func TestManagerStreamsGatedOff(t *testing.T) {
 	assert.Equal(t, c.opened.Load(), int64(0))
 	assert.Equal(t, c.closed.Load(), int64(0))
 	assert.Equal(t, c.failed.Load(), int64(0))
+}
+
+// TestManagerRecvBlocked verifies the end-to-end receive-block path: a stream
+// whose consumer never reads fills its receive buffer, stalls the transport
+// reader, and increments RecvBlocked exactly once.
+func TestManagerRecvBlocked(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	var c muxCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		MuxMetrics: c.bundle(func() bool { return true }),
+	})
+	defer func() { _ = cman.Close() }()
+
+	// Open a client stream and never read from it, so incoming messages pile up
+	// in its receive buffer.
+	stream, err := cman.NewClientStream(ctx, "rpc")
+	assert.NoError(t, err)
+
+	// Stream messages at the stream until the reader stalls. We send one frame
+	// per Write and keep going; once the receive buffer is full the reader
+	// parks inside Enqueue (firing the hook) and stops consuming, so further
+	// Writes block and the loop exits when the connection is closed.
+	ctx.Run(func(context.Context) {
+		for mid := uint64(1); ; mid++ {
+			var buf []byte
+			buf = drpcwire.AppendFrame(buf, createFrame(drpcwire.KindMessage, stream.ID(), mid, "x", true))
+			if _, err := sconn.Write(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	// The hook fires exactly once: when the buffer first becomes full. The
+	// reader is then parked and enqueues nothing more, so the count stays at 1.
+	waitForCount(t, &c.recvBlocked, 1)
+	assert.Equal(t, c.recvBlocked.Load(), int64(1))
+}
+
+// TestManagerRecvBlockedGated verifies that the receive-block hook honors the
+// ShouldRecord gate: it records only when gating is on.
+func TestManagerRecvBlockedGated(t *testing.T) {
+	newManager := func(t *testing.T, shouldRecord func() bool) (*Manager, *muxCounters) {
+		t.Helper()
+		cconn, sconn := net.Pipe()
+		t.Cleanup(func() { _ = cconn.Close(); _ = sconn.Close() })
+		c := &muxCounters{}
+		m := NewWithOptions(cconn, Client, Options{MuxMetrics: c.bundle(shouldRecord)})
+		t.Cleanup(func() { _ = m.Close() })
+		return m, c
+	}
+
+	off, offC := newManager(t, func() bool { return false })
+	off.onRecvBlock()
+	assert.Equal(t, offC.recvBlocked.Load(), int64(0))
+
+	on, onC := newManager(t, func() bool { return true })
+	on.onRecvBlock()
+	assert.Equal(t, onC.recvBlocked.Load(), int64(1))
 }

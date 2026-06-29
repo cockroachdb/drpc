@@ -10,11 +10,12 @@ import (
 
 // Stream contains internal options for the drpcstream package.
 type Stream struct {
-	transport drpc.Transport
-	fin       chan<- struct{}
-	kind      drpc.StreamKind
-	rpc       string
-	stats     *drpcstats.Stats
+	transport   drpc.Transport
+	fin         chan<- struct{}
+	kind        drpc.StreamKind
+	rpc         string
+	stats       *drpcstats.Stats
+	onRecvBlock func()
 }
 
 // GetStreamTransport returns the drpc.Transport stored in the options.
@@ -40,3 +41,9 @@ func GetStreamStats(opts *Stream) *drpcstats.Stats { return opts.stats }
 
 // SetStreamStats sets the Stats stored in the options.
 func SetStreamStats(opts *Stream, stats *drpcstats.Stats) { opts.stats = stats }
+
+// GetStreamOnRecvBlock returns the receive-block hook stored in the options.
+func GetStreamOnRecvBlock(opts *Stream) func() { return opts.onRecvBlock }
+
+// SetStreamOnRecvBlock sets the receive-block hook stored in the options.
+func SetStreamOnRecvBlock(opts *Stream, fn func()) { opts.onRecvBlock = fn }

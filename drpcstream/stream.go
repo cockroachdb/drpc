@@ -114,7 +114,7 @@ func NewWithOptions(
 		wr: wr,
 	}
 
-	s.recvQueue.init(pool)
+	s.recvQueue.init(pool, drpcopts.GetStreamOnRecvBlock(&opts.Internal))
 
 	return s
 }

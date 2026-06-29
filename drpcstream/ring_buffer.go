@@ -41,12 +41,20 @@ type ringBuffer struct {
 
 	held *[]byte // buffer from the last Dequeue, released by Done
 	err  error   // terminal error, set by Close
+
+	// onBlock, if non-nil, is called once each time Enqueue finds the buffer
+	// full and must wait for the consumer to drain a slot. It signals
+	// receive-side head-of-line blocking: the single transport reader is stalled
+	// because this stream's consumer is slow. It runs under the buffer lock, so
+	// it must be cheap and must not block.
+	onBlock func()
 }
 
-func (rb *ringBuffer) init(pool *BufferPool) {
+func (rb *ringBuffer) init(pool *BufferPool, onBlock func()) {
 	rb.cond.L = &rb.mu
 	rb.pool = pool
 	rb.buf = make([]*[]byte, defaultRingBufferCapacity)
+	rb.onBlock = onBlock
 }
 
 // Enqueue copies data into a pooled buffer and places it in the next write
@@ -59,6 +67,12 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
+	// Fire the hook once when the buffer is actually full and we are about to
+	// wait. This is the head-of-line blocking signal; it must precede the wait
+	// loop so a single full event is recorded exactly once.
+	if rb.count == len(rb.buf) && rb.err == nil && rb.onBlock != nil {
+		rb.onBlock()
+	}
 	for rb.count == len(rb.buf) && rb.err == nil {
 		rb.cond.Wait()
 	}

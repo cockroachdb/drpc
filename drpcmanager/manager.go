@@ -90,8 +90,11 @@ type Manager struct {
 
 	// mux holds normalized multiplexing metric handles (never nil; nil fields
 	// are no-ops). It is built once in NewWithOptions and shared by every
-	// stream on this connection.
-	mux *drpcmetrics.MuxMetrics
+	// stream on this connection. onRecvBlock is the per-stream receive-block
+	// hook, built once from mux and installed on every stream on this
+	// connection.
+	mux         *drpcmetrics.MuxMetrics
+	onRecvBlock func()
 }
 
 type ManagerKind uint8
@@ -138,6 +141,15 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
 
 	m.mux = opts.MuxMetrics.WithDefaults()
+	// Build the per-stream receive-block hook once and share it across every
+	// stream on this connection. Gating is checked inside the hook so a slow
+	// consumer never touches the handle when collection is disabled.
+	sr, rb := m.mux.ShouldRecord, m.mux.RecvBlocked
+	m.onRecvBlock = func() {
+		if sr() {
+			rb.Inc(1)
+		}
+	}
 
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.
@@ -281,6 +293,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 	opts := m.opts.Stream
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
+	drpcopts.SetStreamOnRecvBlock(&opts.Internal, m.onRecvBlock)
 	if cb := drpcopts.GetManagerStatsCB(&m.opts.Internal); cb != nil {
 		drpcopts.SetStreamStats(&opts.Internal, cb(rpc))
 	}

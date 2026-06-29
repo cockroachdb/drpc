@@ -110,6 +110,7 @@ type MuxMetrics struct {
 	StreamsOpened Counter
 	StreamsClosed Counter
 	StreamsFailed Counter
+	RecvBlocked   Counter
 	ShouldRecord  func() bool
 }
 
@@ -130,6 +131,9 @@ func (m *MuxMetrics) WithDefaults() *MuxMetrics {
 	}
 	if out.StreamsFailed == nil {
 		out.StreamsFailed = NoOpCounter{}
+	}
+	if out.RecvBlocked == nil {
+		out.RecvBlocked = NoOpCounter{}
 	}
 	if out.ShouldRecord == nil {
 		out.ShouldRecord = func() bool { return true }
