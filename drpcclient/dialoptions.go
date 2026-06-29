@@ -41,11 +41,9 @@ type dialOptions struct {
 	// from multiple goroutines opening streams on the same connection.
 	compressionFunc func() drpc.Compression
 
-	// metrics holds metrics the conn will populate. Its zero value records
-	// nothing. When shouldRecord is set, metrics are recorded only when it
-	// returns true.
-	metrics      drpcmetrics.ConnectionMetrics
-	shouldRecord func() bool
+	// metrics controls metrics the conn will populate. Its zero value records
+	// nothing.
+	metrics drpcmetrics.ConnectionMetrics
 }
 
 // DialOption configures how we set up the client connection.
@@ -90,15 +88,6 @@ func WithTLSConfig(tlsConfig *tls.Config) DialOption {
 func WithMetrics(metrics drpcmetrics.ConnectionMetrics) DialOption {
 	return func(o *dialOptions) {
 		o.metrics = metrics
-	}
-}
-
-// WithShouldRecordFunc returns a DialOption that sets a function to control
-// whether connection metrics are recorded. If the function returns false, no
-// metrics are collected.
-func WithShouldRecordFunc(shouldRecord func() bool) DialOption {
-	return func(o *dialOptions) {
-		o.shouldRecord = shouldRecord
 	}
 }
 
@@ -173,7 +162,6 @@ func DialContext(
 			Stream:          drpcstream.Options{MaximumBufferSize: 0},
 			CompressionFunc: options.compressionFunc,
 		},
-		ShouldRecord: options.shouldRecord,
-		Metrics:      options.metrics,
+		Metrics: options.metrics,
 	}), nil
 }

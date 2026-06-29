@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"storj.io/drpc"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcsignal"
 )
 
@@ -37,6 +38,7 @@ type WriterOptions struct {
 type MuxWriter struct {
 	w       io.Writer
 	onError func(error)
+	metrics drpcmetrics.ConnectionMetrics
 	maxBuf  int // high-water mark for buf; producers block at or above it
 
 	mu       sync.Mutex
@@ -51,12 +53,14 @@ type MuxWriter struct {
 
 // NewMuxWriter constructs a MuxWriter with default options.
 func NewMuxWriter(w io.Writer, onError func(error)) *MuxWriter {
-	return NewMuxWriterWithOptions(w, onError, WriterOptions{})
+	return NewMuxWriterWithOptions(w, onError, drpcmetrics.ConnectionMetrics{}, WriterOptions{})
 }
 
 // NewMuxWriterWithOptions constructs a MuxWriter using the provided options to
-// manage buffering.
-func NewMuxWriterWithOptions(w io.Writer, onError func(error), opts WriterOptions) *MuxWriter {
+// manage buffering and records connection write metrics through metrics.
+func NewMuxWriterWithOptions(
+	w io.Writer, onError func(error), metrics drpcmetrics.ConnectionMetrics, opts WriterOptions,
+) *MuxWriter {
 	if opts.MaximumBufferSize == 0 {
 		opts.MaximumBufferSize = 1 << 20 // Default to 1 MiB.
 	}
@@ -64,6 +68,7 @@ func NewMuxWriterWithOptions(w io.Writer, onError func(error), opts WriterOption
 	mw := &MuxWriter{
 		w:       w,
 		onError: onError,
+		metrics: metrics.WithDefaults(),
 		maxBuf:  opts.MaximumBufferSize,
 		buf:     make([]byte, 0, defaultBufferCapacity),
 		done:    make(chan struct{}),
@@ -106,10 +111,19 @@ func (mw *MuxWriter) run() {
 		// Swap the full pending buffer for the empty spare so producers can
 		// refill buf (now free) while we write the swapped-out bytes below.
 		mw.buf, spare = spare, mw.buf
+		inFlightBytes := int64(len(spare))
+		if mw.metrics.ShouldRecord() {
+			mw.metrics.WriteQueueBytes.Inc(-inFlightBytes)
+			mw.metrics.WriteFlushInFlightBytes.Inc(inFlightBytes)
+		}
 		mw.unblockWritesLocked()
 		mw.mu.Unlock()
 
-		if _, err := mw.w.Write(spare); err != nil {
+		_, err := mw.w.Write(spare)
+		if mw.metrics.ShouldRecord() {
+			mw.metrics.WriteFlushInFlightBytes.Inc(-inFlightBytes)
+		}
+		if err != nil {
 			// A failed write means the connection is gone. Classify it as a
 			// ConnectionError at the source, symmetric with the read path (see
 			// drpcwire.Reader.read). This wrapped error flows out both via
@@ -122,6 +136,11 @@ func (mw *MuxWriter) run() {
 			}
 			mw.closed = true
 			mw.closeErr = err
+			pendingBytes := int64(len(mw.buf))
+			mw.buf = mw.buf[:0]
+			if mw.metrics.ShouldRecord() {
+				mw.metrics.WriteQueueBytes.Inc(-pendingBytes)
+			}
 			mw.unblockWritesLocked()
 			mw.mu.Unlock()
 			if mw.onError != nil {
@@ -154,7 +173,11 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel *drpcsignal.Signal) (err error)
 		// high-water mark by at most one small control frame per terminating
 		// stream, which is bounded and acceptable.
 		if len(mw.buf) < mw.maxBuf || fr.Control {
+			before := len(mw.buf)
 			mw.buf = AppendFrame(mw.buf, fr)
+			if mw.metrics.ShouldRecord() {
+				mw.metrics.WriteQueueBytes.Inc(int64(len(mw.buf) - before))
+			}
 			mw.cond.Signal()
 			mw.mu.Unlock()
 			return nil
@@ -165,6 +188,10 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel *drpcsignal.Signal) (err error)
 		// on the field instead of the snapshot would miss that wakeup.
 		ch := mw.drain
 		mw.blocked++
+		if mw.metrics.ShouldRecord() {
+			mw.metrics.WriteQueueBlockedWriters.Inc(1)
+			mw.metrics.WriteQueueBlockCount.Inc(1)
+		}
 		mw.mu.Unlock()
 
 		// Resolve the cancel channel lazily, only now that we are parking, so the
@@ -180,15 +207,24 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel *drpcsignal.Signal) (err error)
 			// Space may be available now; loop and re-check.
 			mw.mu.Lock()
 			mw.blocked--
+			if mw.metrics.ShouldRecord() {
+				mw.metrics.WriteQueueBlockedWriters.Inc(-1)
+			}
 			mw.mu.Unlock()
 		case <-cancelCh:
 			mw.mu.Lock()
 			mw.blocked--
+			if mw.metrics.ShouldRecord() {
+				mw.metrics.WriteQueueBlockedWriters.Inc(-1)
+			}
 			mw.mu.Unlock()
 			return cancel.Err()
 		case <-mw.done:
 			mw.mu.Lock()
 			mw.blocked--
+			if mw.metrics.ShouldRecord() {
+				mw.metrics.WriteQueueBlockedWriters.Inc(-1)
+			}
 			err := mw.closeErr // can be nil
 			mw.mu.Unlock()
 			return err
@@ -204,6 +240,11 @@ func (mw *MuxWriter) Stop(err error) {
 	if !mw.closed {
 		mw.closed = true
 		mw.closeErr = err
+		pendingBytes := int64(len(mw.buf))
+		mw.buf = mw.buf[:0]
+		if mw.metrics.ShouldRecord() {
+			mw.metrics.WriteQueueBytes.Inc(-pendingBytes)
+		}
 		mw.cond.Broadcast()
 		mw.unblockWritesLocked()
 	}

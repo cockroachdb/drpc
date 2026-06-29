@@ -58,6 +58,7 @@ func (c *testCounter) count() int {
 func createMeteredClientConnection(
 	t testing.TB, server DRPCServiceServer, metrics drpcmetrics.ConnectionMetrics,
 ) (DRPCServiceClient, func()) {
+	metrics.ShouldRecord = func() bool { return true }
 	ctx := drpctest.NewTracker(t)
 	c1, c2 := net.Pipe()
 	mux := drpcmux.New()
@@ -65,9 +66,8 @@ func createMeteredClientConnection(
 	srv := drpcserver.New(mux)
 	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
 	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
-		Manager:      drpcmanager.Options{},
-		Metrics:      metrics,
-		ShouldRecord: func() bool { return true },
+		Manager: drpcmanager.Options{},
+		Metrics: metrics,
 	})
 	return NewDRPCServiceClient(conn), func() {
 		_ = conn.Close()
@@ -179,10 +179,10 @@ func TestClientByteMetricsShouldRecordFalse(t *testing.T) {
 	ctx.Run(func(ctx2 context.Context) { _ = srv.ServeOne(ctx2, c1) })
 	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
 		Metrics: drpcmetrics.ConnectionMetrics{
-			BytesSent: sent,
-			BytesRecv: recv,
+			ShouldRecord: func() bool { return false },
+			BytesSent:    sent,
+			BytesRecv:    recv,
 		},
-		ShouldRecord: func() bool { return false },
 	})
 	cli := NewDRPCServiceClient(conn)
 
@@ -214,10 +214,10 @@ func TestClientByteMetricsShouldRecordDynamic(t *testing.T) {
 	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
 		Manager: drpcmanager.Options{},
 		Metrics: drpcmetrics.ConnectionMetrics{
-			BytesSent: sent,
-			BytesRecv: recv,
+			ShouldRecord: func() bool { return recording },
+			BytesSent:    sent,
+			BytesRecv:    recv,
 		},
-		ShouldRecord: func() bool { return recording },
 	})
 	cli := NewDRPCServiceClient(conn)
 

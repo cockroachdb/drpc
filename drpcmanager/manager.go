@@ -52,14 +52,6 @@ type Options struct {
 	// records nothing.
 	Metrics drpcmetrics.ConnectionMetrics
 
-	// ShouldRecord controls whether connection metrics are recorded. A nil
-	// function disables collection.
-	//
-	// TODO: Evaluate how changes to ShouldRecord should affect stateful gauges.
-	// Checking it independently at paired lifecycle or queue events can leave a
-	// gauge stale or negative.
-	ShouldRecord func() bool
-
 	// GRPCMetadataCompatMode enables/disable gRPC compatibility for metadata
 	// handling. When enabled, the server stream will decode incoming metadata
 	// into grpc metadata in the context.
@@ -101,8 +93,7 @@ type Manager struct {
 
 	kind ManagerKind
 
-	metrics      drpcmetrics.ConnectionMetrics
-	shouldRecord func() bool
+	metrics drpcmetrics.ConnectionMetrics
 }
 
 type ManagerKind uint8
@@ -145,30 +136,25 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 		invokes: make(chan invokeInfo),
 		kind:    kind,
 
-		metrics:      opts.Metrics.WithDefaults(),
-		shouldRecord: opts.ShouldRecord,
+		metrics: opts.Metrics.WithDefaults(),
 	}
-	if m.shouldRecord == nil {
-		m.shouldRecord = func() bool { return false }
-	}
-
-	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
 
 	// Build the receive queue hooks once and copy them into every stream created
 	// by this manager. The ring buffer reports state transitions; the manager
 	// owns the connection-level aggregation and collection gate.
 	drpcopts.SetStreamOnReceiveQueueEnqueue(&m.opts.Stream.Internal, func(bytes int64) {
-		if m.shouldRecord() {
+		if m.metrics.ShouldRecord() {
 			m.metrics.ReceiveQueueMessages.Inc(1)
 			m.metrics.ReceiveQueueBytes.Inc(bytes)
 		}
 	})
 	drpcopts.SetStreamOnReceiveQueueDequeue(&m.opts.Stream.Internal, func(bytes int64) {
-		if m.shouldRecord() {
+		if m.metrics.ShouldRecord() {
 			m.metrics.ReceiveQueueMessages.Inc(-1)
 			m.metrics.ReceiveQueueBytes.Inc(-bytes)
 		}
 	})
+	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, m.metrics, opts.Writer)
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.
 	m.pdone.Make(1)
@@ -342,7 +328,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 		return nil, err
 	}
 
-	if m.shouldRecord() {
+	if m.metrics.ShouldRecord() {
 		m.metrics.StreamsStarted.Inc(1)
 	}
 
@@ -359,7 +345,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 	defer m.wg.Done()
 	defer func() {
-		if m.shouldRecord() {
+		if m.metrics.ShouldRecord() {
 			m.metrics.StreamsTerminated.Inc(1)
 		}
 	}()

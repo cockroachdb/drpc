@@ -45,16 +45,23 @@ func drainConn(ctx *drpctest.Tracker, c net.Conn) {
 }
 
 type streamMetricCounters struct {
-	started, terminated                     atomic.Int64
-	receiveQueueMessages, receiveQueueBytes atomic.Int64
+	started, terminated                           atomic.Int64
+	receiveQueueMessages, receiveQueueBytes       atomic.Int64
+	writeQueueBytes, writeQueueBlockedWriters     atomic.Int64
+	writeQueueBlockCount, writeFlushInFlightBytes atomic.Int64
 }
 
-func (m *streamMetricCounters) bundle() drpcmetrics.ConnectionMetrics {
+func (m *streamMetricCounters) bundle(shouldRecord func() bool) drpcmetrics.ConnectionMetrics {
 	return drpcmetrics.ConnectionMetrics{
-		StreamsStarted:       testCounter{&m.started},
-		StreamsTerminated:    testCounter{&m.terminated},
-		ReceiveQueueMessages: testGauge{&m.receiveQueueMessages},
-		ReceiveQueueBytes:    testGauge{&m.receiveQueueBytes},
+		ShouldRecord:             shouldRecord,
+		StreamsStarted:           testCounter{&m.started},
+		StreamsTerminated:        testCounter{&m.terminated},
+		ReceiveQueueMessages:     testGauge{&m.receiveQueueMessages},
+		ReceiveQueueBytes:        testGauge{&m.receiveQueueBytes},
+		WriteQueueBytes:          testGauge{&m.writeQueueBytes},
+		WriteQueueBlockedWriters: testGauge{&m.writeQueueBlockedWriters},
+		WriteQueueBlockCount:     testCounter{&m.writeQueueBlockCount},
+		WriteFlushInFlightBytes:  testGauge{&m.writeFlushInFlightBytes},
 	}
 }
 
@@ -83,10 +90,7 @@ func TestManagerStreamLifecycle(t *testing.T) {
 	drainConn(ctx, sconn)
 
 	var c streamMetricCounters
-	cman := NewWithOptions(cconn, Client, Options{
-		Metrics:      c.bundle(),
-		ShouldRecord: func() bool { return true },
-	})
+	cman := NewWithOptions(cconn, Client, Options{Metrics: c.bundle(func() bool { return true })})
 	defer func() { _ = cman.Close() }()
 
 	stream, err := cman.NewClientStream(ctx, "rpc", 0)
@@ -115,10 +119,7 @@ func TestManagerStreamLifecycleOnConnectionClose(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 	var c streamMetricCounters
-	cman := NewWithOptions(cconn, Client, Options{
-		Metrics:      c.bundle(),
-		ShouldRecord: func() bool { return true },
-	})
+	cman := NewWithOptions(cconn, Client, Options{Metrics: c.bundle(func() bool { return true })})
 
 	_, err := cman.NewClientStream(ctx, "rpc-1", 0)
 	assert.NoError(t, err)
@@ -142,10 +143,7 @@ func TestManagerRejectedStreamNotCounted(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 	var c streamMetricCounters
-	cman := NewWithOptions(cconn, Client, Options{
-		Metrics:      c.bundle(),
-		ShouldRecord: func() bool { return true },
-	})
+	cman := NewWithOptions(cconn, Client, Options{Metrics: c.bundle(func() bool { return true })})
 	assert.NoError(t, cman.Close())
 
 	_, err := cman.NewClientStream(ctx, "rpc", 0)
@@ -164,10 +162,7 @@ func TestManagerStreamLifecycleGatedOff(t *testing.T) {
 	drainConn(ctx, sconn)
 
 	var c streamMetricCounters
-	cman := NewWithOptions(cconn, Client, Options{
-		Metrics:      c.bundle(),
-		ShouldRecord: func() bool { return false },
-	})
+	cman := NewWithOptions(cconn, Client, Options{Metrics: c.bundle(func() bool { return false })})
 	stream, err := cman.NewClientStream(ctx, "rpc", 0)
 	assert.NoError(t, err)
 	assert.NoError(t, stream.Close())
@@ -188,10 +183,7 @@ func TestManagerReceiveQueueMetrics(t *testing.T) {
 	defer func() { _ = sconn.Close() }()
 
 	var c streamMetricCounters
-	cman := NewWithOptions(cconn, Client, Options{
-		Metrics:      c.bundle(),
-		ShouldRecord: func() bool { return true },
-	})
+	cman := NewWithOptions(cconn, Client, Options{Metrics: c.bundle(func() bool { return true })})
 	defer func() { _ = cman.Close() }()
 
 	stream, err := cman.NewClientStream(ctx, "rpc", 0)
@@ -232,8 +224,7 @@ func TestManagerReceiveQueueMetricsGated(t *testing.T) {
 			t.Cleanup(func() { _ = cconn.Close(); _ = sconn.Close() })
 			var c streamMetricCounters
 			m := NewWithOptions(cconn, Client, Options{
-				Metrics:      c.bundle(),
-				ShouldRecord: func() bool { return tc.enabled },
+				Metrics: c.bundle(func() bool { return tc.enabled }),
 			})
 			t.Cleanup(func() { _ = m.Close() })
 
@@ -249,4 +240,80 @@ func TestManagerReceiveQueueMetricsGated(t *testing.T) {
 
 		})
 	}
+}
+
+// TestManagerWriteMetrics verifies that connection write pressure reaches the
+// per-connection metric bundle.
+func TestManagerWriteMetrics(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+	// Intentionally never read from sconn. The first batch stays in Write, the
+	// next batch remains pending, and the following writer parks.
+
+	var c streamMetricCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		Metrics: c.bundle(func() bool { return true }),
+		Writer:  drpcwire.WriterOptions{MaximumBufferSize: 1},
+	})
+
+	stream, err := cman.NewClientStream(ctx, "rpc", 0)
+	assert.NoError(t, err)
+
+	ctx.Run(func(context.Context) {
+		for {
+			if err := stream.RawWrite(drpcwire.KindMessage, []byte("x")); err != nil {
+				return
+			}
+		}
+	})
+
+	waitForCount(t, &c.writeQueueBlockCount, 1)
+	assert.Equal(t, c.writeQueueBlockedWriters.Load(), int64(1))
+	assert.That(t, c.writeQueueBytes.Load() > 0)
+	assert.That(t, c.writeFlushInFlightBytes.Load() > 0)
+
+	assert.NoError(t, cman.Close())
+	assert.Equal(t, c.writeQueueBytes.Load(), int64(0))
+	assert.Equal(t, c.writeQueueBlockedWriters.Load(), int64(0))
+	assert.That(t, c.writeQueueBlockCount.Load() >= 1)
+	assert.Equal(t, c.writeFlushInFlightBytes.Load(), int64(0))
+}
+
+func TestManagerWriteMetricsGatedOff(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	var c streamMetricCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		Metrics: c.bundle(func() bool { return false }),
+		Writer:  drpcwire.WriterOptions{MaximumBufferSize: 1},
+	})
+	defer func() { _ = cman.Close() }()
+
+	stream, err := cman.NewClientStream(ctx, "rpc", 0)
+	assert.NoError(t, err)
+
+	ctx.Run(func(context.Context) {
+		for {
+			if err := stream.RawWrite(drpcwire.KindMessage, []byte("x")); err != nil {
+				return
+			}
+		}
+	})
+
+	// A writer parks within milliseconds, but every signal must remain zero when
+	// collection is disabled.
+	time.Sleep(250 * time.Millisecond)
+	assert.Equal(t, c.writeQueueBytes.Load(), int64(0))
+	assert.Equal(t, c.writeQueueBlockedWriters.Load(), int64(0))
+	assert.Equal(t, c.writeQueueBlockCount.Load(), int64(0))
+	assert.Equal(t, c.writeFlushInFlightBytes.Load(), int64(0))
 }

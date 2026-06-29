@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"storj.io/drpc"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
@@ -431,7 +432,7 @@ func TestStream_CloseNotDroppedUnderBackpressure(t *testing.T) {
 	defer ctx.Close()
 
 	bw := newBlockingWriter()
-	mw := drpcwire.NewMuxWriterWithOptions(bw, func(error) {}, drpcwire.WriterOptions{MaximumBufferSize: 1})
+	mw := drpcwire.NewMuxWriterWithOptions(bw, func(error) {}, drpcmetrics.ConnectionMetrics{}, drpcwire.WriterOptions{MaximumBufferSize: 1})
 	defer func() { mw.Stop(nil); <-mw.Done() }()
 
 	fillMuxBuffer(t, mw, bw)
@@ -464,7 +465,7 @@ func TestStream_SendCancelPreemptsBlockedSend(t *testing.T) {
 	defer ctx.Close()
 
 	bw := newBlockingWriter()
-	mw := drpcwire.NewMuxWriterWithOptions(bw, func(error) {}, drpcwire.WriterOptions{MaximumBufferSize: 1})
+	mw := drpcwire.NewMuxWriterWithOptions(bw, func(error) {}, drpcmetrics.ConnectionMetrics{}, drpcwire.WriterOptions{MaximumBufferSize: 1})
 	defer func() { mw.Stop(nil); <-mw.Done() }()
 
 	fillMuxBuffer(t, mw, bw)

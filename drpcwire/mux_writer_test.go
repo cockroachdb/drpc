@@ -14,6 +14,7 @@ import (
 	"github.com/zeebo/assert"
 
 	"storj.io/drpc"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcsignal"
 )
 
@@ -71,7 +72,7 @@ func TestMuxWriter_MaxBufferSizeOption(t *testing.T) {
 	<-mw.Done()
 
 	// An explicit value is honored.
-	mw = NewMuxWriterWithOptions(io.Discard, func(error) {}, WriterOptions{MaximumBufferSize: 4096})
+	mw = NewMuxWriterWithOptions(io.Discard, func(error) {}, drpcmetrics.ConnectionMetrics{}, WriterOptions{MaximumBufferSize: 4096})
 	assert.Equal(t, mw.maxBuf, 4096)
 	mw.Stop(nil)
 	<-mw.Done()
@@ -353,7 +354,7 @@ func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 // newTinyMuxWriter builds a MuxWriter with a 1-byte high-water mark so the
 // next WriteFrame after one full frame parks on backpressure.
 func newTinyMuxWriter(w io.Writer) *MuxWriter {
-	return NewMuxWriterWithOptions(w, func(error) {}, WriterOptions{MaximumBufferSize: 1})
+	return NewMuxWriterWithOptions(w, func(error) {}, drpcmetrics.ConnectionMetrics{}, WriterOptions{MaximumBufferSize: 1})
 }
 
 // blockUntilFull writes one frame that run() picks up and stalls on (leaving buf

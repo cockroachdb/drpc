@@ -22,16 +22,36 @@ func TestConnectionMetricsWithDefaults(t *testing.T) {
 	m.ReceiveQueueMessages.Inc(-1)
 	m.ReceiveQueueBytes.Inc(1)
 	m.ReceiveQueueBytes.Inc(-1)
+	m.WriteQueueBytes.Inc(1)
+	m.WriteQueueBytes.Inc(-1)
+	m.WriteQueueBlockedWriters.Inc(1)
+	m.WriteQueueBlockedWriters.Inc(-1)
+	m.WriteQueueBlockCount.Inc(1)
+	m.WriteFlushInFlightBytes.Inc(1)
+	m.WriteFlushInFlightBytes.Inc(-1)
+	if m.ShouldRecord() {
+		t.Fatal("default metric bundle records metrics")
+	}
 
 	// Provided fields are preserved and reach the underlying handle; missing
 	// fields are filled with no-ops that must not panic.
 	var got int64
-	in := ConnectionMetrics{StreamsStarted: countingCounter{&got}}
+	in := ConnectionMetrics{
+		ShouldRecord:   func() bool { return true },
+		StreamsStarted: countingCounter{&got},
+	}
 	out := in.WithDefaults()
+	if !out.ShouldRecord() {
+		t.Fatal("provided recording gate was not preserved")
+	}
 	out.StreamsStarted.Inc(2)
 	out.StreamsTerminated.Inc(1) // no-op
 	out.ReceiveQueueMessages.Inc(1)
 	out.ReceiveQueueBytes.Inc(1)
+	out.WriteQueueBytes.Inc(1)
+	out.WriteQueueBlockedWriters.Inc(1)
+	out.WriteQueueBlockCount.Inc(1)
+	out.WriteFlushInFlightBytes.Inc(1)
 	out.BytesSent.Inc(1) // no-op
 	out.BytesRecv.Inc(1) // no-op
 	if got != 2 {

@@ -66,33 +66,20 @@ func (NoOpAdditiveGauge) Inc(v int64) {}
 // Read and Write call.
 type meteredTransport struct {
 	drpc.Transport
-	bytesSent    Counter
-	bytesRecv    Counter
-	shouldRecord func() bool
+	metrics ConnectionMetrics
 }
 
-// ToMeteredTransport returns a transport that increments bytesSent and
-// bytesRecv on each Write and Read call respectively. Nil counters are
-// replaced with no-op implementations.
-func ToMeteredTransport(
-	tr drpc.Transport, bytesSent,
-	bytesRecv Counter, shouldRecord func() bool,
-) drpc.Transport {
-	if bytesSent == nil {
-		bytesSent = NoOpCounter{}
-	}
-	if bytesRecv == nil {
-		bytesRecv = NoOpCounter{}
-	}
-	return &meteredTransport{Transport: tr, bytesSent: bytesSent,
-		bytesRecv: bytesRecv, shouldRecord: shouldRecord}
+// ToMeteredTransport returns a transport that records bytes read and written
+// through metrics.
+func ToMeteredTransport(tr drpc.Transport, metrics ConnectionMetrics) drpc.Transport {
+	return &meteredTransport{Transport: tr, metrics: metrics.WithDefaults()}
 }
 
 // Read reads from the underlying transport and increments bytesRecv.
 func (t *meteredTransport) Read(p []byte) (n int, err error) {
 	n, err = t.Transport.Read(p)
-	if n > 0 && t.shouldRecord() {
-		t.bytesRecv.Inc(int64(n))
+	if n > 0 && t.metrics.ShouldRecord() {
+		t.metrics.BytesRecv.Inc(int64(n))
 	}
 	return n, err
 }
@@ -100,16 +87,24 @@ func (t *meteredTransport) Read(p []byte) (n int, err error) {
 // Write writes to the underlying transport and increments bytesSent.
 func (t *meteredTransport) Write(p []byte) (n int, err error) {
 	n, err = t.Transport.Write(p)
-	if n > 0 && t.shouldRecord() {
-		t.bytesSent.Inc(int64(n))
+	if n > 0 && t.metrics.ShouldRecord() {
+		t.metrics.BytesSent.Inc(int64(n))
 	}
 	return n, err
 }
 
-// ConnectionMetrics holds metrics populated by a DRPC connection. The caller
-// binds each handle to its desired labels before passing the bundle to DRPC.
-// Its zero value records nothing.
+// ConnectionMetrics controls metrics for one DRPC connection. The caller binds
+// each handle to its desired labels before passing the bundle to DRPC. Its zero
+// value records nothing.
 type ConnectionMetrics struct {
+	// ShouldRecord controls whether this connection records metrics. A nil
+	// function disables collection.
+	//
+	// TODO: Evaluate how changes to ShouldRecord should affect stateful gauges.
+	// Checking it independently at paired lifecycle or queue events can leave a
+	// gauge stale or negative.
+	ShouldRecord func() bool
+
 	BytesSent Counter
 	BytesRecv Counter
 
@@ -118,11 +113,19 @@ type ConnectionMetrics struct {
 
 	ReceiveQueueMessages AdditiveGauge
 	ReceiveQueueBytes    AdditiveGauge
+
+	WriteQueueBytes          AdditiveGauge
+	WriteQueueBlockedWriters AdditiveGauge
+	WriteQueueBlockCount     Counter
+	WriteFlushInFlightBytes  AdditiveGauge
 }
 
 // WithDefaults returns a copy with nil metric handles replaced by no-op
 // implementations.
 func (m ConnectionMetrics) WithDefaults() ConnectionMetrics {
+	if m.ShouldRecord == nil {
+		m.ShouldRecord = neverRecord
+	}
 	if m.BytesSent == nil {
 		m.BytesSent = NoOpCounter{}
 	}
@@ -141,5 +144,19 @@ func (m ConnectionMetrics) WithDefaults() ConnectionMetrics {
 	if m.ReceiveQueueBytes == nil {
 		m.ReceiveQueueBytes = NoOpAdditiveGauge{}
 	}
+	if m.WriteQueueBytes == nil {
+		m.WriteQueueBytes = NoOpAdditiveGauge{}
+	}
+	if m.WriteQueueBlockedWriters == nil {
+		m.WriteQueueBlockedWriters = NoOpAdditiveGauge{}
+	}
+	if m.WriteQueueBlockCount == nil {
+		m.WriteQueueBlockCount = NoOpCounter{}
+	}
+	if m.WriteFlushInFlightBytes == nil {
+		m.WriteFlushInFlightBytes = NoOpAdditiveGauge{}
+	}
 	return m
 }
+
+func neverRecord() bool { return false }
