@@ -8,12 +8,14 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 
 	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
+	"storj.io/drpc/internal/drpcopts"
 )
 
 // testCounter is a drpcmetrics.Counter backed by an atomic so the test can read
@@ -21,6 +23,12 @@ import (
 type testCounter struct{ n *atomic.Int64 }
 
 func (c testCounter) Inc(v int64) { c.n.Add(v) }
+
+// testGauge is an additive gauge backed by an atomic so the test can read it
+// from the test goroutine while the manager updates it from its own.
+type testGauge struct{ n *atomic.Int64 }
+
+func (g testGauge) Inc(v int64) { g.n.Add(v) }
 
 // drainConn reads and discards everything from c until it errors. net.Pipe is
 // synchronous and unbuffered, so without a reader the manager's frame writes
@@ -36,12 +44,29 @@ func drainConn(ctx *drpctest.Tracker, c net.Conn) {
 	})
 }
 
-type streamMetricCounters struct{ started, terminated atomic.Int64 }
+type streamMetricCounters struct {
+	started, terminated                     atomic.Int64
+	receiveQueueMessages, receiveQueueBytes atomic.Int64
+}
 
 func (m *streamMetricCounters) bundle() drpcmetrics.ConnectionMetrics {
 	return drpcmetrics.ConnectionMetrics{
-		StreamsStarted:    testCounter{&m.started},
-		StreamsTerminated: testCounter{&m.terminated},
+		StreamsStarted:       testCounter{&m.started},
+		StreamsTerminated:    testCounter{&m.terminated},
+		ReceiveQueueMessages: testGauge{&m.receiveQueueMessages},
+		ReceiveQueueBytes:    testGauge{&m.receiveQueueBytes},
+	}
+}
+
+// waitForCount polls n until it reaches target or the deadline expires.
+func waitForCount(t *testing.T, n *atomic.Int64, target int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for n.Load() < target {
+		if time.Now().After(deadline) {
+			t.Fatalf("counter reached %d, want %d", n.Load(), target)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -150,4 +175,78 @@ func TestManagerStreamLifecycleGatedOff(t *testing.T) {
 
 	assert.Equal(t, c.started.Load(), int64(0))
 	assert.Equal(t, c.terminated.Load(), int64(0))
+}
+
+// TestManagerReceiveQueueMetrics verifies that queue depth from a stream's
+// ring buffer reaches the connection metric bundle.
+func TestManagerReceiveQueueMetrics(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	var c streamMetricCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		Metrics:      c.bundle(),
+		ShouldRecord: func() bool { return true },
+	})
+	defer func() { _ = cman.Close() }()
+
+	stream, err := cman.NewClientStream(ctx, "rpc")
+	assert.NoError(t, err)
+
+	// Fill all 256 slots.
+	const queueCapacity = 256
+	for mid := uint64(1); mid <= queueCapacity; mid++ {
+		var buf []byte
+		buf = drpcwire.AppendFrame(buf, createFrame(drpcwire.KindMessage, stream.ID(), mid, "x", true))
+		_, err := sconn.Write(buf)
+		assert.NoError(t, err)
+	}
+
+	waitForCount(t, &c.receiveQueueMessages, queueCapacity)
+	assert.Equal(t, c.receiveQueueMessages.Load(), int64(queueCapacity))
+	assert.Equal(t, c.receiveQueueBytes.Load(), int64(queueCapacity))
+
+	// Removing one message lowers the queue depth by one.
+	data, err := stream.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("x"))
+	assert.Equal(t, c.receiveQueueMessages.Load(), int64(queueCapacity-1))
+	assert.Equal(t, c.receiveQueueBytes.Load(), int64(queueCapacity-1))
+}
+
+func TestManagerReceiveQueueMetricsGated(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		want    int64
+	}{
+		{name: "disabled", enabled: false, want: 0},
+		{name: "enabled", enabled: true, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cconn, sconn := net.Pipe()
+			t.Cleanup(func() { _ = cconn.Close(); _ = sconn.Close() })
+			var c streamMetricCounters
+			m := NewWithOptions(cconn, Client, Options{
+				Metrics:      c.bundle(),
+				ShouldRecord: func() bool { return tc.enabled },
+			})
+			t.Cleanup(func() { _ = m.Close() })
+
+			enqueue := drpcopts.GetStreamOnReceiveQueueEnqueue(&m.opts.Stream.Internal)
+			dequeue := drpcopts.GetStreamOnReceiveQueueDequeue(&m.opts.Stream.Internal)
+
+			enqueue(10)
+			assert.Equal(t, c.receiveQueueMessages.Load(), tc.want)
+			assert.Equal(t, c.receiveQueueBytes.Load(), 10*tc.want)
+			dequeue(10)
+			assert.Equal(t, c.receiveQueueMessages.Load(), int64(0))
+			assert.Equal(t, c.receiveQueueBytes.Load(), int64(0))
+
+		})
+	}
 }

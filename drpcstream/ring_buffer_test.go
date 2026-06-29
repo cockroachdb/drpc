@@ -13,7 +13,7 @@ import (
 
 func TestRingBuffer_EnqueueDequeue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	rb.Enqueue([]byte("hello"))
 
@@ -24,7 +24,7 @@ func TestRingBuffer_EnqueueDequeue(t *testing.T) {
 
 func TestRingBuffer_FIFO(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	rb.Enqueue([]byte("first"))
 	rb.Enqueue([]byte("second"))
@@ -39,7 +39,7 @@ func TestRingBuffer_FIFO(t *testing.T) {
 
 func TestRingBuffer_DequeueBlocksUntilEnqueue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	got := make(chan []byte, 1)
 	go func() {
@@ -88,7 +88,7 @@ func TestRingBuffer_EnqueueBlocksWhenFull(t *testing.T) {
 
 func TestRingBuffer_CloseUnblocksDequeue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	errch := make(chan error, 1)
 	go func() {
@@ -120,7 +120,7 @@ func TestRingBuffer_CloseUnblocksEnqueue(t *testing.T) {
 
 func TestRingBuffer_CloseDrainsQueued(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	rb.Enqueue([]byte("queued"))
 	rb.Close(io.EOF)
@@ -138,7 +138,7 @@ func TestRingBuffer_CloseDrainsQueued(t *testing.T) {
 
 func TestRingBuffer_CloseIdempotent(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	rb.Close(io.EOF)
 	rb.Close(io.ErrUnexpectedEOF) // should not overwrite
@@ -149,7 +149,7 @@ func TestRingBuffer_CloseIdempotent(t *testing.T) {
 
 func TestRingBuffer_EnqueueAfterClose(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	rb.Close(io.EOF)
 	rb.Enqueue([]byte("dropped")) // should not panic or block
@@ -172,7 +172,7 @@ func TestRingBuffer_SlotReuse(t *testing.T) {
 
 func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool())
+	rb.init(NewBufferPool(), ringBufferHooks{})
 
 	const n = 1000
 	var wg sync.WaitGroup
@@ -201,7 +201,7 @@ func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 func TestRingBuffer_WithPool(t *testing.T) {
 	pool := NewBufferPool()
 	var rb ringBuffer
-	rb.init(pool)
+	rb.init(pool, ringBufferHooks{})
 
 	rb.Enqueue([]byte("pooled"))
 

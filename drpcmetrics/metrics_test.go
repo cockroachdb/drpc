@@ -18,6 +18,10 @@ func TestConnectionMetricsWithDefaults(t *testing.T) {
 	m.BytesRecv.Inc(1)
 	m.StreamsStarted.Inc(1)
 	m.StreamsTerminated.Inc(1)
+	m.ReceiveQueueMessages.Inc(1)
+	m.ReceiveQueueMessages.Inc(-1)
+	m.ReceiveQueueBytes.Inc(1)
+	m.ReceiveQueueBytes.Inc(-1)
 
 	// Provided fields are preserved and reach the underlying handle; missing
 	// fields are filled with no-ops that must not panic.
@@ -26,8 +30,10 @@ func TestConnectionMetricsWithDefaults(t *testing.T) {
 	out := in.WithDefaults()
 	out.StreamsStarted.Inc(2)
 	out.StreamsTerminated.Inc(1) // no-op
-	out.BytesSent.Inc(1)         // no-op
-	out.BytesRecv.Inc(1)         // no-op
+	out.ReceiveQueueMessages.Inc(1)
+	out.ReceiveQueueBytes.Inc(1)
+	out.BytesSent.Inc(1) // no-op
+	out.BytesRecv.Inc(1) // no-op
 	if got != 2 {
 		t.Fatalf("expected provided counter to observe 2, got %d", got)
 	}

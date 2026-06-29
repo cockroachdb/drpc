@@ -13,6 +13,11 @@ import "sync"
 // TODO: benchmark whether power-of-2 masking improves performance over modulo.
 const defaultRingBufferCapacity = 256
 
+type ringBufferHooks struct {
+	onEnqueue func(bytes int64)
+	onDequeue func(bytes int64)
+}
+
 // ringBuffer is a bounded single-producer / single-consumer FIFO queue for
 // assembled packet data. It sits between manageReader (producer, calls
 // Enqueue) and the application goroutine (consumer, calls Dequeue/Done).
@@ -41,12 +46,15 @@ type ringBuffer struct {
 
 	held *[]byte // buffer from the last Dequeue, released by Done
 	err  error   // terminal error, set by Close
+
+	hooks ringBufferHooks
 }
 
-func (rb *ringBuffer) init(pool *BufferPool) {
+func (rb *ringBuffer) init(pool *BufferPool, hooks ringBufferHooks) {
 	rb.cond.L = &rb.mu
 	rb.pool = pool
 	rb.buf = make([]*[]byte, defaultRingBufferCapacity)
+	rb.hooks = hooks
 }
 
 // Enqueue copies data into a pooled buffer and places it in the next write
@@ -70,6 +78,9 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 	rb.buf[rb.head] = b
 	rb.head = (rb.head + 1) % len(rb.buf)
 	rb.count++
+	if rb.hooks.onEnqueue != nil {
+		rb.hooks.onEnqueue(int64(len(*b)))
+	}
 	rb.cond.Broadcast()
 }
 
@@ -93,6 +104,9 @@ func (rb *ringBuffer) Dequeue() ([]byte, error) {
 	rb.tail = (rb.tail + 1) % len(rb.buf)
 	rb.count--
 	rb.held = b
+	if rb.hooks.onDequeue != nil {
+		rb.hooks.onDequeue(int64(len(*b)))
+	}
 	rb.cond.Broadcast()
 
 	return *b, nil

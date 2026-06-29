@@ -45,6 +45,10 @@ type Options struct {
 
 	// ShouldRecord controls whether connection metrics are recorded. A nil
 	// function disables collection.
+	//
+	// TODO: Evaluate how changes to ShouldRecord should affect stateful gauges.
+	// Checking it independently at paired lifecycle or queue events can leave a
+	// gauge stale or negative.
 	ShouldRecord func() bool
 
 	// GRPCMetadataCompatMode enables/disable gRPC compatibility for metadata
@@ -141,6 +145,21 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 
 	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
 
+	// Build the receive queue hooks once and copy them into every stream created
+	// by this manager. The ring buffer reports state transitions; the manager
+	// owns the connection-level aggregation and collection gate.
+	drpcopts.SetStreamOnReceiveQueueEnqueue(&m.opts.Stream.Internal, func(bytes int64) {
+		if m.shouldRecord() {
+			m.metrics.ReceiveQueueMessages.Inc(1)
+			m.metrics.ReceiveQueueBytes.Inc(bytes)
+		}
+	})
+	drpcopts.SetStreamOnReceiveQueueDequeue(&m.opts.Stream.Internal, func(bytes int64) {
+		if m.shouldRecord() {
+			m.metrics.ReceiveQueueMessages.Inc(-1)
+			m.metrics.ReceiveQueueBytes.Inc(-bytes)
+		}
+	})
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.
 	m.pdone.Make(1)

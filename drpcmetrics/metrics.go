@@ -115,6 +115,9 @@ type ConnectionMetrics struct {
 
 	StreamsStarted    Counter
 	StreamsTerminated Counter
+
+	ReceiveQueueMessages AdditiveGauge
+	ReceiveQueueBytes    AdditiveGauge
 }
 
 // WithDefaults returns a copy with nil metric handles replaced by no-op
@@ -131,6 +134,12 @@ func (m ConnectionMetrics) WithDefaults() ConnectionMetrics {
 	}
 	if m.StreamsTerminated == nil {
 		m.StreamsTerminated = NoOpCounter{}
+	}
+	if m.ReceiveQueueMessages == nil {
+		m.ReceiveQueueMessages = NoOpAdditiveGauge{}
+	}
+	if m.ReceiveQueueBytes == nil {
+		m.ReceiveQueueBytes = NoOpAdditiveGauge{}
 	}
 	return m
 }

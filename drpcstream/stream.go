@@ -113,7 +113,10 @@ func NewWithOptions(
 		wr: wr,
 	}
 
-	s.recvQueue.init(pool)
+	s.recvQueue.init(pool, ringBufferHooks{
+		onEnqueue: drpcopts.GetStreamOnReceiveQueueEnqueue(&opts.Internal),
+		onDequeue: drpcopts.GetStreamOnReceiveQueueDequeue(&opts.Internal),
+	})
 
 	return s
 }

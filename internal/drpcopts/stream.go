@@ -10,11 +10,13 @@ import (
 
 // Stream contains internal options for the drpcstream package.
 type Stream struct {
-	transport drpc.Transport
-	fin       chan<- struct{}
-	kind      drpc.StreamKind
-	rpc       string
-	stats     *drpcstats.Stats
+	transport             drpc.Transport
+	fin                   chan<- struct{}
+	kind                  drpc.StreamKind
+	rpc                   string
+	stats                 *drpcstats.Stats
+	onReceiveQueueEnqueue func(int64)
+	onReceiveQueueDequeue func(int64)
 }
 
 // GetStreamTransport returns the drpc.Transport stored in the options.
@@ -40,3 +42,23 @@ func GetStreamStats(opts *Stream) *drpcstats.Stats { return opts.stats }
 
 // SetStreamStats sets the Stats stored in the options.
 func SetStreamStats(opts *Stream, stats *drpcstats.Stats) { opts.stats = stats }
+
+// GetStreamOnReceiveQueueEnqueue returns the receive queue enqueue hook.
+func GetStreamOnReceiveQueueEnqueue(opts *Stream) func(int64) {
+	return opts.onReceiveQueueEnqueue
+}
+
+// SetStreamOnReceiveQueueEnqueue sets the receive queue enqueue hook.
+func SetStreamOnReceiveQueueEnqueue(opts *Stream, fn func(int64)) {
+	opts.onReceiveQueueEnqueue = fn
+}
+
+// GetStreamOnReceiveQueueDequeue returns the receive queue dequeue hook.
+func GetStreamOnReceiveQueueDequeue(opts *Stream) func(int64) {
+	return opts.onReceiveQueueDequeue
+}
+
+// SetStreamOnReceiveQueueDequeue sets the receive queue dequeue hook.
+func SetStreamOnReceiveQueueDequeue(opts *Stream, fn func(int64)) {
+	opts.onReceiveQueueDequeue = fn
+}
