@@ -20,6 +20,7 @@ import (
 	"storj.io/drpc"
 	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcmetadata"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcsignal"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpcwire"
@@ -41,6 +42,10 @@ type Options struct {
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
+
+	// MuxMetrics holds optional, per-connection metric handles for the
+	// multiplexing layer. Nil records nothing.
+	MuxMetrics *drpcmetrics.MuxMetrics
 
 	// GRPCMetadataCompatMode enables/disable gRPC compatibility for metadata
 	// handling. When enabled, the server stream will decode incoming metadata
@@ -82,6 +87,11 @@ type Manager struct {
 	}
 
 	kind ManagerKind
+
+	// mux holds normalized multiplexing metric handles (never nil; nil fields
+	// are no-ops). It is built once in NewWithOptions and shared by every
+	// stream on this connection.
+	mux *drpcmetrics.MuxMetrics
 }
 
 type ManagerKind uint8
@@ -126,6 +136,8 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 	}
 
 	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
+
+	m.mux = opts.MuxMetrics.WithDefaults()
 
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.
@@ -279,6 +291,10 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 		return nil, err
 	}
 
+	if m.mux.ShouldRecord() {
+		m.mux.StreamsOpened.Inc(1)
+	}
+
 	m.wg.Add(1)
 	go m.manageStream(ctx, stream)
 
@@ -291,6 +307,18 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 // is finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 	defer m.wg.Done()
+	// Classify the outcome on teardown. This deferred call runs after the
+	// select below returns, by which point the stream has reached Finished()
+	// and its terminal cause is settled.
+	defer func() {
+		if m.mux.ShouldRecord() {
+			if stream.Succeeded() {
+				m.mux.StreamsClosed.Inc(1)
+			} else {
+				m.mux.StreamsFailed.Inc(1)
+			}
+		}
+	}()
 	defer m.streams.Remove(stream.ID())
 	select {
 	case <-stream.Finished():

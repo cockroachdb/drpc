@@ -100,3 +100,39 @@ type ClientMetrics struct {
 	BytesSent Counter
 	BytesRecv Counter
 }
+
+// MuxMetrics holds optional, per-connection metric handles for the stream
+// multiplexing layer. Each handle is already bound to its peer labels by the
+// caller, so the hot path passes no labels and allocates nothing. A nil bundle,
+// or any nil field, records nothing (see WithDefaults). ShouldRecord gates all
+// collection at runtime; when it returns false no handle is touched.
+type MuxMetrics struct {
+	StreamsOpened Counter
+	StreamsClosed Counter
+	StreamsFailed Counter
+	ShouldRecord  func() bool
+}
+
+// WithDefaults returns a bundle with every nil field replaced by a no-op
+// implementation and a nil ShouldRecord replaced by one that always records, so
+// callers can invoke the handles unconditionally. It is safe to call on a nil
+// receiver.
+func (m *MuxMetrics) WithDefaults() *MuxMetrics {
+	out := MuxMetrics{}
+	if m != nil {
+		out = *m
+	}
+	if out.StreamsOpened == nil {
+		out.StreamsOpened = NoOpCounter{}
+	}
+	if out.StreamsClosed == nil {
+		out.StreamsClosed = NoOpCounter{}
+	}
+	if out.StreamsFailed == nil {
+		out.StreamsFailed = NoOpCounter{}
+	}
+	if out.ShouldRecord == nil {
+		out.ShouldRecord = func() bool { return true }
+	}
+	return &out
+}

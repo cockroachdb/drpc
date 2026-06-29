@@ -38,6 +38,10 @@ type dialOptions struct {
 	// only when shouldRecord returns true.
 	metrics      *drpcmetrics.ClientMetrics
 	shouldRecord func() bool
+
+	// muxMetrics holds optional, per-connection multiplexing metric handles,
+	// populated during connection operation. Nil records nothing.
+	muxMetrics *drpcmetrics.MuxMetrics
 }
 
 // DialOption configures how we set up the client connection.
@@ -91,6 +95,14 @@ func WithMetrics(metrics *drpcmetrics.ClientMetrics) DialOption {
 func WithShouldRecordFunc(shouldRecord func() bool) DialOption {
 	return func(o *dialOptions) {
 		o.shouldRecord = shouldRecord
+	}
+}
+
+// WithMuxMetrics returns a DialOption that sets per-connection multiplexing
+// metric handles, populated during connection operation.
+func WithMuxMetrics(m *drpcmetrics.MuxMetrics) DialOption {
+	return func(o *dialOptions) {
+		o.muxMetrics = m
 	}
 }
 
@@ -158,6 +170,7 @@ func DialContext(
 			Stream: drpcstream.Options{
 				MaximumBufferSize: 0, // unlimited
 			},
+			MuxMetrics: options.muxMetrics,
 		},
 		ShouldRecord: options.shouldRecord,
 		Metrics:      *options.metrics,

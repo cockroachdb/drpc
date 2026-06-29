@@ -5,6 +5,7 @@ package drpcstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"runtime/trace"
@@ -196,6 +197,26 @@ func (s *Stream) Finished() <-chan struct{} { return s.sigs.fin.Signal() }
 // issue any writes or reads.
 func (s *Stream) IsFinished() bool { return s.sigs.fin.IsSet() }
 
+// Succeeded reports whether the stream terminated gracefully (a normal close on
+// either side or no error) rather than via an error, cancellation, or
+// connection drop. It is meant to be read after Finished() has fired. This is a
+// v1 heuristic: any termination cause that is not one of the recognized
+// graceful sentinels is treated as a failure.
+func (s *Stream) Succeeded() bool {
+	err := s.sigs.term.Err()
+	switch {
+	case err == nil,
+		errors.Is(err, io.EOF),
+		errors.Is(err, sendClosed),
+		errors.Is(err, termClosed),
+		errors.Is(err, termBothClosed),
+		errors.Is(err, termRemoteClosed):
+		return true
+	default:
+		return false
+	}
+}
+
 //
 // frame handler
 //
@@ -255,7 +276,7 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 	case drpcwire.KindClose:
 		s.sigs.recv.Set(io.EOF)
 		s.recvQueue.Close(io.EOF)
-		s.terminate(drpc.ClosedError.New("remote closed the stream"))
+		s.terminate(termRemoteClosed)
 		return nil
 
 	case drpcwire.KindCloseSend:
@@ -485,6 +506,11 @@ var (
 	termError      = drpc.Error.New("stream terminated by sending error")
 	termClosed     = drpc.Error.New("stream terminated by sending close")
 	termBothClosed = drpc.Error.New("stream terminated by both issuing close send")
+	// termRemoteClosed is the terminal error for a stream the remote ended with
+	// a graceful KindClose. It is a distinct sentinel (not a freshly wrapped
+	// ClosedError) so Succeeded can tell a normal remote close apart from a
+	// connection drop, which also surfaces as a ClosedError.
+	termRemoteClosed = drpc.ClosedError.New("remote closed the stream")
 )
 
 // SendError terminates the stream and sends the error to the remote. It is a
