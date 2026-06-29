@@ -16,7 +16,7 @@ import (
 
 // PoolMetrics holds optional metrics for connection pool monitoring.
 type PoolMetrics struct {
-	PoolSize              drpcmetrics.Gauge
+	PoolSize              drpcmetrics.LabeledGauge
 	ConnectionHitsTotal   drpcmetrics.LabeledCounter
 	ConnectionMissesTotal drpcmetrics.LabeledCounter
 }
@@ -81,7 +81,7 @@ func (p *Pool[K, V]) initPoolMetrics() {
 	// initialize the metrics with no-op implementations if they are nil
 	metrics := &p.opts.Metrics
 	if metrics.PoolSize == nil {
-		metrics.PoolSize = drpcmetrics.NoOpGauge{}
+		metrics.PoolSize = drpcmetrics.NoOpLabeledGauge{}
 	}
 	if metrics.ConnectionHitsTotal == nil {
 		metrics.ConnectionHitsTotal = drpcmetrics.NoOpLabeledCounter{}

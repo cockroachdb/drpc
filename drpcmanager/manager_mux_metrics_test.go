@@ -23,6 +23,12 @@ type muxCounter struct{ n *atomic.Int64 }
 
 func (c muxCounter) Inc(v int64) { c.n.Add(v) }
 
+// muxGauge is a drpcmetrics.Gauge backed by an atomic so the test can read the
+// latest value set by the manager from another goroutine.
+type muxGauge struct{ n *atomic.Int64 }
+
+func (g muxGauge) Update(v int64) { g.n.Store(v) }
+
 // drainConn reads and discards everything from c until it errors. net.Pipe is
 // synchronous and unbuffered, so without a reader the manager's frame writes
 // (invoke/message/close/cancel) would block.
@@ -38,7 +44,7 @@ func drainConn(ctx *drpctest.Tracker, c net.Conn) {
 }
 
 type muxCounters struct {
-	opened, closed, failed, recvBlocked atomic.Int64
+	opened, closed, failed, recvBlocked, writeBlocked atomic.Int64
 }
 
 func (m *muxCounters) bundle(shouldRecord func() bool) *drpcmetrics.MuxMetrics {
@@ -47,6 +53,7 @@ func (m *muxCounters) bundle(shouldRecord func() bool) *drpcmetrics.MuxMetrics {
 		StreamsClosed: muxCounter{&m.closed},
 		StreamsFailed: muxCounter{&m.failed},
 		RecvBlocked:   muxCounter{&m.recvBlocked},
+		Blocked:       muxGauge{&m.writeBlocked},
 		ShouldRecord:  shouldRecord,
 	}
 }
@@ -222,4 +229,76 @@ func TestManagerRecvBlockedGated(t *testing.T) {
 	on, onC := newManager(t, func() bool { return true })
 	on.onRecvBlock()
 	assert.Equal(t, onC.recvBlocked.Load(), int64(1))
+}
+
+// TestManagerWriteBlocked verifies the end-to-end write-backpressure path: with
+// a tiny write buffer and a transport whose writes never drain (no reader on
+// the other end), a stream writer parks on backpressure and the Blocked gauge
+// rises to one.
+func TestManagerWriteBlocked(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+	// Intentionally never read from sconn: the writer's run goroutine stalls on
+	// the first flush, so the pending buffer fills and producers park.
+
+	var c muxCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		Writer:     drpcwire.WriterOptions{MaximumBufferSize: 1},
+		MuxMetrics: c.bundle(func() bool { return true }),
+	})
+	defer func() { _ = cman.Close() }()
+
+	stream, err := cman.NewClientStream(ctx, "rpc")
+	assert.NoError(t, err)
+
+	// Keep writing; with the writer stalled and a 1-byte high-water mark, a
+	// writer soon parks on backpressure. RawWrite returns once the manager is
+	// closed during cleanup.
+	ctx.Run(func(context.Context) {
+		for {
+			if err := stream.RawWrite(drpcwire.KindMessage, []byte("x")); err != nil {
+				return
+			}
+		}
+	})
+
+	waitForCount(t, &c.writeBlocked, 1)
+}
+
+// TestManagerWriteBlockedGatedOff verifies that with gating off the Blocked
+// gauge is never touched, even though a writer does park on backpressure.
+func TestManagerWriteBlockedGatedOff(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	var c muxCounters
+	cman := NewWithOptions(cconn, Client, Options{
+		Writer:     drpcwire.WriterOptions{MaximumBufferSize: 1},
+		MuxMetrics: c.bundle(func() bool { return false }),
+	})
+	defer func() { _ = cman.Close() }()
+
+	stream, err := cman.NewClientStream(ctx, "rpc")
+	assert.NoError(t, err)
+
+	ctx.Run(func(context.Context) {
+		for {
+			if err := stream.RawWrite(drpcwire.KindMessage, []byte("x")); err != nil {
+				return
+			}
+		}
+	})
+
+	// A writer parks within milliseconds (the transport never drains), but with
+	// gating off the gauge must remain zero. Give it ample time to park.
+	time.Sleep(250 * time.Millisecond)
+	assert.Equal(t, c.writeBlocked.Load(), int64(0))
 }

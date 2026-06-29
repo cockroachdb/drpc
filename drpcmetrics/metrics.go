@@ -34,21 +34,32 @@ type NoOpLabeledCounter struct{}
 // Inc implements LabeledCounter.
 func (NoOpLabeledCounter) Inc(labels map[string]string, v int64) {}
 
-// Gauge is a metric that can increase and decrease (e.g. pool size).
-// Update sets the gauge to the given absolute value.
-//
-// Note: Gauge values may go up or down; Counter values must only increase.
-// The concrete type must provide a thread-safe implementation for the
-// method.
+// Gauge is a metric that can increase and decrease (e.g. a queue depth). Update
+// sets the gauge to the given absolute value. Callers hold a handle already
+// bound to its labels, so no labels are passed on the hot path. The concrete
+// type must provide a thread-safe implementation.
 type Gauge interface {
-	Update(labels map[string]string, v int64)
+	Update(v int64)
 }
 
 // NoOpGauge is a Gauge implementation that does nothing.
 type NoOpGauge struct{}
 
 // Update implements Gauge.
-func (NoOpGauge) Update(labels map[string]string, v int64) {}
+func (NoOpGauge) Update(v int64) {}
+
+// LabeledGauge is a gauge that accepts dimensional labels on each update. The
+// labels parameter contains key-value pairs for metric dimensions; it may be
+// nil. The concrete type must provide a thread-safe implementation.
+type LabeledGauge interface {
+	Update(labels map[string]string, v int64)
+}
+
+// NoOpLabeledGauge is a LabeledGauge implementation that does nothing.
+type NoOpLabeledGauge struct{}
+
+// Update implements LabeledGauge.
+func (NoOpLabeledGauge) Update(labels map[string]string, v int64) {}
 
 // meteredTransport wraps a Transport and increments byte counters on each
 // Read and Write call.
@@ -111,7 +122,10 @@ type MuxMetrics struct {
 	StreamsClosed Counter
 	StreamsFailed Counter
 	RecvBlocked   Counter
-	ShouldRecord  func() bool
+	// Blocked is the number of stream writers currently parked on connection
+	// write backpressure (the pending write buffer is at its high-water mark).
+	Blocked      Gauge
+	ShouldRecord func() bool
 }
 
 // WithDefaults returns a bundle with every nil field replaced by a no-op
@@ -134,6 +148,9 @@ func (m *MuxMetrics) WithDefaults() *MuxMetrics {
 	}
 	if out.RecvBlocked == nil {
 		out.RecvBlocked = NoOpCounter{}
+	}
+	if out.Blocked == nil {
+		out.Blocked = NoOpGauge{}
 	}
 	if out.ShouldRecord == nil {
 		out.ShouldRecord = func() bool { return true }

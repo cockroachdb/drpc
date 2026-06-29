@@ -138,8 +138,6 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 		kind:    kind,
 	}
 
-	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
-
 	m.mux = opts.MuxMetrics.WithDefaults()
 	// Build the per-stream receive-block hook once and share it across every
 	// stream on this connection. Gating is checked inside the hook so a slow
@@ -150,6 +148,17 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 			rb.Inc(1)
 		}
 	}
+
+	// The blocked-writers gauge tracks how many stream writers are parked on
+	// connection write backpressure. The writer invokes this under its lock, so
+	// the hook only does a gated, non-blocking gauge update.
+	blocked := m.mux.Blocked
+	opts.Writer.OnBlockedLen = func(n int) {
+		if sr() {
+			blocked.Update(int64(n))
+		}
+	}
+	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, opts.Writer)
 
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.

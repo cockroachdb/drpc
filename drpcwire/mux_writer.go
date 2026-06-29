@@ -23,6 +23,11 @@ type WriterOptions struct {
 	// ~2x this value: the pending buffer plus the in-flight buffer being
 	// written. When 0, it defaults to 1 MiB.
 	MaximumBufferSize int
+
+	// OnBlockedLen, if non-nil, is called with the current number of producers
+	// parked on backpressure whenever that count changes. It runs under the
+	// writer lock, so it must be cheap and must not block.
+	OnBlockedLen func(n int)
 }
 
 // MuxWriter serializes frames from many concurrent streams onto a single
@@ -34,9 +39,10 @@ type WriterOptions struct {
 // until run frees space, the caller cancels, or the writer is stopped. This is
 // the connection-level backpressure that keeps memory bounded.
 type MuxWriter struct {
-	w       io.Writer
-	onError func(error)
-	maxBuf  int // high-water mark for buf; producers block at or above it
+	w            io.Writer
+	onError      func(error)
+	onBlockedLen func(n int)
+	maxBuf       int // high-water mark for buf; producers block at or above it
 
 	mu       sync.Mutex
 	cond     *sync.Cond    // signaled by WriteFrame when buf becomes non-empty; awaited by run
@@ -61,12 +67,13 @@ func NewMuxWriterWithOptions(w io.Writer, onError func(error), opts WriterOption
 	}
 
 	mw := &MuxWriter{
-		w:       w,
-		onError: onError,
-		maxBuf:  opts.MaximumBufferSize,
-		buf:     make([]byte, 0, defaultBufferCapacity),
-		done:    make(chan struct{}),
-		drain:   make(chan struct{}),
+		w:            w,
+		onError:      onError,
+		onBlockedLen: opts.OnBlockedLen,
+		maxBuf:       opts.MaximumBufferSize,
+		buf:          make([]byte, 0, defaultBufferCapacity),
+		done:         make(chan struct{}),
+		drain:        make(chan struct{}),
 	}
 	mw.cond = sync.NewCond(&mw.mu)
 	go mw.run()
@@ -159,6 +166,9 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel *drpcsignal.Signal) (err error)
 		// on the field instead of the snapshot would miss that wakeup.
 		ch := mw.drain
 		mw.blocked++
+		if mw.onBlockedLen != nil {
+			mw.onBlockedLen(mw.blocked)
+		}
 		mw.mu.Unlock()
 
 		// Resolve the cancel channel lazily, only now that we are parking, so the
@@ -174,15 +184,24 @@ func (mw *MuxWriter) WriteFrame(fr Frame, cancel *drpcsignal.Signal) (err error)
 			// Space may be available now; loop and re-check.
 			mw.mu.Lock()
 			mw.blocked--
+			if mw.onBlockedLen != nil {
+				mw.onBlockedLen(mw.blocked)
+			}
 			mw.mu.Unlock()
 		case <-cancelCh:
 			mw.mu.Lock()
 			mw.blocked--
+			if mw.onBlockedLen != nil {
+				mw.onBlockedLen(mw.blocked)
+			}
 			mw.mu.Unlock()
 			return cancel.Err()
 		case <-mw.done:
 			mw.mu.Lock()
 			mw.blocked--
+			if mw.onBlockedLen != nil {
+				mw.onBlockedLen(mw.blocked)
+			}
 			err := mw.closeErr // can be nil
 			mw.mu.Unlock()
 			return err
