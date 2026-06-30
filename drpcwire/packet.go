@@ -36,6 +36,11 @@ const (
 
 	// KindInvokeMetadata includes metadata about the next Invoke packet.
 	KindInvokeMetadata Kind = 7
+
+	// KindWindowUpdate carries a flow-control credit grant: a varint byte delta
+	// for the frame's stream id. Stream id 0 is reserved for a future
+	// connection-level window and is unused in v1.
+	KindWindowUpdate Kind = 8
 )
 
 //
@@ -141,6 +146,35 @@ func AppendFrame(buf []byte, fr Frame) []byte {
 	out = AppendVarint(out, uint64(len(fr.Data)))
 	out = append(out, fr.Data...)
 	return out
+}
+
+// WindowUpdateFrame builds a KindWindowUpdate grant frame. Callers must pass a
+// real stream id (>0; 0 is reserved) and a positive delta, the conditions
+// ParseWindowUpdate enforces.
+func WindowUpdateFrame(streamID, delta uint64) Frame {
+	return Frame{
+		Data:    AppendVarint(nil, delta),
+		ID:      ID{Stream: streamID},
+		Kind:    KindWindowUpdate,
+		Done:    true,
+		Control: true,
+	}
+}
+
+// ParseWindowUpdate returns a grant frame's stream id and delta. ok is false
+// unless the frame conforms to the wire contract, so the caller drops
+// non-conforming frames rather than acting on them.
+func ParseWindowUpdate(fr Frame) (streamID, delta uint64, ok bool) {
+	// A self-contained control frame for a real stream; the message id is
+	// unchecked since grants are intercepted before packet assembly.
+	if fr.Kind != KindWindowUpdate || !fr.Control || !fr.Done || fr.ID.Stream == 0 {
+		return 0, 0, false
+	}
+	rem, d, parsed, err := ReadVarint(fr.Data)
+	if !parsed || err != nil || len(rem) != 0 || d == 0 { // positive delta, no trailing bytes
+		return 0, 0, false
+	}
+	return fr.ID.Stream, d, true
 }
 
 //

@@ -15,11 +15,12 @@ func _() {
 	_ = x[KindClose-5]
 	_ = x[KindCloseSend-6]
 	_ = x[KindInvokeMetadata-7]
+	_ = x[KindWindowUpdate-8]
 }
 
-const _Kind_name = "InvokeMessageErrorCancelCloseCloseSendInvokeMetadata"
+const _Kind_name = "InvokeMessageErrorCancelCloseCloseSendInvokeMetadataWindowUpdate"
 
-var _Kind_index = [...]uint8{0, 6, 13, 18, 24, 29, 38, 52}
+var _Kind_index = [...]uint8{0, 6, 13, 18, 24, 29, 38, 52, 64}
 
 func (i Kind) String() string {
 	i -= 1
