@@ -36,6 +36,15 @@ const (
 
 	// KindInvokeMetadata includes metadata about the next Invoke packet.
 	KindInvokeMetadata Kind = 7
+
+	// KindWindowUpdate carries a flow-control credit grant: a varint byte delta
+	// in the body for the stream named by the frame's stream id. Stream id 0 is
+	// reserved for a possible future connection-level window and is unused in v1.
+	// The control bit marks it as out-of-band signaling (so it is emitted without
+	// blocking on data backpressure); it is not relied on for backward
+	// compatibility — grants are only ever sent once flow control is active
+	// cluster-wide, so a peer that predates flow control never receives one.
+	KindWindowUpdate Kind = 8
 )
 
 //
