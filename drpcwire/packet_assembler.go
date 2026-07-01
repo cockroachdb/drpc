@@ -16,6 +16,9 @@ type PacketAssembler struct {
 	pk                Packet
 	assembling        bool
 	streamInitialized bool
+
+	discardedKind Kind
+	discardedLen  int
 }
 
 // NewPacketAssembler returns a new PacketAssembler ready to assemble frames.
@@ -41,12 +44,26 @@ func (pa *PacketAssembler) Reset() {
 	}
 	pa.assembling = false
 	pa.streamInitialized = false
+	pa.discardedKind, pa.discardedLen = 0, 0
+}
+
+// TakeDiscarded returns the kind and payload byte count of an unfinished
+// message dropped by the most recent AppendFrame (a higher message id
+// superseded it), and clears the record. n is 0 when nothing was dropped.
+func (pa *PacketAssembler) TakeDiscarded() (kind Kind, n int) {
+	kind, n = pa.discardedKind, pa.discardedLen
+	pa.discardedKind, pa.discardedLen = 0, 0
+	return kind, n
 }
 
 // AppendFrame adds a frame to the in-progress packet. It returns the completed
 // packet and true when a frame with Done=true is received. It returns false
 // when more frames are needed to complete the packet.
 func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady bool, err error) {
+	// A discard record is scoped to the most recent AppendFrame (see
+	// TakeDiscarded); clear any stale one before possibly setting a fresh one.
+	pa.discardedKind, pa.discardedLen = 0, 0
+
 	// Enforce stream ID consistency: infer from first frame or reject mismatches.
 	if !pa.streamInitialized {
 		pa.pk.ID.Stream = fr.ID.Stream
@@ -60,7 +77,11 @@ func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady boo
 		return Packet{}, false, drpc.ProtocolError.New(
 			"message id monotonicity violation: got %v, expected >= %v", fr.ID.Message, pa.pk.ID.Message)
 	} else if fr.ID.Message > pa.pk.ID.Message || !pa.assembling {
-		// New message: reset the buffer and start assembling.
+		// New message: reset and start assembling. Record any dropped
+		// unfinished bytes so byte-accounting callers can release them.
+		if pa.assembling && len(pa.pk.Data) > 0 {
+			pa.discardedKind, pa.discardedLen = pa.pk.Kind, len(pa.pk.Data)
+		}
 		pa.pk.Data = pa.pk.Data[:0]
 		pa.assembling = true
 		pa.pk.ID.Message = fr.ID.Message
