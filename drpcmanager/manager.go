@@ -25,6 +25,10 @@ import (
 
 var managerClosed = errs.Class("manager closed")
 
+// maxStreamsExceeded is returned to a peer whose inbound stream is refused
+// because the manager is already at its concurrent-stream cap.
+var maxStreamsExceeded = errs.Class("too many concurrent streams")
+
 // Options controls configuration settings for a manager.
 type Options struct {
 	// Reader are passed to any readers the manager creates.
@@ -56,6 +60,13 @@ type Options struct {
 	// handling. When enabled, the server stream will decode incoming metadata
 	// into grpc metadata in the context.
 	GRPCMetadataCompatMode bool
+
+	// MaxStreams caps the number of concurrent streams the peer may open against
+	// this manager. When the cap is reached, further inbound streams are refused
+	// with a stream-level error rather than admitted, bounding the per-stream
+	// bookkeeping (goroutines, stream-table entries) that byte windows do not.
+	// 0 means unlimited.
+	MaxStreams int
 }
 
 // Manager handles the logic of managing a transport for a drpc client or
@@ -294,6 +305,16 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 		return nil
 	}
 
+	// Enforce the concurrent-stream cap before admitting the stream. Refuse it
+	// here, in the read path, so the per-stream state the cap protects is never
+	// allocated; the peer learns via a stream-level error and the connection
+	// stays up.
+	if m.opts.MaxStreams > 0 && m.streams.Len() >= m.opts.MaxStreams {
+		m.rejectStream(pkt.ID.Stream)
+		delete(m.pendingStreams, fr.ID.Stream)
+		return nil
+	}
+
 	// Invoke packet completes the sequence. Send to NewServerStream.
 	select {
 	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: ps.metadata}:
@@ -306,6 +327,23 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	case <-m.sigs.term.Signal():
 	}
 	return nil
+}
+
+// rejectStream refuses an inbound stream that would exceed MaxStreams by
+// sending a stream-level KindError to the peer. The control bit is set so the
+// frame is appended immediately without blocking the reader goroutine on write
+// backpressure (as with an abortive cancel). No stream is created.
+func (m *Manager) rejectStream(sid uint64) {
+	err := maxStreamsExceeded.New("refused: at most %d concurrent streams", m.opts.MaxStreams)
+	// Message id 1: this is the first (and only) frame the peer receives on the
+	// refused stream, and its receive assembler expects ids to start at 1.
+	_ = m.wr.WriteFrame(drpcwire.Frame{
+		ID:      drpcwire.ID{Stream: sid, Message: 1},
+		Kind:    drpcwire.KindError,
+		Data:    drpcwire.MarshalError(err),
+		Done:    true,
+		Control: true,
+	}, nil)
 }
 
 //
