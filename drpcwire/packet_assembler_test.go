@@ -87,6 +87,69 @@ func TestPacketAssembler_HigherMsgDiscardsInProgress(t *testing.T) {
 	assert.NoError(t, err)
 	assert.That(t, ready)
 	assert.DeepEqual(t, pkt.Data, []byte("kept"))
+
+	// The dropped bytes are reported once so byte accounting can release them.
+	kind, n := pa.TakeDiscarded()
+	assert.Equal(t, kind, KindMessage)
+	assert.Equal(t, n, len("discard"))
+	_, n = pa.TakeDiscarded()
+	assert.Equal(t, n, 0)
+}
+
+// A completed message followed by the next message id is not a discard.
+func TestPacketAssembler_CompletedMessageNotReportedDiscarded(t *testing.T) {
+	pa := NewPacketAssembler()
+	pa.SetStreamID(1)
+
+	_, ready, err := pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("done"), Done: true,
+	})
+	assert.NoError(t, err)
+	assert.That(t, ready)
+
+	_, ready, err = pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Data: []byte("next"), Done: true,
+	})
+	assert.NoError(t, err)
+	assert.That(t, ready)
+
+	_, n := pa.TakeDiscarded()
+	assert.Equal(t, n, 0)
+}
+
+// Discard state is scoped to the most recent AppendFrame: a later
+// non-discarding append clears an undrained record, and Reset drops it too.
+func TestPacketAssembler_DiscardStateNotStale(t *testing.T) {
+	pa := NewPacketAssembler()
+	pa.SetStreamID(1)
+
+	_, _, err := pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("old"), Done: false,
+	})
+	assert.NoError(t, err)
+	_, _, err = pa.AppendFrame(Frame{ // supersedes m1: discard recorded
+		ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Data: []byte("a"), Done: false,
+	})
+	assert.NoError(t, err)
+	_, _, err = pa.AppendFrame(Frame{ // non-discarding: undrained record cleared
+		ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Data: []byte("b"), Done: true,
+	})
+	assert.NoError(t, err)
+	_, n := pa.TakeDiscarded()
+	assert.Equal(t, n, 0)
+
+	// Reset clears a pending record as well.
+	_, _, err = pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 3}, Kind: KindMessage, Data: []byte("old"), Done: false,
+	})
+	assert.NoError(t, err)
+	_, _, err = pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 4}, Kind: KindMessage, Data: []byte("new"), Done: true,
+	})
+	assert.NoError(t, err)
+	pa.Reset()
+	_, n = pa.TakeDiscarded()
+	assert.Equal(t, n, 0)
 }
 
 // Continuation frames (same message ID, mid-assembly) must carry the same

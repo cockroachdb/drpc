@@ -65,6 +65,10 @@ type Stream struct {
 	// flow control is not enabled, in which case data writes are ungated.
 	sendw *sendWindow
 
+	// recvw is the per-stream receive-side flow-control policy. It is nil when
+	// flow control is not enabled, in which case no grants are emitted.
+	recvw *recvWindow
+
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
 		send drpcsignal.Signal // set when done sending messages
@@ -220,10 +224,38 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 		return nil
 	}
 
+	// Grants are out-of-band signaling: intercept before the assembler so one
+	// arriving mid-message cannot disturb reassembly. Without a send window
+	// (flow control disabled) the grant is ignored.
+	if fr.Kind == drpcwire.KindWindowUpdate {
+		if s.sendw != nil {
+			if _, delta, ok := drpcwire.ParseWindowUpdate(fr); ok {
+				s.sendw.grant(delta)
+			}
+		}
+		return nil
+	}
+
 	packet, packetReady, err := s.pa.AppendFrame(fr)
 	if err != nil {
 		return err
 	}
+
+	// Release bytes the assembler discarded (an unfinished message superseded
+	// by a higher id). Deferred so the gate decision sees the final buffered
+	// state and a terminal packet suppresses the grant (emitGrant checks term).
+	defer func() {
+		if kind, n := s.pa.TakeDiscarded(); n > 0 && kind == drpcwire.KindMessage && s.recvw != nil {
+			s.emitGrant(s.recvw.consumed(int64(n)))
+		}
+	}()
+
+	// Accrue credit for a dispatched data frame; granted now or when the
+	// high-water gate reopens.
+	if fr.Kind == drpcwire.KindMessage && s.recvw != nil {
+		s.emitGrant(s.recvw.dispatched(int64(len(fr.Data))))
+	}
+
 	if !packetReady {
 		return nil
 	}
@@ -287,6 +319,17 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 		s.terminate(err)
 		return err
 	}
+}
+
+// emitGrant sends a credit grant of delta bytes; no-op unless delta is
+// positive and the stream is live (no credit behind a terminal frame).
+// Control frames append without blocking, so the reader may call this.
+// Best-effort: a write error means the stream is going away.
+func (s *Stream) emitGrant(delta int64) {
+	if delta <= 0 || s.sigs.term.IsSet() {
+		return
+	}
+	_ = s.wr.WriteFrame(drpcwire.WindowUpdateFrame(s.id.Stream, uint64(delta)), nil)
 }
 
 //
@@ -463,6 +506,7 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 		return nil, err
 	}
 	defer s.recvQueue.Done()
+	n := len(b) // wire bytes, pre-decompression: matches dispatch accounting
 
 	if s.opts.Compression != drpc.CompressionNone {
 		s.dbuf, err = drpcwire.Decompress(s.opts.Compression, s.dbuf[:0], b)
@@ -473,6 +517,10 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	}
 	data = append([]byte(nil), b...)
 
+	// Consuming may reopen the gate, releasing credit accrued at dispatch.
+	if s.recvw != nil {
+		s.emitGrant(s.recvw.consumed(int64(n)))
+	}
 	return data, nil
 }
 
@@ -515,6 +563,7 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 		return err
 	}
 	defer s.recvQueue.Done()
+	n := len(b) // wire bytes, pre-decompression: matches dispatch accounting
 
 	if s.opts.Compression != drpc.CompressionNone {
 		s.dbuf, err = drpcwire.Decompress(s.opts.Compression, s.dbuf[:0], b)
@@ -525,6 +574,10 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 	}
 	err = enc.Unmarshal(b, msg)
 
+	// Consuming may reopen the gate, releasing credit accrued at dispatch.
+	if s.recvw != nil {
+		s.emitGrant(s.recvw.consumed(int64(n)))
+	}
 	return err
 }
 
