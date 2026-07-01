@@ -30,8 +30,33 @@ type Options struct {
 	// more allocations. 0 is unlimited.
 	MaximumBufferSize int
 
+	// FlowControl configures per-stream flow control. It is disabled by default.
+	FlowControl FlowControl
+
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Stream
+}
+
+// FlowControl configures per-stream flow control. When Enabled, the stream
+// installs a send window (data writes acquire credit before going on the wire)
+// and a receive window (grants are returned as data is dispatched and
+// consumed). It is the caller's responsibility to size these so the liveness
+// rule StreamWindow >= 2*SplitSize holds.
+type FlowControl struct {
+	// Enabled turns per-stream flow control on for the stream.
+	Enabled bool
+
+	// StreamWindow is the per-stream send window: the initial send credit and
+	// the nominal window size.
+	StreamWindow int64
+
+	// HighWater is the receive-side buffered-byte high-water mark above which
+	// grants are withheld.
+	HighWater int64
+
+	// GrantThreshold is the amount of returnable credit that must accrue before
+	// a grant is emitted, coalescing many frames into one KindWindowUpdate.
+	GrantThreshold int64
 }
 
 // Stream represents an rpc actively happening on a transport.
@@ -122,6 +147,14 @@ func NewWithOptions(
 	}
 
 	s.recvQueue.init(pool)
+
+	// When flow control is enabled, install the per-stream windows. The send
+	// window starts with StreamWindow credit (statically agreed with the peer);
+	// the receive window drives grant emission.
+	if opts.FlowControl.Enabled {
+		s.sendw = newSendWindow(opts.FlowControl.StreamWindow)
+		s.recvw = newRecvWindow(opts.FlowControl.HighWater, opts.FlowControl.GrantThreshold)
+	}
 
 	return s
 }
