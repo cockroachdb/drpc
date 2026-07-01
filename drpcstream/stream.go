@@ -55,6 +55,10 @@ type Stream struct {
 	recvQueue ringBuffer
 	wbuf      []byte
 
+	// sendw is the per-stream send-side flow-control window. It is nil when
+	// flow control is not enabled, in which case data writes are ungated.
+	sendw *sendWindow
+
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
 		send drpcsignal.Signal // set when done sending messages
@@ -352,6 +356,9 @@ func (s *Stream) terminate(err error) {
 	s.sigs.recv.Set(err)
 	s.sigs.term.Set(err)
 	s.recvQueue.Close(err)
+	if s.sendw != nil {
+		s.sendw.close(err)
+	}
 	s.checkFinished()
 }
 
@@ -404,6 +411,17 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
+
+		// Flow control: a data frame must acquire send credit before it goes on
+		// the wire. Only KindMessage is flow-controlled; control frames (e.g.
+		// invoke/metadata) bypass. When no window is installed (the default),
+		// sends are ungated. acquire blocks until credit arrives and is
+		// interruptible by stream termination, which closes the window.
+		if kind == drpcwire.KindMessage && s.sendw != nil {
+			if err := s.sendw.acquire(s.Context(), int64(len(fr.Data))); err != nil {
+				return err
+			}
+		}
 
 		// Pass the send signal, the write side's own stop signal, so a parked
 		// WriteFrame is woken when sending ends (cancel, error, close) and
