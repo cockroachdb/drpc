@@ -464,6 +464,19 @@ func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
 // appropriate locks.
 // TODO(shubham): can we merge this with sendPacketLocked?
 func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
+	// Flow control bounds a single message to the implicit maximum of
+	// high_water + window: a larger message can never complete (the sender runs
+	// out of credit with the receiver's buffer full and nothing to drain), so
+	// reject it up front rather than parking on a message that would deadlock.
+	// This is checked against the local configuration, which under static
+	// symmetric enablement matches the peer's; a non-compliant peer is a
+	// separate, receiver-side concern.
+	if kind == drpcwire.KindMessage && s.sendw != nil {
+		if maxMsg := s.opts.FlowControl.HighWater + s.opts.FlowControl.StreamWindow; maxMsg > 0 && int64(len(data)) > maxMsg {
+			return errs.New("flow control: message of %d bytes exceeds the maximum of %d bytes (high_water + window)", len(data), maxMsg)
+		}
+	}
+
 	fr := s.newFrameLocked(kind)
 	n := s.opts.SplitSize
 

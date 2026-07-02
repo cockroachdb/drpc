@@ -5,6 +5,7 @@ package drpcstream
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,4 +68,32 @@ func TestStream_FlowControlOptionGatesAndResumes(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("write did not resume after grant")
 	}
+}
+
+// A message larger than the implicit maximum (high_water + window) is rejected
+// up front rather than parking the sender on a message that can never complete.
+func TestStream_FlowControlRejectsOversizedMessage(t *testing.T) {
+	mw := testMuxWriter(t)
+	st := NewWithOptions(context.Background(), 1, mw, NewBufferPool(), Options{
+		SplitSize:   64 << 10,
+		FlowControl: FlowControl{Enabled: true, StreamWindow: 256, HighWater: 1024, GrantThreshold: 128},
+	})
+	// maxMsg = HighWater + StreamWindow = 1280.
+	done := make(chan error, 1)
+	go func() { done <- st.RawWrite(drpcwire.KindMessage, make([]byte, 1281)) }()
+
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+		assert.That(t, strings.Contains(err.Error(), "exceeds"))
+	case <-time.After(time.Second):
+		t.Fatal("oversized message did not fail fast (it parked on credit instead)")
+	}
+}
+
+// With flow control disabled there is no implicit message-size limit.
+func TestStream_NoFlowControlNoMessageSizeLimit(t *testing.T) {
+	mw := testMuxWriter(t)
+	st := NewWithOptions(context.Background(), 1, mw, NewBufferPool(), Options{SplitSize: 64 << 10})
+	assert.NoError(t, st.RawWrite(drpcwire.KindMessage, make([]byte, 256<<10)))
 }
