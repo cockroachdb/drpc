@@ -6,6 +6,7 @@ package drpcstream
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,4 +140,32 @@ func TestStream_NoWindowsNoGrants(t *testing.T) {
 	assertNoFrame(t, frames)
 
 	assert.NoError(t, st.HandleFrame(drpcwire.WindowUpdateFrame(st.ID(), 100)))
+}
+
+// The receiver defends against a peer that does not honor the max-message
+// bound: an incoming message that grows past the implicit maximum (high_water +
+// window) can never complete, so the stream is failed with a data-overflow
+// error and the peer is notified with an abortive cancel. The connection stays
+// up (HandleFrame returns nil).
+func TestStream_ReceiverRejectsOversizedMessage(t *testing.T) {
+	mw, frames := captureWriter(t)
+	st := NewWithOptions(context.Background(), 1, mw, NewBufferPool(), Options{
+		SplitSize:   64 << 10,
+		FlowControl: FlowControl{Enabled: true, StreamWindow: 256, HighWater: 1024, GrantThreshold: 128},
+	})
+	sid := st.ID()
+	// maxMsg = HighWater + StreamWindow = 1280.
+	assert.NoError(t, st.HandleFrame(msgFrame(sid, 1, make([]byte, 1024), false)))
+	// This frame pushes the in-progress message to 1324 > 1280 without a Done,
+	// so it can never complete: the receiver must fail the stream.
+	assert.NoError(t, st.HandleFrame(msgFrame(sid, 1, make([]byte, 300), false)))
+
+	// The peer is notified with a cancel.
+	fr := waitFrame(t, frames)
+	assert.Equal(t, fr.Kind, drpcwire.KindCancel)
+
+	// The local stream is failed with the data-overflow error.
+	_, err := st.RawRecv()
+	assert.Error(t, err)
+	assert.That(t, strings.Contains(err.Error(), "exceeds"))
 }

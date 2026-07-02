@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,4 +139,62 @@ func TestManager_FlowControlContextCancelWakesParkedSend(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("parked send did not wake on context cancellation")
 	}
+}
+
+// A peer that does not honor the receiver's implicit maximum message size is
+// caught on receipt: the server's window is small, and a client with a much
+// larger window sends a message that exceeds the server's maximum. The server
+// fails that stream with a data-overflow error while the connection stays up.
+func TestManager_FlowControlReceiverRejectsOversizedMessage(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	// The client's window is large enough to send the whole message immediately
+	// without waiting for grants and without tripping its own sender-side limit;
+	// the server's window is small, so the message exceeds the server's implicit
+	// maximum (high_water + window) and must be rejected on receipt.
+	cman := NewWithOptions(cconn, Client, Options{Stream: drpcstream.Options{
+		SplitSize: 64 << 10,
+		FlowControl: drpcstream.FlowControl{
+			Enabled: true, StreamWindow: 1 << 20, HighWater: 8 << 20, GrantThreshold: 256 << 10,
+		},
+	}})
+	defer func() { _ = cman.Close() }()
+	sman := NewWithOptions(sconn, Server, Options{Stream: drpcstream.Options{
+		SplitSize: 64 << 10,
+		FlowControl: drpcstream.FlowControl{
+			Enabled: true, StreamWindow: 64 << 10, HighWater: 64 << 10, GrantThreshold: 32 << 10,
+		},
+	}})
+	defer func() { _ = sman.Close() }()
+
+	// 256 KiB exceeds the server's 128 KiB implicit maximum (64 KiB high-water +
+	// 64 KiB window).
+	msg := make([]byte, 256<<10)
+
+	ctx.Run(func(ctx context.Context) {
+		stream, err := cman.NewClientStream(ctx, "rpc")
+		assert.NoError(t, err)
+		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("rpc")))
+		// Best-effort: the send may complete (credit is ample) or fail once the
+		// server's cancel arrives; either way the server must reject the message.
+		_ = stream.RawWrite(drpcwire.KindMessage, msg)
+		_ = stream.Close()
+	})
+
+	ctx.Run(func(ctx context.Context) {
+		stream, _, err := sman.NewServerStream(ctx)
+		assert.NoError(t, err)
+		defer func() { _ = stream.Close() }()
+
+		_, err = stream.RawRecv()
+		assert.Error(t, err)
+		assert.That(t, strings.Contains(err.Error(), "exceeds"))
+	})
+
+	ctx.Wait()
 }

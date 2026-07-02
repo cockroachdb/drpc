@@ -88,6 +88,12 @@ type Stream struct {
 	// flow control is not enabled, in which case no grants are emitted.
 	recvw *recvWindow
 
+	// recvMsgBytes tracks the size of the in-progress inbound message so an
+	// oversized message (one the sender could never legitimately complete) can
+	// be detected. It is touched only from the reader goroutine (HandleFrame)
+	// and reset when a message completes.
+	recvMsgBytes int64
+
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
 		send drpcsignal.Signal // set when done sending messages
@@ -269,7 +275,26 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 
 	// A data frame dispatched off the wire may return credit to the sender.
 	if fr.Kind == drpcwire.KindMessage && s.recvw != nil {
+		s.recvMsgBytes += int64(len(fr.Data))
+
+		// Receiver-side defense against a peer that does not honor the implicit
+		// maximum message size (high_water + window): such a message can never
+		// complete -- once it reaches the maximum the sender is out of credit
+		// with our buffer full -- so we would otherwise buffer up to the limit
+		// and then stall. Fail the stream with a data-overflow error and notify
+		// the peer with an abortive cancel; the connection stays up. SendCancel
+		// is safe from the reader goroutine because it terminates before taking
+		// the write lock. A zero bound means unlimited (windows not sized).
+		if maxMsg := s.opts.FlowControl.HighWater + s.opts.FlowControl.StreamWindow; maxMsg > 0 &&
+			(s.recvMsgBytes > maxMsg || (s.recvMsgBytes == maxMsg && !fr.Done)) {
+			_ = s.SendCancel(errs.New("flow control: received message exceeds the maximum of %d bytes (high_water + window)", maxMsg))
+			return nil
+		}
+
 		s.emitGrant(s.recvw.dispatched(int64(len(fr.Data))))
+		if fr.Done {
+			s.recvMsgBytes = 0
+		}
 	}
 
 	if !packetReady {
