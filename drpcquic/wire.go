@@ -6,6 +6,7 @@ package drpcquic
 import (
 	"crypto/tls"
 	"net"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
@@ -57,17 +58,38 @@ func ensureALPN(tlsConf *tls.Config) *tls.Config {
 	return tlsConf
 }
 
+// quicConfig returns the QUIC connection tuning shared by Dial and Listen.
+//
+// MaxIncomingStreams is the load-bearing setting: quic-go defaults to 100, and
+// since every drpc RPC opens its own QUIC stream, a connection carrying >100
+// concurrent RPCs would make the peer's OpenStreamSync block waiting for stream
+// credits — stalling latency-sensitive RPCs (e.g. connection heartbeats) until
+// they time out and the connection is torn down. Raise it well above any
+// realistic per-connection concurrency.
+//
+// KeepAlivePeriod keeps an otherwise-idle connection alive: the QUIC idle
+// timeout is connection-scoped, so without keepalive one quiet period would drop
+// every stream multiplexed on the connection.
+func quicConfig() *quic.Config {
+	const idle = 30 * time.Second
+	return &quic.Config{
+		MaxIdleTimeout:     idle,
+		KeepAlivePeriod:    idle / 2,
+		MaxIncomingStreams: 1 << 16,
+	}
+}
+
 // Listen starts a QUIC listener for DRPC on addr. tlsConf must carry a server
 // certificate (QUIC is secure-only); the DRPC ALPN is forced automatically.
 func Listen(addr string, tlsConf *tls.Config) (*quic.Listener, error) {
 	// 1-RTT quic.ListenAddr, not the 0-RTT "early" variant: 0-RTT early data is
 	// replayable and is deliberately deferred (see the note in Dial).
-	return quic.ListenAddr(addr, ensureALPN(tlsConf), nil)
+	return quic.ListenAddr(addr, ensureALPN(tlsConf), quicConfig())
 }
 
 // ListenPacket is like Listen but over a caller-owned UDP socket, for callers
 // that want to own socket creation (e.g. sharing a port). tlsConf must carry a
 // server certificate; the DRPC ALPN is forced automatically.
 func ListenPacket(conn net.PacketConn, tlsConf *tls.Config) (*quic.Listener, error) {
-	return quic.Listen(conn, ensureALPN(tlsConf), nil)
+	return quic.Listen(conn, ensureALPN(tlsConf), quicConfig())
 }

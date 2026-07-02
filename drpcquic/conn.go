@@ -53,7 +53,7 @@ func DialWithOptions(
 	// 1-RTT quic.DialAddr, not the 0-RTT "early" variant (quic.DialAddrEarly):
 	// 0-RTT early data is replayable and would require classifying RPCs as
 	// replay-safe before sending on it; revisit if/when we want 0-RTT.
-	qconn, err := quic.DialAddr(ctx, addr, ensureALPN(tlsConf), nil)
+	qconn, err := quic.DialAddr(ctx, addr, ensureALPN(tlsConf), quicConfig())
 	if err != nil {
 		return nil, err
 	}
