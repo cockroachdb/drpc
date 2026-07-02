@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"storj.io/drpc"
-	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpcquic"
 	"storj.io/drpc/drpcserver"
 )
@@ -49,8 +48,9 @@ func devTLS() (server, client *tls.Config) {
 	}
 	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
-	server = &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{drpcquic.ALPN}}
-	client = &tls.Config{InsecureSkipVerify: true, NextProtos: []string{drpcquic.ALPN}} //nolint:gosec
+	// The drpcquic ALPN is forced by Dial/Listen, so callers need not set it.
+	server = &tls.Config{Certificates: []tls.Certificate{cert}}
+	client = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	return
 }
 
@@ -58,17 +58,18 @@ func main() {
 	ctx := context.Background()
 	serverTLS, clientTLS := devTLS()
 
-	ln, err := drpcquic.Listen("127.0.0.1:0", serverTLS, drpcquic.Options{})
+	ln, err := drpcquic.Listen("127.0.0.1:0", serverTLS)
 	if err != nil {
 		log.Fatal(err)
 	}
-	go func() { _ = drpcquic.Serve(ctx, ln, drpcserver.New(echo{}), drpcquic.Options{}) }()
+	go func() { _ = drpcserver.New(echo{}).ServeQuic(ctx, ln) }()
 
-	mt, err := drpcquic.Dial(ctx, ln.Addr().String(), clientTLS, drpcquic.Options{})
+	// Dial returns a *QuicConn, which implements drpc.Conn directly — no
+	// drpcconn wrapper needed (each Invoke opens its own QUIC stream).
+	conn, err := drpcquic.Dial(ctx, ln.Addr().String(), clientTLS)
 	if err != nil {
 		log.Fatal(err)
 	}
-	conn := drpcconn.NewFromMultiplexed(mt, drpcconn.Options{})
 	defer conn.Close()
 
 	var wg sync.WaitGroup
