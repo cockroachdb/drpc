@@ -7,12 +7,16 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/zeebo/assert"
 	"github.com/zeebo/errs"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"storj.io/drpc"
 	"storj.io/drpc/drpctest"
@@ -498,4 +502,52 @@ func TestStream_SendCancelPreemptsBlockedSend(t *testing.T) {
 	// The cancel frame is queued; draining lets it reach the wire.
 	close(bw.unblock)
 	waitForKind(t, bw.wrote, drpcwire.KindCancel)
+}
+
+// failWriter fails every Write with err. It models a torn-down transport whose
+// writes no longer reach the peer.
+type failWriter struct{ err error }
+
+func (w *failWriter) Write(p []byte) (int, error) { return 0, w.err }
+
+// rawTestEncoding is a trivial Encoding: MsgSend needs something to marshal, and
+// the payload is irrelevant to this test, so it emits a fixed byte slice.
+type rawTestEncoding struct{}
+
+func (rawTestEncoding) Marshal(drpc.Message) ([]byte, error) { return []byte("ping"), nil }
+func (rawTestEncoding) Unmarshal([]byte, drpc.Message) error { return nil }
+
+// TestStream_WriteFailureMapsToUnavailable asserts the end-to-end contract that
+// connection-liveness checks depend on: once the underlying transport write
+// fails (e.g. a "broken pipe" on a torn-down connection), a subsequent MsgSend
+// surfaces codes.Unavailable, not codes.Unknown. MuxWriter classifies the failed
+// write as a drpc.ConnectionError at the source and drpc.ToRPCErr (applied by
+// MsgSend) maps that class to Unavailable.
+func TestStream_WriteFailureMapsToUnavailable(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	// A write to a torn-down TCP connection surfaces as *net.OpError wrapping
+	// EPIPE ("broken pipe"); this is the raw error MuxWriter must classify.
+	brokenPipe := &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}
+	mw := drpcwire.NewMuxWriter(&failWriter{err: brokenPipe}, func(error) {})
+	t.Cleanup(func() { mw.Stop(nil); <-mw.Done() })
+
+	st := New(ctx, 1, mw, NewBufferPool())
+
+	// The first send only buffers a frame and returns before the writer
+	// goroutine attempts (and fails) the flush, so it succeeds. The flush then
+	// fails and closes the writer with the classified error.
+	assert.NoError(t, st.MsgSend(nil, rawTestEncoding{}))
+
+	// Synchronize on the writer goroutine observing the failure and exiting, so
+	// the closeErr is set before the next send.
+	<-mw.Done()
+
+	// A future send must now report the connection as unavailable.
+	err := st.MsgSend(nil, rawTestEncoding{})
+	assert.Error(t, err)
+	s, ok := status.FromError(err)
+	assert.That(t, ok)
+	assert.Equal(t, s.Code(), codes.Unavailable)
 }

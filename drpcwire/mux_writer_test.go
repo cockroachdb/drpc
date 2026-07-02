@@ -13,6 +13,7 @@ import (
 
 	"github.com/zeebo/assert"
 
+	"storj.io/drpc"
 	"storj.io/drpc/drpcsignal"
 )
 
@@ -183,7 +184,11 @@ func TestMuxWriter_WriteErrorCallsOnError(t *testing.T) {
 
 	select {
 	case err := <-gotErr:
-		assert.Equal(t, err, writeErr)
+		// The raw write error is wrapped as a ConnectionError at the source so
+		// drpc.ToRPCErr can map it to codes.Unavailable; the original error is
+		// preserved in the chain.
+		assert.That(t, drpc.ConnectionError.Has(err))
+		assert.That(t, errors.Is(err, writeErr))
 	case <-time.After(5 * time.Second):
 		t.Fatal("onError not called")
 	}

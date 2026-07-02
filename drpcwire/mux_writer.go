@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 
+	"storj.io/drpc"
 	"storj.io/drpc/drpcsignal"
 )
 
@@ -109,6 +110,11 @@ func (mw *MuxWriter) run() {
 		mw.mu.Unlock()
 
 		if _, err := mw.w.Write(spare); err != nil {
+			// A failed write means the connection is gone. Classify it as a
+			// ConnectionError at the source, symmetric with the read path (see
+			// drpcwire.Reader.read). This wrapped error flows out both via
+			// closeErr (returned by WriteFrame) and onError (manager teardown).
+			err = drpc.ConnectionError.Wrap(err)
 			mw.mu.Lock()
 			if mw.closed {
 				mw.mu.Unlock()
