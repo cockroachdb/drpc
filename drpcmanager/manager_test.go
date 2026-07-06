@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/zeebo/assert"
+	"google.golang.org/grpc/codes"
 	grpcmetadata "google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"storj.io/drpc"
 	"storj.io/drpc/drpcmetadata"
 
@@ -529,4 +531,60 @@ func TestManageReader_WaitsForStreamCreation(t *testing.T) {
 	})
 
 	assert.DeepEqual(t, <-recv, []byte("data"))
+}
+
+// TestManager_CloseSurfacesUnavailable checks that once the manager is closed,
+// which is what the RPC layer does when a peer goes away, a stream started on it
+// reports the connection as unavailable rather than codes.Unknown. A deliberate
+// Close terminates with "manager closed: Close called". That error used to be
+// unclassified and fell through drpc.ToRPCErr to codes.Unknown, which
+// grpcutil.IsClosedConnection does not recognize. This is a regression test for
+// the TestDrain failure under DRPC mux.
+func TestManager_CloseSurfacesUnavailable(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn, Client)
+
+	// Close the manager, mirroring the RPC layer tearing down a dead peer.
+	assert.NoError(t, cman.Close())
+
+	// A stream created after teardown should come back as a closed connection.
+	_, err := cman.NewClientStream(ctx, "rpc")
+	assert.Error(t, err)
+	assert.That(t, drpc.ClosedError.Has(err))
+
+	// And through the gRPC-compat boundary it should map to codes.Unavailable,
+	// the code connection-liveness checks look for, not codes.Unknown.
+	assert.Equal(t, status.Code(drpc.ToRPCErr(err)), codes.Unavailable)
+}
+
+// TestManager_ServerClientHangupCancels checks that when a client hangs up
+// cleanly, meaning the transport hits EOF with no frame in flight, a server
+// manager treats it as a canceled RPC. readError maps the read-side io.EOF to
+// context.Canceled, and drpc.ToRPCErr turns that into codes.Canceled. This is
+// how gRPC behaves too: a client disconnect cancels the server's stream context
+// instead of surfacing some opaque error.
+func TestManager_ServerClientHangupCancels(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = sconn.Close() }()
+
+	sman := New(sconn, Server)
+	defer func() { _ = sman.Close() }()
+
+	// Client hangs up cleanly; the server's reader observes a bare io.EOF.
+	assert.NoError(t, cconn.Close())
+
+	waitForClosed(t, sman)
+
+	err := sman.sigs.term.Err()
+	assert.That(t, errors.Is(err, context.Canceled))
+	assert.Equal(t, status.Code(drpc.ToRPCErr(err)), codes.Canceled)
 }

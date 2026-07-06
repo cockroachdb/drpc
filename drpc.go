@@ -20,7 +20,19 @@ type HTTPRoute struct {
 	Handler any
 }
 
-// These error classes represent some common errors that drpc generates.
+// These error classes cover the common errors that drpc generates. ToRPCErr
+// knows how to translate them into gRPC status codes, so the rule is to classify
+// an error where it happens: when a subsystem hits a terminal error, or gets one
+// from a library it calls, it should tag the error with the class that matches
+// the cause. ToRPCErr then turns that class into a gRPC code at the boundary.
+//
+// ConnectionError and ClosedError mean the connection is gone, either because
+// the transport died or because we closed it on purpose. ToRPCErr maps both to
+// codes.Unavailable.
+//
+// ProtocolError and InternalError are real faults, not connection problems. We
+// leave these for ToRPCErr to report as codes.Unknown or codes.Internal, so an
+// actual bug does not get hidden behind a retryable "connection lost" error.
 var (
 	Error           = errs.Class("drpc")
 	InternalError   = errs.Class("internal error")

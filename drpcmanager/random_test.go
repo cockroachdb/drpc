@@ -16,6 +16,7 @@ import (
 	"github.com/zeebo/assert"
 	"google.golang.org/grpc/status"
 
+	"storj.io/drpc"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
@@ -232,7 +233,12 @@ func runRandomized(t *testing.T, prog []byte, r runner) {
 	}
 
 	assert.NoError(t, man.Close())
-	assert.Equal(t, (<-errch).Error(), "manager closed: Close called")
+	// A deliberate Close reaches consumers as a ClosedError, which drpc.ToRPCErr
+	// maps to codes.Unavailable, and it still keeps the original "manager closed:
+	// Close called" cause in the chain.
+	err := <-errch
+	assert.That(t, drpc.ClosedError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "manager closed: Close called"))
 }
 
 //

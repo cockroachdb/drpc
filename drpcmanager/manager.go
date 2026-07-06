@@ -8,11 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
@@ -161,15 +158,42 @@ func (m *Manager) log(what string, cb func() string) {
 func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
-		if errors.Is(err, io.EOF) {
-			err = context.Canceled
-			if m.kind == Client {
-				err = drpc.ClosedError.New("connection closed")
-			}
-		}
 		m.wr.Stop(err)
 		m.sigs.tport.Set(m.tr.Close())
 		m.streams.Close(err)
+	}
+}
+
+// readError classifies an error from the reader, at the point where it happens,
+// into a form that drpc.ToRPCErr understands. The reader already does most of
+// the work: it tags I/O failures (including connection resets) as
+// ConnectionError and wire faults as ProtocolError. This function only handles
+// the sentinels the reader passes through untouched.
+//
+// An io.EOF means the peer hung up. For a client that means the connection is
+// gone, so we report it as a ClosedError. For a server a client hanging up is
+// really a canceled RPC, which is how gRPC behaves too, so we report
+// context.Canceled.
+//
+// Anything else is wrapped in managerClosed and passed along. That wrapper is
+// transparent to ToRPCErr, so an error the reader already classified as a
+// ConnectionError still maps to Unavailable, while a protocol or internal fault
+// stays Unknown instead of being mistaken for a retryable connection loss.
+//
+// One thing to watch out for: never wrap a sentinel like io.EOF or
+// context.Canceled in managerClosed. ToRPCErr matches those by identity and
+// would not see them through the wrapper.
+func readError(kind ManagerKind, err error) error {
+	switch {
+	case errors.Is(err, io.EOF):
+		// The peer hung up. Wrapping the EOF in ClosedError is safe because
+		// ToRPCErr matches that class even through the wrapper.
+		if kind == Client {
+			return drpc.ClosedError.Wrap(err)
+		}
+		return context.Canceled
+	default:
+		return managerClosed.Wrap(err)
 	}
 }
 
@@ -187,10 +211,7 @@ func (m *Manager) manageReader() {
 	for !m.sigs.term.IsSet() {
 		incomingFrame, err := m.rd.ReadFrame()
 		if err != nil {
-			if isConnectionReset(err) {
-				err = drpc.ClosedError.Wrap(err)
-			}
-			m.terminate(managerClosed.Wrap(err))
+			m.terminate(readError(m.kind, err))
 			return
 		}
 
@@ -328,7 +349,11 @@ func (m *Manager) Unblocked() <-chan struct{} {
 
 // Close closes the transport the manager is using.
 func (m *Manager) Close() error {
-	m.terminate(managerClosed.New("Close called"))
+	// Closing on purpose still means the connection is gone, so classify it here
+	// as a ClosedError. That way consumers see codes.Unavailable rather than
+	// codes.Unknown. The managerClosed wrapper keeps the "Close called" cause in
+	// the chain.
+	m.terminate(drpc.ClosedError.Wrap(managerClosed.New("Close called")))
 
 	<-m.wr.Done()      // wait for writer goroutine to exit
 	m.wg.Wait()        // wait for all stream goroutines
@@ -381,25 +406,4 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 		m.pdone.Send()
 		return stream, rpc, err
 	}
-}
-
-func isConnectionReset(err error) bool {
-	var operr *net.OpError
-	if !errors.As(err, &operr) {
-		return false
-	}
-	if errors.Is(operr.Err, syscall.ECONNRESET) {
-		return true
-	}
-	msg := strings.ToLower(operr.Err.Error())
-	if strings.Contains(msg, "connection reset by peer") {
-		return true
-	}
-	if strings.Contains(msg, "connection was forcibly closed by the remote host") {
-		return true
-	}
-	if strings.Contains(msg, strings.ToLower(syscall.ECONNRESET.Error())) {
-		return true
-	}
-	return false
 }
