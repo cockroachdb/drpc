@@ -5,7 +5,6 @@ package drpcmanager
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -164,34 +163,30 @@ func (m *Manager) terminate(err error) {
 	}
 }
 
-// readError classifies an error from the reader, at the point where it happens,
-// into a form that drpc.ToRPCErr understands. The reader already does most of
-// the work: it tags I/O failures (including connection resets) as
-// ConnectionError and wire faults as ProtocolError. This function only handles
-// the sentinels the reader passes through untouched.
+// readError turns an error from the reader into a form ToRPCErr understands.
+// The reader already does most of the work: it tags I/O failures (including
+// connection resets) as ConnectionError and wire faults as ProtocolError. It
+// only passes a few sentinels through untouched.
 //
-// An io.EOF means the peer hung up. For a client that means the connection is
-// gone, so we report it as a ClosedError. For a server a client hanging up is
-// really a canceled RPC, which is how gRPC behaves too, so we report
-// context.Canceled.
+// io.EOF means the peer hung up. For a client the connection is gone, so we
+// report a ClosedError, which ToRPCErr maps to Unavailable. For a server a
+// client hang-up is really a canceled RPC, which is how gRPC behaves too, so we
+// report context.Canceled.
 //
-// Anything else is wrapped in managerClosed and passed along. That wrapper is
-// transparent to ToRPCErr, so an error the reader already classified as a
-// ConnectionError still maps to Unavailable, while a protocol or internal fault
-// stays Unknown instead of being mistaken for a retryable connection loss.
-//
-// One thing to watch out for: never wrap a sentinel like io.EOF or
-// context.Canceled in managerClosed. ToRPCErr matches those by identity and
-// would not see them through the wrapper.
+// The other sentinels ToRPCErr recognizes (io.ErrUnexpectedEOF, context.Canceled,
+// context.DeadlineExceeded) pass through untouched: ToRPCErr matches them by
+// identity, so wrapping one would hide it and it would fall back to Unknown.
+// Everything else is already a class, so we wrap it in managerClosed, which is
+// transparent to ToRPCErr.
 func readError(kind ManagerKind, err error) error {
-	switch {
-	case errors.Is(err, io.EOF):
-		// The peer hung up. Wrapping the EOF in ClosedError is safe because
-		// ToRPCErr matches that class even through the wrapper.
+	switch err {
+	case io.EOF:
 		if kind == Client {
 			return drpc.ClosedError.Wrap(err)
 		}
 		return context.Canceled
+	case io.ErrUnexpectedEOF, context.Canceled, context.DeadlineExceeded:
+		return err
 	default:
 		return managerClosed.Wrap(err)
 	}
