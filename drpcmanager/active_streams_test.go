@@ -29,7 +29,7 @@ func TestActiveStreams_AddAndGet(t *testing.T) {
 	streams := newActiveStreams()
 	s := testStream(t, 1)
 
-	assert.NoError(t, streams.Add(1, s))
+	assert.NoError(t, streams.Add(1, s, nil))
 
 	got, ok := streams.Get(1)
 	assert.That(t, ok)
@@ -48,7 +48,7 @@ func TestActiveStreams_Remove(t *testing.T) {
 	streams := newActiveStreams()
 	s := testStream(t, 1)
 
-	assert.NoError(t, streams.Add(1, s))
+	assert.NoError(t, streams.Add(1, s, nil))
 	assert.Equal(t, streams.Len(), 1)
 
 	streams.Remove(1)
@@ -70,8 +70,8 @@ func TestActiveStreams_DuplicateAdd(t *testing.T) {
 	s1 := testStream(t, 1)
 	s2 := testStream(t, 1)
 
-	assert.NoError(t, streams.Add(1, s1))
-	assert.Error(t, streams.Add(1, s2))
+	assert.NoError(t, streams.Add(1, s1, nil))
+	assert.Error(t, streams.Add(1, s2, nil))
 
 	// original stream is still present
 	got, ok := streams.Get(1)
@@ -83,14 +83,14 @@ func TestActiveStreams_AddAfterClose(t *testing.T) {
 	streams := newActiveStreams()
 	streams.Close(errors.New("closed"))
 
-	err := streams.Add(1, testStream(t, 1))
+	err := streams.Add(1, testStream(t, 1), nil)
 	assert.Error(t, err)
 }
 
 func TestActiveStreams_RemoveAfterClose(t *testing.T) {
 	streams := newActiveStreams()
 	s := testStream(t, 1)
-	assert.NoError(t, streams.Add(1, s))
+	assert.NoError(t, streams.Add(1, s, nil))
 
 	streams.Close(errors.New("closed"))
 
@@ -102,10 +102,10 @@ func TestActiveStreams_Len(t *testing.T) {
 	streams := newActiveStreams()
 	assert.Equal(t, streams.Len(), 0)
 
-	assert.NoError(t, streams.Add(1, testStream(t, 1)))
+	assert.NoError(t, streams.Add(1, testStream(t, 1), nil))
 	assert.Equal(t, streams.Len(), 1)
 
-	assert.NoError(t, streams.Add(2, testStream(t, 2)))
+	assert.NoError(t, streams.Add(2, testStream(t, 2), nil))
 	assert.Equal(t, streams.Len(), 2)
 
 	streams.Remove(1)

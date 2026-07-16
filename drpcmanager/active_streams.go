@@ -25,8 +25,11 @@ func newActiveStreams() *activeStreams {
 }
 
 // Add adds a stream. It returns an error if the collection is closed or if a
-// stream with the same ID already exists.
-func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream) error {
+// stream with the same ID already exists. If wg is non-nil, it is incremented
+// under the same lock that checks closed, so wg.Add and the closed check are
+// atomic with respect to Close (which sets closed before Manager.Close calls
+// wg.Wait).
+func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream, wg *sync.WaitGroup) error {
 	if stream == nil {
 		return managerClosed.New("stream can't be nil")
 	}
@@ -41,6 +44,9 @@ func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream) error {
 		return managerClosed.New("duplicate stream id")
 	}
 	r.streams[id] = stream
+	if wg != nil {
+		wg.Add(1)
+	}
 	return nil
 }
 

@@ -324,7 +324,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, m.recvPool, opts)
 
-	if err := m.streams.Add(sid, stream); err != nil {
+	if err := m.streams.Add(sid, stream, &m.wg); err != nil {
 		return nil, err
 	}
 
@@ -332,7 +332,6 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 		m.metrics.StreamsStarted.Inc(1)
 	}
 
-	m.wg.Add(1)
 	go m.manageStream(ctx, stream)
 
 	m.log("STREAM", stream.String)

@@ -588,3 +588,41 @@ func TestManager_ServerClientHangupCancels(t *testing.T) {
 	assert.That(t, errors.Is(err, context.Canceled))
 	assert.Equal(t, status.Code(drpc.ToRPCErr(err)), codes.Canceled)
 }
+
+// TestManager_ConcurrentCloseAndNewClientStream exercises the race between
+// Manager.Close (terminate → stop writer, close transport, close streams) and
+// Manager.NewClientStream (newStream → create stream, add to streams, wg.Add).
+// Under -race this would fail without wg.Add being atomic with the closed
+// check in activeStreams.Add.
+func TestManager_ConcurrentCloseAndNewClientStream(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		cconn, sconn := net.Pipe()
+
+		cman := New(cconn, Client)
+
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+
+		go func() {
+			<-start
+			_ = cman.Close()
+			done <- struct{}{}
+		}()
+
+		go func() {
+			<-start
+			stream, err := cman.NewClientStream(context.Background(), "rpc", 0)
+			if err == nil {
+				_ = stream.Close()
+			}
+			done <- struct{}{}
+		}()
+
+		close(start)
+		<-done
+		<-done
+
+		_ = cconn.Close()
+		_ = sconn.Close()
+	}
+}
