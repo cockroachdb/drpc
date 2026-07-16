@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 
@@ -78,6 +79,66 @@ func TestManager_FlowControlEndToEnd(t *testing.T) {
 	})
 
 	ctx.Wait()
+}
+
+// Cancelling an RPC's context wakes a sender parked on flow-control credit. The
+// client has flow control with a small window; the server does not, so it never
+// returns credit and the client's oversized send parks. This exercises the
+// production wake path: manageStream sees the cancellation and calls
+// Cancel -> terminate -> sendWindow.close.
+func TestManager_FlowControlContextCancelWakesParkedSend(t *testing.T) {
+	tr := drpctest.NewTracker(t)
+	defer tr.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := NewWithOptions(cconn, Client, fcManagerOptions(128<<10, 1<<20, 64<<10))
+	defer func() { _ = cman.Close() }()
+	// Server has no flow control, so it never returns credit.
+	sman := New(sconn, Server)
+	defer func() { _ = sman.Close() }()
+
+	// Accept the stream and drain; the message never completes (the sender
+	// parks mid-message), so RawRecv just blocks until teardown.
+	tr.Run(func(ctx context.Context) {
+		stream, _, err := sman.NewServerStream(ctx)
+		if err != nil {
+			return
+		}
+		defer func() { _ = stream.Close() }()
+		for {
+			if _, err := stream.RawRecv(); err != nil {
+				return
+			}
+		}
+	})
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	stream, err := cman.NewClientStream(streamCtx, "rpc", drpc.CompressionNone)
+	assert.NoError(t, err)
+	assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("rpc")))
+
+	// A 512 KiB message exceeds the 128 KiB window; once the initial credit is
+	// spent the send parks waiting for grants that never come.
+	done := make(chan error, 1)
+	go func() { done <- stream.RawWrite(drpcwire.KindMessage, make([]byte, 512<<10)) }()
+
+	select {
+	case <-done:
+		t.Fatal("send returned before it could park on credit")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("parked send did not wake on context cancellation")
+	}
 }
 
 // sniffConn tees every byte read off the connection into w, where a frame
