@@ -17,7 +17,33 @@ type Stream struct {
 	stats                 *drpcstats.Stats
 	onReceiveQueueEnqueue func(int64)
 	onReceiveQueueDequeue func(int64)
+	flowControl           FlowControl
 }
+
+// FlowControl configures per-stream flow control. Internal-only until the
+// CockroachDB version-gated enablement is ready; a later change promotes it to
+// a public option. The installation site validates it (see drpcstream).
+type FlowControl struct {
+	// Enabled turns per-stream flow control on.
+	Enabled bool
+
+	// StreamWindow is the sender's initial and nominal per-stream credit.
+	StreamWindow int64
+
+	// HighWater is the receive-side buffered-byte mark at or above which
+	// grants are withheld.
+	HighWater int64
+
+	// GrantThreshold is the credit that must accrue before a grant is emitted,
+	// coalescing many frames into one KindWindowUpdate.
+	GrantThreshold int64
+}
+
+// GetStreamFlowControl returns the FlowControl stored in the options.
+func GetStreamFlowControl(opts *Stream) FlowControl { return opts.flowControl }
+
+// SetStreamFlowControl sets the FlowControl stored in the options.
+func SetStreamFlowControl(opts *Stream, fc FlowControl) { opts.flowControl = fc }
 
 // GetStreamTransport returns the drpc.Transport stored in the options.
 func GetStreamTransport(opts *Stream) drpc.Transport { return opts.transport }
