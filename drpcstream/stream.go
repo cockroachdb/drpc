@@ -34,8 +34,31 @@ type Options struct {
 	// All KindMessage data is compressed on send and decompressed on receive.
 	Compression drpc.Compression
 
-	// Internal contains options that are for internal use only.
+	// Internal contains options that are for internal use only. Per-stream
+	// flow control is configured here (drpcopts.SetStreamFlowControl) and is
+	// internal-only until the version-gated enablement work is ready.
 	Internal drpcopts.Stream
+}
+
+// validateFlowControl panics on a flow-control configuration that cannot make
+// progress: an invalid window is a programmer error, and disabling silently
+// would silently drop the protection. The frame size is SplitSize, or
+// SplitData's 64 KiB default when SplitSize is 0.
+func validateFlowControl(fc drpcopts.FlowControl, splitSize int) {
+	frame := int64(splitSize)
+	if splitSize == 0 {
+		frame = 64 << 10
+	}
+	switch {
+	case splitSize < 0:
+		panic("drpcstream: flow control requires a bounded SplitSize")
+	case fc.StreamWindow <= 0 || fc.HighWater <= 0 || fc.GrantThreshold <= 0:
+		panic(fmt.Sprintf("drpcstream: flow-control sizes must be positive: %+v", fc))
+	case frame > fc.StreamWindow || fc.GrantThreshold > fc.StreamWindow-frame:
+		panic(fmt.Sprintf(
+			"drpcstream: GrantThreshold (%d) + frame size (%d) exceeds StreamWindow (%d)",
+			fc.GrantThreshold, frame, fc.StreamWindow))
+	}
 }
 
 // Stream represents an rpc actively happening on a transport.
@@ -131,6 +154,15 @@ func NewWithOptions(
 		onEnqueue: drpcopts.GetStreamOnReceiveQueueEnqueue(&opts.Internal),
 		onDequeue: drpcopts.GetStreamOnReceiveQueueDequeue(&opts.Internal),
 	})
+
+	// When flow control is enabled, install the per-stream windows. The send
+	// window starts with StreamWindow credit (statically agreed with the peer);
+	// the receive window drives grant emission.
+	if fc := drpcopts.GetStreamFlowControl(&opts.Internal); fc.Enabled {
+		validateFlowControl(fc, opts.SplitSize)
+		s.sendw = newSendWindow(fc.StreamWindow)
+		s.recvw = newRecvWindow(fc.HighWater, fc.GrantThreshold)
+	}
 
 	return s
 }
