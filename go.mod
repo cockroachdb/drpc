@@ -3,7 +3,7 @@ module storj.io/drpc
 go 1.23.0
 
 require (
-	github.com/golang/snappy v1.0.0
+	github.com/golang/snappy v0.0.5-0.20231225225746-43d5d4cd4e0e
 	github.com/stretchr/testify v1.10.0
 	github.com/zeebo/assert v1.3.1
 	github.com/zeebo/errs v1.4.0
