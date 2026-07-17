@@ -61,6 +61,10 @@ type Stream struct {
 	cbuf      []byte // compression scratch buffer
 	dbuf      []byte // decompression scratch buffer
 
+	// sendw is the per-stream send-side flow-control window. It is nil when
+	// flow control is not enabled, in which case data writes are ungated.
+	sendw *sendWindow
+
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
 		send drpcsignal.Signal // set when done sending messages
@@ -361,6 +365,12 @@ func (s *Stream) terminate(err error) {
 	s.sigs.recv.Set(err)
 	s.sigs.term.Set(err)
 	s.recvQueue.Close(err)
+	if s.sendw != nil {
+		// Close with the send-side error: sigs.send is first-wins, so when a
+		// caller pre-set it (io.EOF for cancel/error), a send parked on credit
+		// returns the same error as one parked in WriteFrame or a later send.
+		s.sendw.close(s.sigs.send.Err())
+	}
 	s.checkFinished()
 }
 
@@ -416,6 +426,15 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 
 		fr.Data, data = drpcwire.SplitData(data, n)
 		fr.Done = len(data) == 0
+
+		// Only data frames consume send credit; a nil window (flow control
+		// disabled) leaves sends ungated. acquire parks until credit arrives,
+		// the ctx is canceled, or the window closes (stream termination).
+		if kind == drpcwire.KindMessage && s.sendw != nil {
+			if err := s.sendw.acquire(s.Context(), int64(len(fr.Data))); err != nil {
+				return err
+			}
+		}
 
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
@@ -533,11 +552,19 @@ func (s *Stream) SendError(serr error) (err error) {
 		s.mu.Unlock()
 		return nil
 	}
+
+	// Close the send window before taking the write lock so a send parked on
+	// credit wakes and releases the lock (same ordering as Close). io.EOF to
+	// match the sigs.send error set below, so parked and later sends agree.
+	if s.sendw != nil {
+		s.sendw.close(io.EOF)
+	}
 	s.mu.Unlock()
 
 	defer s.checkFinished()
 
-	// Wait for the write lock without holding s.mu (see Close).
+	// Wait for the write lock without holding s.mu, matching CloseSend's
+	// write-then-mu order; holding s.mu here would ABBA-deadlock against it.
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -598,6 +625,13 @@ func (s *Stream) Close() (err error) {
 		s.mu.Unlock()
 		return nil
 	}
+
+	// Close the send window before taking the write lock so a send parked on
+	// credit wakes and releases the lock, instead of stalling the close on a
+	// grant that may never come (mirrors SendCancel's signal-first ordering).
+	if s.sendw != nil {
+		s.sendw.close(termClosed)
+	}
 	s.mu.Unlock()
 
 	defer s.checkFinished()
@@ -637,7 +671,9 @@ func (s *Stream) CloseSend() (err error) {
 
 	defer s.checkFinished()
 
-	// Wait for the write lock without holding s.mu (see Close).
+	// Wait for the write lock without holding s.mu: the writer holding it may
+	// be parked on send credit, and every path that frees it (terminate, via
+	// Cancel/Close/SendError or an inbound terminal frame) needs s.mu first.
 	s.write.Lock()
 	defer s.write.Unlock()
 
