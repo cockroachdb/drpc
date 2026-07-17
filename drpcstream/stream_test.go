@@ -552,3 +552,62 @@ func TestStream_WriteFailureMapsToUnavailable(t *testing.T) {
 	assert.That(t, ok)
 	assert.Equal(t, s.Code(), codes.Unavailable)
 }
+
+// While CloseSend waits for the write lock behind a blocked send, paths that
+// need s.mu (Cancel, the connection reader) must still make progress: CloseSend
+// must not hold s.mu while waiting.
+func TestStream_CancelUnwedgesCloseSendBehindBlockedSend(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	bw := newBlockingWriter()
+	mw := drpcwire.NewMuxWriterWithOptions(bw, func(error) {}, drpcmetrics.ConnectionMetrics{}, drpcwire.WriterOptions{MaximumBufferSize: 1})
+	defer func() { mw.Stop(nil); <-mw.Done() }()
+	defer close(bw.unblock) // LIFO: drain the writer before waiting for run() to exit
+
+	fillMuxBuffer(t, mw, bw)
+	st := New(context.Background(), 1, mw, NewBufferPool())
+
+	write := make(chan error, 1)
+	go func() { write <- st.RawWrite(drpcwire.KindMessage, []byte("data")) }() // parks in WriteFrame
+
+	select {
+	case <-write:
+		t.Fatal("write returned before it could park on backpressure")
+	case <-time.After(blockShort):
+	}
+
+	closeSend := make(chan error, 1)
+	go func() { closeSend <- st.CloseSend() }()
+
+	select {
+	case <-closeSend:
+		t.Fatal("CloseSend returned while a send held the write lock")
+	case <-time.After(blockShort):
+	}
+
+	// Cancel needs s.mu to set the send signal that frees the parked writer;
+	// with CloseSend holding s.mu while waiting, this would deadlock.
+	canceled := make(chan struct{})
+	go func() { st.Cancel(errs.New("boom")); close(canceled) }()
+
+	for name, ch := range map[string]<-chan struct{}{"Cancel": canceled} {
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("%s deadlocked", name)
+		}
+	}
+	select {
+	case err := <-write:
+		assert.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("parked write did not wake")
+	}
+	select {
+	case err := <-closeSend:
+		assert.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("CloseSend did not unblock")
+	}
+}

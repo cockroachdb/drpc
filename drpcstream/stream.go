@@ -533,11 +533,20 @@ func (s *Stream) SendError(serr error) (err error) {
 		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 
 	defer s.checkFinished()
+
+	// Wait for the write lock without holding s.mu (see Close).
 	s.write.Lock()
 	defer s.write.Unlock()
 
+	s.mu.Lock()
+	// Re-check: another path may have terminated while we waited.
+	if s.sigs.term.IsSet() {
+		s.mu.Unlock()
+		return nil
+	}
 	s.sigs.send.Set(io.EOF) // in this state, gRPC returns io.EOF on send.
 	s.terminate(termError)
 	s.mu.Unlock()
@@ -589,11 +598,21 @@ func (s *Stream) Close() (err error) {
 		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 
 	defer s.checkFinished()
+
+	// Wait for the write lock without holding s.mu, matching CloseSend's
+	// write-then-mu order; holding s.mu here would ABBA-deadlock against it.
 	s.write.Lock()
 	defer s.write.Unlock()
 
+	s.mu.Lock()
+	// Re-check: another path may have terminated while we waited.
+	if s.sigs.term.IsSet() {
+		s.mu.Unlock()
+		return nil
+	}
 	s.terminate(termClosed)
 	s.mu.Unlock()
 
@@ -614,11 +633,20 @@ func (s *Stream) CloseSend() (err error) {
 		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 
 	defer s.checkFinished()
+
+	// Wait for the write lock without holding s.mu (see Close).
 	s.write.Lock()
 	defer s.write.Unlock()
 
+	s.mu.Lock()
+	// Re-check: sending may have ended while we waited for the write lock.
+	if s.sigs.send.IsSet() || s.sigs.term.IsSet() {
+		s.mu.Unlock()
+		return nil
+	}
 	s.sigs.send.Set(sendClosed)
 	s.terminateIfBothClosed()
 	s.mu.Unlock()
