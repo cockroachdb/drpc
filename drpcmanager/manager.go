@@ -29,6 +29,10 @@ var managerClosed = errs.Class("manager closed")
 // because the manager is already at its concurrent-stream cap.
 var maxStreamsExceeded = errs.Class("too many concurrent streams")
 
+// maxControlPayloadExceeded is returned to a peer whose inbound stream is
+// refused because its setup buffered more control payload than allowed.
+var maxControlPayloadExceeded = errs.Class("control payload too large")
+
 // Options controls configuration settings for a manager.
 type Options struct {
 	// Reader are passed to any readers the manager creates.
@@ -69,6 +73,12 @@ type Options struct {
 	// not. It applies only to peer-initiated (inbound) streams. 0 means
 	// unlimited.
 	MaxStreams int
+
+	// MaxControlPayloadSize caps the total invoke and metadata bytes a peer may
+	// buffer while setting up a single inbound stream. Beyond it the stream is
+	// refused, bounding setup payloads that are not flow-controlled. 0 means
+	// unlimited.
+	MaxControlPayloadSize int
 }
 
 // Manager handles the logic of managing a transport for a drpc client or
@@ -123,6 +133,7 @@ const (
 type pendingStream struct {
 	metadata map[string]string        // accumulated invoke metadata
 	pa       drpcwire.PacketAssembler // assembles invoke/metadata frames into packets
+	bytes    int64                    // total invoke/metadata payload buffered during setup
 }
 
 // invokeInfo carries the assembled invoke data from manageReader to
@@ -292,12 +303,25 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 		// metadata buffers) simply by never completing the invoke. Refuse before
 		// allocating any state for this id.
 		if m.opts.MaxStreams > 0 && m.streams.Len()+len(m.pendingStreams) >= m.opts.MaxStreams {
-			m.rejectStream(fr.ID.Stream)
+			m.rejectStream(fr.ID.Stream, maxStreamsExceeded.New(
+				"refused: at most %d concurrent streams", m.opts.MaxStreams))
 			return nil
 		}
 		ps = &pendingStream{pa: drpcwire.NewPacketAssembler()}
 		m.pendingStreams[fr.ID.Stream] = ps
 	}
+
+	// Bound the total invoke/metadata bytes buffered during setup: these are not
+	// flow-controlled, so without a cap a single stream can accumulate unbounded
+	// payload across continuation frames. Reject before appending this frame.
+	ps.bytes += int64(len(fr.Data))
+	if m.opts.MaxControlPayloadSize > 0 && ps.bytes > int64(m.opts.MaxControlPayloadSize) {
+		m.rejectStream(fr.ID.Stream, maxControlPayloadExceeded.New(
+			"refused: setup payload exceeds %d bytes", m.opts.MaxControlPayloadSize))
+		delete(m.pendingStreams, fr.ID.Stream)
+		return nil
+	}
+
 	pkt, packetReady, err := ps.pa.AppendFrame(fr)
 	if err != nil {
 		return err
@@ -330,12 +354,11 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	return nil
 }
 
-// rejectStream refuses an inbound stream that would exceed MaxStreams by
-// sending a stream-level KindError to the peer. The control bit is set so the
-// frame is appended immediately without blocking the reader goroutine on write
-// backpressure (as with an abortive cancel). No stream is created.
-func (m *Manager) rejectStream(sid uint64) {
-	err := maxStreamsExceeded.New("refused: at most %d concurrent streams", m.opts.MaxStreams)
+// rejectStream refuses an inbound stream by sending err as a stream-level
+// KindError to the peer. The control bit is set so the frame is appended
+// immediately without blocking the reader goroutine on write backpressure (as
+// with an abortive cancel). No stream is created.
+func (m *Manager) rejectStream(sid uint64, err error) {
 	// Message id 1: this is the first (and only) frame the peer receives on the
 	// refused stream, and its receive assembler expects ids to start at 1.
 	_ = m.wr.WriteFrame(drpcwire.Frame{

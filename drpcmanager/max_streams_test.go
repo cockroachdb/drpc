@@ -227,3 +227,57 @@ func TestManager_MaxStreamsZeroUnlimited(t *testing.T) {
 		_ = c.Close()
 	}
 }
+
+// The total invoke/metadata payload buffered during setup is bounded across
+// continuation frames: a stream that accumulates more than
+// MaxControlPayloadSize is refused, and the connection stays up.
+func TestManager_MaxControlPayloadRefusesOversizedSetup(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	sman := NewWithOptions(sconn, Server, Options{MaxControlPayloadSize: 8})
+	defer func() { _ = sman.Close() }()
+
+	served := make(chan *drpcstream.Stream, 1)
+	ctx.Run(func(ctx context.Context) {
+		for {
+			s, _, err := sman.NewServerStream(ctx)
+			if err != nil {
+				return
+			}
+			served <- s
+		}
+	})
+
+	rd := drpcwire.NewReader(cconn)
+
+	// Stream 1: two 5-byte continuation frames total 10 > 8, so the second
+	// frame trips the cap even though neither frame alone exceeds it.
+	writeRawFrame(t, cconn, drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindInvoke,
+		Data: []byte("aaaaa"), Done: false,
+	})
+	writeRawFrame(t, cconn, drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindInvoke,
+		Data: []byte("bbbbb"), Done: true,
+	})
+	err := readErrorForStream(t, rd, 1)
+	assert.Error(t, err)
+	assert.That(t, strings.Contains(err.Error(), "payload"))
+
+	// The connection is still usable: a within-limit stream is admitted.
+	writeRawFrame(t, cconn, drpcwire.Frame{
+		ID: drpcwire.ID{Stream: 2, Message: 1}, Kind: drpcwire.KindInvoke,
+		Data: []byte("rpc"), Done: true,
+	})
+	select {
+	case s := <-served:
+		_ = s.Close()
+	case <-time.After(time.Second):
+		t.Fatal("connection unusable after a control-payload rejection")
+	}
+}
