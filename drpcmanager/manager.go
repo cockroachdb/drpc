@@ -62,10 +62,12 @@ type Options struct {
 	GRPCMetadataCompatMode bool
 
 	// MaxStreams caps the number of concurrent streams the peer may open against
-	// this manager. When the cap is reached, further inbound streams are refused
-	// with a stream-level error rather than admitted, bounding the per-stream
-	// bookkeeping (goroutines, stream-table entries) that byte windows do not.
-	// 0 means unlimited.
+	// this manager, counting both admitted streams and streams still in setup.
+	// Beyond the cap, further inbound streams are refused with a stream-level
+	// error rather than admitted, bounding the per-stream bookkeeping
+	// (goroutines, stream-table entries, setup assemblers) that byte windows do
+	// not. It applies only to peer-initiated (inbound) streams. 0 means
+	// unlimited.
 	MaxStreams int
 }
 
@@ -284,6 +286,15 @@ func (m *Manager) manageReader() {
 func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	ps, ok := m.pendingStreams[fr.ID.Stream]
 	if !ok {
+		// Count the stream against the cap now, while it is still in setup:
+		// admitted + pending <= MaxStreams. Counting only admitted streams would
+		// let a peer hold unbounded half-open streams (setup assemblers and
+		// metadata buffers) simply by never completing the invoke. Refuse before
+		// allocating any state for this id.
+		if m.opts.MaxStreams > 0 && m.streams.Len()+len(m.pendingStreams) >= m.opts.MaxStreams {
+			m.rejectStream(fr.ID.Stream)
+			return nil
+		}
 		ps = &pendingStream{pa: drpcwire.NewPacketAssembler()}
 		m.pendingStreams[fr.ID.Stream] = ps
 	}
@@ -302,16 +313,6 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 			return err
 		}
 		ps.metadata = meta
-		return nil
-	}
-
-	// Enforce the concurrent-stream cap before admitting the stream. Refuse it
-	// here, in the read path, so the per-stream state the cap protects is never
-	// allocated; the peer learns via a stream-level error and the connection
-	// stays up.
-	if m.opts.MaxStreams > 0 && m.streams.Len() >= m.opts.MaxStreams {
-		m.rejectStream(pkt.ID.Stream)
-		delete(m.pendingStreams, fr.ID.Stream)
 		return nil
 	}
 

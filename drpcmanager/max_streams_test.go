@@ -8,10 +8,12 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 
 	"storj.io/drpc"
+	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
@@ -66,4 +68,162 @@ func TestManager_MaxStreamsRefusesExcessInbound(t *testing.T) {
 	})
 
 	ctx.Wait()
+}
+
+// writeRawFrame marshals and writes a single frame to conn, as a raw peer.
+func writeRawFrame(t *testing.T, conn net.Conn, fr drpcwire.Frame) {
+	t.Helper()
+	if _, err := conn.Write(drpcwire.AppendFrame(nil, fr)); err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+}
+
+// readErrorForStream reads frames from conn until it sees a KindError for sid,
+// returning the decoded error. Frames for other streams are skipped.
+func readErrorForStream(t *testing.T, rd *drpcwire.Reader, sid uint64) error {
+	t.Helper()
+	for {
+		fr, err := rd.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		if fr.Kind == drpcwire.KindError && fr.ID.Stream == sid {
+			return drpcwire.UnmarshalError(fr.Data)
+		}
+	}
+}
+
+// Streams still in setup (partial invoke, no completing frame) count against
+// MaxStreams: a peer cannot hold unbounded half-open streams even though none
+// are admitted.
+func TestManager_MaxStreamsCountsPendingSetup(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	const max = 2
+	sman := NewWithOptions(sconn, Server, Options{MaxStreams: max})
+	defer func() { _ = sman.Close() }()
+
+	rd := drpcwire.NewReader(cconn)
+
+	// Open `max` streams but never complete their invokes (Done=false), so they
+	// stay pending: none are admitted, yet all the slots are held.
+	for sid := uint64(1); sid <= max; sid++ {
+		writeRawFrame(t, cconn, drpcwire.Frame{
+			ID:   drpcwire.ID{Stream: sid, Message: 1},
+			Kind: drpcwire.KindInvoke,
+			Data: []byte("rpc"),
+			Done: false,
+		})
+	}
+
+	// One more stream is refused, though streams.Len() is still 0.
+	writeRawFrame(t, cconn, drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: max + 1, Message: 1},
+		Kind: drpcwire.KindInvoke,
+		Data: []byte("rpc"),
+		Done: false,
+	})
+
+	err := readErrorForStream(t, rd, max+1)
+	assert.Error(t, err)
+	assert.That(t, strings.Contains(err.Error(), "concurrent streams"))
+}
+
+// A stream refused for exceeding MaxStreams does not tear down the connection:
+// once a slot frees, a new stream is admitted.
+func TestManager_MaxStreamsSlotFreesAfterClose(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn, Client)
+	defer func() { _ = cman.Close() }()
+	sman := NewWithOptions(sconn, Server, Options{MaxStreams: 1})
+	defer func() { _ = sman.Close() }()
+
+	served := make(chan *drpcstream.Stream, 2)
+	ctx.Run(func(ctx context.Context) {
+		for {
+			s, _, err := sman.NewServerStream(ctx)
+			if err != nil {
+				return
+			}
+			served <- s
+		}
+	})
+
+	// First stream is admitted; take and hold it.
+	c1, err := cman.NewClientStream(ctx, "rpc", drpc.CompressionNone)
+	assert.NoError(t, err)
+	assert.NoError(t, c1.RawWrite(drpcwire.KindInvoke, []byte("rpc")))
+	s1 := <-served
+
+	// Close it, freeing the single slot, then open another: it is admitted.
+	assert.NoError(t, s1.Close())
+	assert.NoError(t, c1.Close())
+
+	c2, err := cman.NewClientStream(ctx, "rpc", drpc.CompressionNone)
+	assert.NoError(t, err)
+	assert.NoError(t, c2.RawWrite(drpcwire.KindInvoke, []byte("rpc")))
+	select {
+	case <-served: // admitted: the slot was freed
+	case <-time.After(time.Second):
+		t.Fatal("second stream was not admitted after the first closed")
+	}
+	_ = c2.Close()
+}
+
+// With MaxStreams unset (0), the cap is disabled and many concurrent inbound
+// streams are admitted.
+func TestManager_MaxStreamsZeroUnlimited(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn, Client)
+	defer func() { _ = cman.Close() }()
+	sman := NewWithOptions(sconn, Server, Options{}) // MaxStreams 0
+	defer func() { _ = sman.Close() }()
+
+	const n = 8
+	admitted := make(chan struct{}, n)
+	ctx.Run(func(ctx context.Context) {
+		for {
+			s, _, err := sman.NewServerStream(ctx)
+			if err != nil {
+				return
+			}
+			admitted <- struct{}{}
+			defer func() { _ = s.Close() }()
+		}
+	})
+
+	streams := make([]*drpcstream.Stream, 0, n)
+	for i := 0; i < n; i++ {
+		c, err := cman.NewClientStream(ctx, "rpc", drpc.CompressionNone)
+		assert.NoError(t, err)
+		assert.NoError(t, c.RawWrite(drpcwire.KindInvoke, []byte("rpc")))
+		streams = append(streams, c)
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-admitted:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d streams admitted", i, n)
+		}
+	}
+	for _, c := range streams {
+		_ = c.Close()
+	}
 }
