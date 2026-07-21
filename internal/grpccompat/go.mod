@@ -1,6 +1,6 @@
 module storj.io/drpc/internal/grpccompat
 
-go 1.23.0
+go 1.26.5
 
 require (
 	github.com/zeebo/assert v1.3.1
