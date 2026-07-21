@@ -4,7 +4,6 @@
 package drpcstream
 
 import (
-	"context"
 	"io"
 	"math"
 	"sync"
@@ -35,23 +34,19 @@ func (w *sendWindow) available() int64 {
 }
 
 // acquire debits n bytes of credit, blocking until available, and returns nil.
-// It returns early (consuming no credit) if the window is closed or ctx is
-// canceled
-func (w *sendWindow) acquire(ctx context.Context, n int64) error {
+// It returns early (consuming no credit) with the close error if the window is
+// closed. n <= 0 is a no-op unless the window is already closed.
+func (w *sendWindow) acquire(n int64) error {
 	for {
 		w.mu.Lock()
 		switch {
 		case w.closed:
+			// Checked before n <= 0 so a closed window still fails an empty frame.
 			err := w.err
 			w.mu.Unlock()
 			return err
-		case ctx.Err() != nil:
-			w.mu.Unlock()
-			return ctx.Err()
 		case n <= 0:
-			// Nothing to acquire; after the terminal cases (so a closed/canceled
-			// window still fails) and never debits (so a negative n cannot add credit).
-			w.mu.Unlock()
+			w.mu.Unlock() // nothing to acquire; never debits, so a negative n adds no credit
 			return nil
 		case w.avail >= n:
 			w.avail -= n
@@ -60,19 +55,15 @@ func (w *sendWindow) acquire(ctx context.Context, n int64) error {
 		}
 		// Snapshot the notify channel under the lock before parking, so a grant
 		// or close that fires the instant we unlock is not missed. Allocated
-		// here, by the first parker, so wakes with no waiters stay free.
+		// here, by the first parker, so wakes with no waiters stay free. The
+		// only wakeups are grant and close; abort is close's job (the stream
+		// terminates the window), so acquire needs no context.
 		if w.notify == nil {
 			w.notify = make(chan struct{})
 		}
 		ch := w.notify
 		w.mu.Unlock()
-
-		select {
-		case <-ch:
-			// Credit was granted or the window closed; loop and re-check.
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		<-ch // credit was granted or the window closed; loop and re-check
 	}
 }
 
