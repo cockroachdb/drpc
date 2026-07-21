@@ -4,7 +4,6 @@
 package drpcstream
 
 import (
-	"context"
 	"errors"
 	"io"
 	"math"
@@ -23,10 +22,10 @@ func TestSendWindowAcquireImmediate(t *testing.T) {
 	w := newSendWindow(1000)
 	assert.Equal(t, w.available(), int64(1000))
 
-	assert.NoError(t, w.acquire(context.Background(), 400))
+	assert.NoError(t, w.acquire(400))
 	assert.Equal(t, w.available(), int64(600))
 
-	assert.NoError(t, w.acquire(context.Background(), 600))
+	assert.NoError(t, w.acquire(600))
 	assert.Equal(t, w.available(), int64(0))
 }
 
@@ -36,14 +35,14 @@ func TestSendWindowGrantsAccumulate(t *testing.T) {
 	w.grant(50)
 	assert.Equal(t, w.available(), int64(150))
 
-	assert.NoError(t, w.acquire(context.Background(), 150))
+	assert.NoError(t, w.acquire(150))
 	assert.Equal(t, w.available(), int64(0))
 }
 
 func TestSendWindowAcquireBlocksUntilGrant(t *testing.T) {
 	w := newSendWindow(100)
 	done := make(chan error, 1)
-	go func() { done <- w.acquire(context.Background(), 300) }()
+	go func() { done <- w.acquire(300) }()
 
 	// Not enough credit yet: acquire must block.
 	select {
@@ -61,30 +60,6 @@ func TestSendWindowAcquireBlocksUntilGrant(t *testing.T) {
 		t.Fatal("acquire did not return after grant")
 	}
 	assert.Equal(t, w.available(), int64(50))
-}
-
-func TestSendWindowAcquireContextCancel(t *testing.T) {
-	w := newSendWindow(0)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- w.acquire(ctx, 100) }()
-
-	select {
-	case <-done:
-		t.Fatal("acquire returned before cancellation")
-	case <-time.After(blockShort):
-	}
-
-	cancel()
-
-	select {
-	case err := <-done:
-		assert.That(t, errors.Is(err, context.Canceled))
-	case <-time.After(time.Second):
-		t.Fatal("acquire did not wake on context cancellation")
-	}
-	// Credit was not consumed by a failed acquire.
-	assert.Equal(t, w.available(), int64(0))
 }
 
 func TestSendWindowGrantSaturates(t *testing.T) {
@@ -121,22 +96,11 @@ func TestSendWindowGrantSaturates(t *testing.T) {
 	assert.Equal(t, w5.available(), int64(math.MaxInt64))
 }
 
-func TestSendWindowAcquireCanceledCtxWithCredit(t *testing.T) {
-	w := newSendWindow(1000)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already canceled, with credit available
-
-	err := w.acquire(ctx, 100)
-	assert.That(t, errors.Is(err, context.Canceled))
-	// A canceled context must not consume credit even though it was available.
-	assert.Equal(t, w.available(), int64(1000))
-}
-
 func TestSendWindowCloseWakesAcquire(t *testing.T) {
 	w := newSendWindow(0)
 	closeErr := errs.New("terminated")
 	done := make(chan error, 1)
-	go func() { done <- w.acquire(context.Background(), 100) }()
+	go func() { done <- w.acquire(100) }()
 
 	select {
 	case <-done:
@@ -160,32 +124,28 @@ func TestSendWindowAcquireAfterClose(t *testing.T) {
 	w.close(closeErr)
 
 	// Even though credit is available, a closed window returns the close error.
-	assert.That(t, errors.Is(w.acquire(context.Background(), 1), closeErr))
+	assert.That(t, errors.Is(w.acquire(1), closeErr))
 }
 
 func TestSendWindowCloseNilError(t *testing.T) {
 	w := newSendWindow(1000)
 	w.close(nil) // closing with nil must not let a later acquire report success
-	assert.That(t, errors.Is(w.acquire(context.Background(), 1), io.EOF))
+	assert.That(t, errors.Is(w.acquire(1), io.EOF))
 }
 
 func TestSendWindowAcquireNonPositive(t *testing.T) {
 	w := newSendWindow(100)
-	assert.NoError(t, w.acquire(context.Background(), 0))
-	assert.NoError(t, w.acquire(context.Background(), -5))
+	assert.NoError(t, w.acquire(0))
+	assert.NoError(t, w.acquire(-5))
 	// Non-positive acquire consumes nothing; a negative one must not add credit.
 	assert.Equal(t, w.available(), int64(100))
 }
 
-func TestSendWindowAcquireZeroObservesTerminalState(t *testing.T) {
-	// A zero-length acquire (empty frame) must still observe a canceled context...
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	assert.That(t, errors.Is(newSendWindow(100).acquire(ctx, 0), context.Canceled))
-
-	// ...and a closed window, rather than reporting success.
+func TestSendWindowAcquireZeroObservesClose(t *testing.T) {
+	// A zero-length acquire (empty frame) must still observe a closed window
+	// rather than reporting success (closed is checked before n <= 0).
 	w := newSendWindow(100)
 	closeErr := errs.New("terminated")
 	w.close(closeErr)
-	assert.That(t, errors.Is(w.acquire(context.Background(), 0), closeErr))
+	assert.That(t, errors.Is(w.acquire(0), closeErr))
 }

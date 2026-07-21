@@ -61,6 +61,10 @@ type Stream struct {
 	cbuf      []byte // compression scratch buffer
 	dbuf      []byte // decompression scratch buffer
 
+	// sendw is the per-stream send-side flow-control window. It is nil when
+	// flow control is not enabled, in which case data writes are ungated.
+	sendw *sendWindow
+
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
 		send drpcsignal.Signal // set when done sending messages
@@ -361,6 +365,12 @@ func (s *Stream) terminate(err error) {
 	s.sigs.recv.Set(err)
 	s.sigs.term.Set(err)
 	s.recvQueue.Close(err)
+	if s.sendw != nil {
+		// Close with the send-side error: sigs.send is first-wins, so when a
+		// caller pre-set it (io.EOF for cancel/error), a send parked on credit
+		// returns the same error as one parked in WriteFrame or a later send.
+		s.sendw.close(s.sigs.send.Err())
+	}
 	s.checkFinished()
 }
 
@@ -416,6 +426,15 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 
 		fr.Data, data = drpcwire.SplitData(data, n)
 		fr.Done = len(data) == 0
+
+		// Only data frames consume send credit; a nil window (flow control
+		// disabled) leaves sends ungated. acquire parks until credit arrives or
+		// the window closes (stream termination) -- the latter is the abort path.
+		if kind == drpcwire.KindMessage && s.sendw != nil {
+			if err := s.sendw.acquire(int64(len(fr.Data))); err != nil {
+				return err
+			}
+		}
 
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
