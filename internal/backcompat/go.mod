@@ -1,6 +1,6 @@
 module storj.io/drpc/internal/backcompat
 
-go 1.19
+go 1.26.5
 
 require (
 	github.com/zeebo/assert v1.3.0
