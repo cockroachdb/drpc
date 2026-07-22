@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sync"
 	"sync/atomic"
 
 	"github.com/zeebo/errs"
@@ -70,8 +69,6 @@ type Manager struct {
 
 	// next client stream ID, incremented atomically
 	lastStreamID atomic.Uint64
-
-	wg sync.WaitGroup // tracks active manageStream goroutines
 
 	// streams tracks active streams.
 	streams  *activeStreams
@@ -309,7 +306,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, m.recvPool, m.metrics, opts)
 
-	if err := m.streams.Add(sid, stream, &m.wg); err != nil {
+	if err := m.streams.Add(sid, stream); err != nil {
 		return nil, err
 	}
 
@@ -327,13 +324,12 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 // manageStream watches the context and the stream and returns when the stream
 // is finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
-	defer m.wg.Done()
+	defer m.streams.Remove(stream.ID())
 	defer func() {
 		if m.metrics.ShouldRecord() {
 			m.metrics.StreamsTerminated.Inc(1)
 		}
 	}()
-	defer m.streams.Remove(stream.ID())
 	select {
 	case <-stream.Finished():
 
@@ -377,7 +373,7 @@ func (m *Manager) Close() error {
 	m.terminate(drpc.ClosedError.Wrap(managerClosed.New("Close called")))
 
 	<-m.wr.Done()      // wait for writer goroutine to exit
-	m.wg.Wait()        // wait for all stream goroutines
+	m.streams.Wait()   // wait for all stream goroutines
 	m.sigs.read.Wait() // wait for reader goroutine to exit
 	m.sigs.tport.Wait()
 
