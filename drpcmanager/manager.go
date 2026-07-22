@@ -25,6 +25,10 @@ import (
 
 var managerClosed = errs.Class("manager closed")
 
+// maxStreamsExceeded is sent to a peer whose inbound stream is refused for
+// exceeding the concurrent-stream cap.
+var maxStreamsExceeded = errs.Class("too many concurrent streams")
+
 // Options controls configuration settings for a manager.
 type Options struct {
 	// Reader are passed to any readers the manager creates.
@@ -56,6 +60,11 @@ type Options struct {
 	// handling. When enabled, the server stream will decode incoming metadata
 	// into grpc metadata in the context.
 	GRPCMetadataCompatMode bool
+
+	// MaxStreams caps concurrent peer-initiated streams; beyond it, inbound
+	// streams are refused with a stream-level error rather than admitted. It
+	// bounds per-stream bookkeeping that byte windows do not. 0 means unlimited.
+	MaxStreams int
 }
 
 // Manager handles the logic of managing a transport for a drpc client or
@@ -294,6 +303,14 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 		return nil
 	}
 
+	// Refuse in the read path so the stream is never admitted; the connection
+	// stays up and the peer learns via a stream-level error.
+	if m.opts.MaxStreams > 0 && m.streams.Len() >= m.opts.MaxStreams {
+		m.rejectStream(pkt.ID.Stream)
+		delete(m.pendingStreams, fr.ID.Stream)
+		return nil
+	}
+
 	// Invoke packet completes the sequence. Send to NewServerStream.
 	select {
 	case m.invokes <- invokeInfo{sid: pkt.ID.Stream, data: pkt.Data, metadata: ps.metadata}:
@@ -306,6 +323,23 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	case <-m.sigs.term.Signal():
 	}
 	return nil
+}
+
+// rejectStream refuses an inbound stream with a stream-level KindError. No
+// stream is created. The frame is not marked Control: refusals are unbounded (a
+// peer can flood over-cap invokes), so it must respect write-buffer
+// backpressure rather than append past MaximumBufferSize. A full buffer parks
+// the reader, throttling the flooder; nil cancel lets the error wait for space
+// so it still reaches the peer.
+func (m *Manager) rejectStream(sid uint64) {
+	err := maxStreamsExceeded.New("refused: at most %d concurrent streams", m.opts.MaxStreams)
+	// Message id 1: the peer's receive assembler expects ids to start at 1.
+	_ = m.wr.WriteFrame(drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: sid, Message: 1},
+		Kind: drpcwire.KindError,
+		Data: drpcwire.MarshalError(err),
+		Done: true,
+	}, nil)
 }
 
 //
