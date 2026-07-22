@@ -45,6 +45,14 @@ type Options struct {
 	// restrictions. If it returns a non-nil error the connection is rejected.
 	TLSCipherRestrict func(conn net.Conn) error
 
+	// TLSHandshakeTimeout, if positive, bounds the TLS handshake performed in
+	// ServeOne: the handshake runs under a context derived from ServeOne's
+	// context with this timeout, so a peer that stalls mid-handshake is
+	// disconnected once it elapses. If zero, the handshake is bounded only by
+	// ServeOne's context, so such a peer can hold its connection (and serving
+	// goroutine) open until that context is done.
+	TLSHandshakeTimeout time.Duration
+
 	// Metrics holds optional metrics the server will populate.
 	Metrics ServerMetrics
 }
@@ -142,7 +150,31 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		// interrupting any ongoing communication. Even if we didn't call it
 		// explicitly, the first read/write operation would call it internally
 		// anyway.
-		err := tlsConn.HandshakeContext(ctx)
+		//
+		// Bound the handshake with a timeout derived from the parent context so
+		// a peer that stalls mid-handshake cannot hold the connection (and its
+		// serving goroutine) open indefinitely. HandshakeContext closes the
+		// underlying connection when its context is done, so a stalled read is
+		// interrupted without touching the connection's own deadlines; serving
+		// below continues to use the original ctx. Deriving the timeout from ctx
+		// (rather than setting a connection deadline) also means an earlier
+		// parent deadline or cancellation still applies.
+		handshakeCtx := ctx
+		var cancel context.CancelFunc
+		if timeout := s.opts.TLSHandshakeTimeout; timeout > 0 {
+			handshakeCtx, cancel = context.WithTimeout(ctx, timeout)
+			// Safety net in case a future edit adds an early return before the
+			// explicit cancel below; cancel is idempotent so calling it twice is
+			// harmless.
+			defer cancel()
+		}
+		err := tlsConn.HandshakeContext(handshakeCtx)
+		// Release the timeout context's resources as soon as the handshake
+		// returns rather than holding them for the served connection's entire
+		// lifetime (ServeOne's scope).
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			s.recordTLSHandshakeError()
 			return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
