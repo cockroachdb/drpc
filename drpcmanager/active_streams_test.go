@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/zeebo/assert"
 
@@ -25,11 +26,41 @@ func testStream(t *testing.T, id uint64) *drpcstream.Stream {
 	return drpcstream.New(context.Background(), id, testMuxWriter(t), drpcstream.NewBufferPool())
 }
 
+func waitForActiveStreams(streams *activeStreams) <-chan struct{} {
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		streams.Wait()
+		close(done)
+	}()
+	<-started
+	return done
+}
+
+func assertWaitBlocked(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatal("Wait completed before the collection drained")
+	default:
+	}
+}
+
+func assertWaitCompleted(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not complete after the collection drained")
+	}
+}
+
 func TestActiveStreams_AddAndGet(t *testing.T) {
 	streams := newActiveStreams()
 	s := testStream(t, 1)
 
-	assert.NoError(t, streams.Add(1, s, nil))
+	assert.NoError(t, streams.Add(1, s))
 
 	got, ok := streams.Get(1)
 	assert.That(t, ok)
@@ -48,7 +79,7 @@ func TestActiveStreams_Remove(t *testing.T) {
 	streams := newActiveStreams()
 	s := testStream(t, 1)
 
-	assert.NoError(t, streams.Add(1, s, nil))
+	assert.NoError(t, streams.Add(1, s))
 	assert.Equal(t, streams.Len(), 1)
 
 	streams.Remove(1)
@@ -70,8 +101,8 @@ func TestActiveStreams_DuplicateAdd(t *testing.T) {
 	s1 := testStream(t, 1)
 	s2 := testStream(t, 1)
 
-	assert.NoError(t, streams.Add(1, s1, nil))
-	assert.Error(t, streams.Add(1, s2, nil))
+	assert.NoError(t, streams.Add(1, s1))
+	assert.Error(t, streams.Add(1, s2))
 
 	// original stream is still present
 	got, ok := streams.Get(1)
@@ -83,14 +114,14 @@ func TestActiveStreams_AddAfterClose(t *testing.T) {
 	streams := newActiveStreams()
 	streams.Close(errors.New("closed"))
 
-	err := streams.Add(1, testStream(t, 1), nil)
+	err := streams.Add(1, testStream(t, 1))
 	assert.Error(t, err)
 }
 
 func TestActiveStreams_RemoveAfterClose(t *testing.T) {
 	streams := newActiveStreams()
 	s := testStream(t, 1)
-	assert.NoError(t, streams.Add(1, s, nil))
+	assert.NoError(t, streams.Add(1, s))
 
 	streams.Close(errors.New("closed"))
 
@@ -98,14 +129,49 @@ func TestActiveStreams_RemoveAfterClose(t *testing.T) {
 	streams.Remove(1)
 }
 
+func TestActiveStreams_WaitForAllStreams(t *testing.T) {
+	streams := newActiveStreams()
+	assert.NoError(t, streams.Add(1, testStream(t, 1)))
+	assert.NoError(t, streams.Add(2, testStream(t, 2)))
+	waitDone := waitForActiveStreams(streams)
+
+	streams.Close(errors.New("closed"))
+	streams.Remove(1)
+	assertWaitBlocked(t, waitDone)
+
+	streams.Remove(2)
+	assertWaitCompleted(t, waitDone)
+}
+
+func TestActiveStreams_WaitForClose(t *testing.T) {
+	streams := newActiveStreams()
+	waitDone := waitForActiveStreams(streams)
+	assertWaitBlocked(t, waitDone)
+
+	streams.Close(errors.New("closed"))
+	assertWaitCompleted(t, waitDone)
+}
+
+func TestActiveStreams_CloseWakesWaiterAfterStreamsRemoved(t *testing.T) {
+	streams := newActiveStreams()
+	assert.NoError(t, streams.Add(1, testStream(t, 1)))
+	streams.Remove(1)
+
+	waitDone := waitForActiveStreams(streams)
+	assertWaitBlocked(t, waitDone)
+
+	streams.Close(errors.New("closed"))
+	assertWaitCompleted(t, waitDone)
+}
+
 func TestActiveStreams_Len(t *testing.T) {
 	streams := newActiveStreams()
 	assert.Equal(t, streams.Len(), 0)
 
-	assert.NoError(t, streams.Add(1, testStream(t, 1), nil))
+	assert.NoError(t, streams.Add(1, testStream(t, 1)))
 	assert.Equal(t, streams.Len(), 1)
 
-	assert.NoError(t, streams.Add(2, testStream(t, 2), nil))
+	assert.NoError(t, streams.Add(2, testStream(t, 2)))
 	assert.Equal(t, streams.Len(), 2)
 
 	streams.Remove(1)
