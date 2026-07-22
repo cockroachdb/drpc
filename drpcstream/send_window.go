@@ -7,75 +7,80 @@ import (
 	"io"
 	"math"
 	"sync"
+	"sync/atomic"
 )
 
 // sendWindow is a per-stream flow-control credit balance on the sender. It
 // tracks how many more bytes the stream is allowed to put on the wire right
 // now. acquire spends credit (blocking until enough is available), grant adds
-// credit, and close terminates the window.
+// credit, and close terminates a blocked acquire. There must be at most one
+// goroutine calling acquire and one goroutine calling grant.
 type sendWindow struct {
-	mu     sync.Mutex
-	avail  int64         // available credit; signed (maybe negative during enablement)
-	closed bool          // set once by close; no further acquires succeed
-	err    error         // terminal error returned by acquire after close
-	notify chan struct{} // lazily allocated by parkers; closed+nilled to wake them
+	avail atomic.Int64 // available credit; negative while acquire is waiting
+
+	mu   sync.Mutex
+	cond *sync.Cond // allocated only if acquire has to wait
+	err  error      // terminal error returned by a blocked acquire after close
 }
 
 // newSendWindow returns a sendWindow seeded with initial credit.
 func newSendWindow(initial int64) *sendWindow {
-	return &sendWindow{avail: initial}
+	w := &sendWindow{}
+	w.avail.Store(initial)
+	return w
 }
 
 // available returns the current credit balance.
 func (w *sendWindow) available() int64 {
+	return w.avail.Load()
+}
+
+// acquire debits n bytes of credit and blocks while the resulting balance is
+// negative. If the window is closed while blocked, it returns the close error.
+// n <= 0 is a no-op.
+func (w *sendWindow) acquire(n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	if w.avail.Add(-n) >= 0 {
+		return nil
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.avail
-}
-
-// acquire debits n bytes of credit, blocking until available, and returns nil.
-// It returns early (consuming no credit) with the close error if the window is
-// closed. n <= 0 is a no-op unless the window is already closed.
-func (w *sendWindow) acquire(n int64) error {
-	for {
-		w.mu.Lock()
-		switch {
-		case w.closed:
-			// Checked before n <= 0 so a closed window still fails an empty frame.
-			err := w.err
-			w.mu.Unlock()
-			return err
-		case n <= 0:
-			w.mu.Unlock() // nothing to acquire; never debits, so a negative n adds no credit
-			return nil
-		case w.avail >= n:
-			w.avail -= n
-			w.mu.Unlock()
-			return nil
+	for w.avail.Load() < 0 && w.err == nil {
+		if w.cond == nil {
+			w.cond = sync.NewCond(&w.mu)
 		}
-		// Snapshot the notify channel under the lock before parking, so a grant
-		// or close that fires the instant we unlock is not missed. Allocated
-		// here, by the first parker, so wakes with no waiters stay free. The
-		// only wakeups are grant and close; abort is close's job (the stream
-		// terminates the window), so acquire needs no context.
-		if w.notify == nil {
-			w.notify = make(chan struct{})
-		}
-		ch := w.notify
-		w.mu.Unlock()
-		<-ch // credit was granted or the window closed; loop and re-check
+		w.cond.Wait()
 	}
+
+	return w.err // can be nil
 }
 
-// grant raises the balance by n and wakes any parked acquirer. n is unsigned,
-// so a grant never lowers the balance. Grants after close are ignored.
+// grant raises the balance by n and wakes the acquirer if the grant satisfies
+// its deficit. n is unsigned, so a grant never lowers the balance.
 func (w *sendWindow) grant(n uint64) {
-	w.mu.Lock()
-	if !w.closed {
-		w.avail = applyGrant(w.avail, n)
-		w.wakeLocked()
+	if n == 0 {
+		return
 	}
-	w.mu.Unlock()
+	for {
+		oldCredits := w.avail.Load()
+		newCredits := applyGrant(oldCredits, n)
+		if !w.avail.CompareAndSwap(oldCredits, newCredits) {
+			continue
+		}
+		if oldCredits < 0 && newCredits >= 0 {
+			// Taking mu makes the predicate check in acquire and this signal
+			// atomic with respect to cond.Wait, preventing a lost wakeup.
+			w.mu.Lock()
+			if w.cond != nil {
+				w.cond.Signal()
+			}
+			w.mu.Unlock()
+		}
+		return
+	}
 }
 
 // applyGrant returns avail + n with an upper bound of math.MaxInt64.
@@ -100,26 +105,17 @@ func applyGrant(avail int64, n uint64) int64 {
 }
 
 // close terminates the window with err, waking every parked acquirer, which
-// then returns err. Subsequent acquires also return err. It is a no-op if the
-// window is already closed.
+// then returns err. It is a no-op if the window is already closed.
 func (w *sendWindow) close(err error) {
 	if err == nil {
-		err = io.EOF // never nil: acquire must not report success on a closed window
+		err = io.EOF
 	}
 	w.mu.Lock()
-	if !w.closed {
-		w.closed = true
+	if w.err == nil {
 		w.err = err
-		w.wakeLocked()
+		if w.cond != nil {
+			w.cond.Signal()
+		}
 	}
 	w.mu.Unlock()
-}
-
-// wakeLocked broadcasts to all parked acquirers by closing the notify channel;
-// Requires w.mu.
-func (w *sendWindow) wakeLocked() {
-	if w.notify != nil {
-		close(w.notify)
-		w.notify = nil
-	}
 }

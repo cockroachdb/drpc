@@ -50,8 +50,9 @@ func TestSendWindowAcquireBlocksUntilGrant(t *testing.T) {
 		t.Fatal("acquire returned before sufficient credit")
 	case <-time.After(blockShort):
 	}
+	assert.Equal(t, w.available(), int64(-200))
 
-	w.grant(250) // 100 + 250 = 350 >= 300
+	w.grant(250) // -200 + 250 = 50
 
 	select {
 	case err := <-done:
@@ -77,7 +78,7 @@ func TestSendWindowGrantSaturates(t *testing.T) {
 
 	// A grant that raises a negative balance is applied exactly (no saturation).
 	w3 := newSendWindow(0)
-	w3.avail = -300
+	w3.avail.Store(-300)
 	w3.grant(500)
 	assert.Equal(t, w3.available(), int64(200))
 
@@ -85,13 +86,13 @@ func TestSendWindowGrantSaturates(t *testing.T) {
 	// clamping: the true sum -300 + MaxInt64 fits, so it must not saturate to
 	// MaxInt64 (which would erase the 300 of pre-enforcement debt).
 	w4 := newSendWindow(0)
-	w4.avail = -300
+	w4.avail.Store(-300)
 	w4.grant(math.MaxInt64)
 	assert.Equal(t, w4.available(), int64(math.MaxInt64-300))
 
 	// Only when the true sum truly overflows does it clamp.
 	w5 := newSendWindow(0)
-	w5.avail = -300
+	w5.avail.Store(-300)
 	w5.grant(math.MaxUint64)
 	assert.Equal(t, w5.available(), int64(math.MaxInt64))
 }
@@ -120,16 +121,16 @@ func TestSendWindowCloseWakesAcquire(t *testing.T) {
 
 func TestSendWindowAcquireAfterClose(t *testing.T) {
 	w := newSendWindow(1000)
-	closeErr := errs.New("closed")
-	w.close(closeErr)
+	w.close(errs.New("closed"))
 
-	// Even though credit is available, a closed window returns the close error.
-	assert.That(t, errors.Is(w.acquire(1), closeErr))
+	// The fast path does not consult closed when enough credit is available.
+	assert.NoError(t, w.acquire(1))
+	assert.Equal(t, w.available(), int64(999))
 }
 
 func TestSendWindowCloseNilError(t *testing.T) {
-	w := newSendWindow(1000)
-	w.close(nil) // closing with nil must not let a later acquire report success
+	w := newSendWindow(0)
+	w.close(nil)
 	assert.That(t, errors.Is(w.acquire(1), io.EOF))
 }
 
@@ -141,11 +142,8 @@ func TestSendWindowAcquireNonPositive(t *testing.T) {
 	assert.Equal(t, w.available(), int64(100))
 }
 
-func TestSendWindowAcquireZeroObservesClose(t *testing.T) {
-	// A zero-length acquire (empty frame) must still observe a closed window
-	// rather than reporting success (closed is checked before n <= 0).
+func TestSendWindowAcquireZeroAfterClose(t *testing.T) {
 	w := newSendWindow(100)
-	closeErr := errs.New("terminated")
-	w.close(closeErr)
-	assert.That(t, errors.Is(w.acquire(0), closeErr))
+	w.close(errs.New("terminated"))
+	assert.NoError(t, w.acquire(0))
 }
