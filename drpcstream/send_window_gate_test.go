@@ -35,7 +35,7 @@ func TestStream_SendWindowDefaultUngated(t *testing.T) {
 // granted.
 func TestStream_SendWindowGatesDataWrite(t *testing.T) {
 	st := newGateStream(t)
-	st.sendw = newSendWindow(4) // 4 bytes of credit
+	st.sendw = newSendWindow(4, st.sigs.send.Signal(), st.sigs.send.Err) // 4 bytes of credit
 
 	done := make(chan error, 1)
 	go func() { done <- st.RawWrite(drpcwire.KindMessage, []byte("hello")) }() // 5 bytes > 4
@@ -60,7 +60,7 @@ func TestStream_SendWindowGatesDataWrite(t *testing.T) {
 // zero send credit.
 func TestStream_SendWindowControlKindsBypassGate(t *testing.T) {
 	st := newGateStream(t)
-	st.sendw = newSendWindow(0) // no credit at all
+	st.sendw = newSendWindow(0, st.sigs.send.Signal(), st.sigs.send.Err) // no credit at all
 
 	assert.NoError(t, st.WriteInvoke("service.Method", nil))
 }
@@ -70,7 +70,7 @@ func TestStream_SendWindowControlKindsBypassGate(t *testing.T) {
 // lock, and the cancel frame goes out.
 func TestStream_SendWindowSendCancelPreemptsParkedWrite(t *testing.T) {
 	st := newGateStream(t)
-	st.sendw = newSendWindow(0) // send will park immediately
+	st.sendw = newSendWindow(0, st.sigs.send.Signal(), st.sigs.send.Err) // send will park immediately
 
 	done := make(chan error, 1)
 	go func() { done <- st.RawWrite(drpcwire.KindMessage, []byte("data")) }()
@@ -98,7 +98,7 @@ func TestStream_SendWindowSendCancelPreemptsParkedWrite(t *testing.T) {
 // Terminating the stream wakes a send parked on credit.
 func TestStream_SendWindowTerminateWakesParkedWrite(t *testing.T) {
 	st := newGateStream(t)
-	st.sendw = newSendWindow(0) // send will park immediately
+	st.sendw = newSendWindow(0, st.sigs.send.Signal(), st.sigs.send.Err) // send will park immediately
 
 	done := make(chan error, 1)
 	go func() { done <- st.RawWrite(drpcwire.KindMessage, []byte("data")) }()

@@ -365,12 +365,6 @@ func (s *Stream) terminate(err error) {
 	s.sigs.recv.Set(err)
 	s.sigs.term.Set(err)
 	s.recvQueue.Close(err)
-	if s.sendw != nil {
-		// Close with the send-side error: sigs.send is first-wins, so when a
-		// caller pre-set it (io.EOF for cancel/error), a send parked on credit
-		// returns the same error as one parked in WriteFrame or a later send.
-		s.sendw.close(s.sigs.send.Err())
-	}
 	s.checkFinished()
 }
 
