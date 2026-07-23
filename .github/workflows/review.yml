@@ -26,7 +26,7 @@ jobs:
       (github.event.action == 'synchronize' && !github.event.pull_request.draft) ||
       (github.event.action == 'opened' && !github.event.pull_request.draft) ||
       github.event.action == 'ready_for_review'
-    uses: cockroachlabs/roachdev/.github/workflows/ai-review.yml@main
+    uses: cockroachlabs/roachdev/.github/workflows/ai-review.yml@101ea24f06e4da9316557494137f9c6a45d321ef
     with:
       pr_number: ${{ fromJSON(github.event.inputs.pr_number || github.event.pull_request.number) }}
     secrets: inherit
