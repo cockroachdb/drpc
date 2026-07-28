@@ -15,6 +15,7 @@ import (
 	"storj.io/drpc/drpcctx"
 	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcenc"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcsignal"
 	"storj.io/drpc/drpcwire"
 	"storj.io/drpc/internal/drpcopts"
@@ -88,7 +89,7 @@ var _ drpc.Stream = (*Stream)(nil)
 // will use the writer to write messages on. It is important use monotonically
 // increasing stream ids within a single transport.
 func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool) *Stream {
-	return NewWithOptions(ctx, sid, wr, pool, Options{})
+	return NewWithOptions(ctx, sid, wr, pool, drpcmetrics.ConnectionMetrics{}, Options{})
 }
 
 // NewWithOptions returns a new stream bound to the context with the given
@@ -96,7 +97,12 @@ func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPo
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
 func NewWithOptions(
-	ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool, opts Options,
+	ctx context.Context,
+	sid uint64,
+	wr *drpcwire.MuxWriter,
+	pool *BufferPool,
+	metrics drpcmetrics.ConnectionMetrics,
+	opts Options,
 ) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
@@ -123,10 +129,7 @@ func NewWithOptions(
 		wr: wr,
 	}
 
-	s.recvQueue.init(pool, ringBufferHooks{
-		onEnqueue: drpcopts.GetStreamOnReceiveQueueEnqueue(&opts.Internal),
-		onDequeue: drpcopts.GetStreamOnReceiveQueueDequeue(&opts.Internal),
-	})
+	s.recvQueue.init(pool, metrics)
 
 	return s
 }

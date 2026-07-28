@@ -3,7 +3,11 @@
 
 package drpcstream
 
-import "sync"
+import (
+	"sync"
+
+	"storj.io/drpc/drpcmetrics"
+)
 
 // defaultRingBufferCapacity is the number of messages the ring buffer can
 // hold before the producer blocks. This decouples the transport reader
@@ -12,11 +16,6 @@ import "sync"
 //
 // TODO: benchmark whether power-of-2 masking improves performance over modulo.
 const defaultRingBufferCapacity = 256
-
-type ringBufferHooks struct {
-	onEnqueue func(bytes int64)
-	onDequeue func(bytes int64)
-}
 
 // ringBuffer is a bounded single-producer / single-consumer FIFO queue for
 // assembled packet data. It sits between manageReader (producer, calls
@@ -47,14 +46,14 @@ type ringBuffer struct {
 	held *[]byte // buffer from the last Dequeue, released by Done
 	err  error   // terminal error, set by Close
 
-	hooks ringBufferHooks
+	metrics drpcmetrics.ConnectionMetrics
 }
 
-func (rb *ringBuffer) init(pool *BufferPool, hooks ringBufferHooks) {
+func (rb *ringBuffer) init(pool *BufferPool, metrics drpcmetrics.ConnectionMetrics) {
 	rb.cond.L = &rb.mu
 	rb.pool = pool
 	rb.buf = make([]*[]byte, defaultRingBufferCapacity)
-	rb.hooks = hooks
+	rb.metrics = metrics.WithDefaults()
 }
 
 // Enqueue copies data into a pooled buffer and places it in the next write
@@ -78,8 +77,9 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 	rb.buf[rb.head] = b
 	rb.head = (rb.head + 1) % len(rb.buf)
 	rb.count++
-	if rb.hooks.onEnqueue != nil {
-		rb.hooks.onEnqueue(int64(len(*b)))
+	if rb.metrics.ShouldRecord() {
+		rb.metrics.ReceiveQueueMessages.Inc(1)
+		rb.metrics.ReceiveQueueBytes.Inc(int64(len(*b)))
 	}
 	rb.cond.Broadcast()
 }
@@ -104,8 +104,9 @@ func (rb *ringBuffer) Dequeue() ([]byte, error) {
 	rb.tail = (rb.tail + 1) % len(rb.buf)
 	rb.count--
 	rb.held = b
-	if rb.hooks.onDequeue != nil {
-		rb.hooks.onDequeue(int64(len(*b)))
+	if rb.metrics.ShouldRecord() {
+		rb.metrics.ReceiveQueueMessages.Inc(-1)
+		rb.metrics.ReceiveQueueBytes.Inc(-int64(len(*b)))
 	}
 	rb.cond.Broadcast()
 

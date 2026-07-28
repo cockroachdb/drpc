@@ -13,6 +13,7 @@ import (
 	"github.com/zeebo/assert"
 	"github.com/zeebo/errs"
 
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcwire"
 )
 
@@ -20,7 +21,10 @@ import (
 // SplitSize so small payloads are a single frame.
 func newGateStream(t *testing.T) *Stream {
 	mw := testMuxWriter(t)
-	return NewWithOptions(context.Background(), 1, mw, NewBufferPool(), Options{SplitSize: 64 << 10})
+	return NewWithOptions(
+		context.Background(), 1, mw, NewBufferPool(),
+		drpcmetrics.ConnectionMetrics{}, Options{SplitSize: 64 << 10},
+	)
 }
 
 // By default no send window is installed, so data writes are ungated

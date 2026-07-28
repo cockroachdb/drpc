@@ -15,7 +15,6 @@ import (
 	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
-	"storj.io/drpc/internal/drpcopts"
 )
 
 // testCounter is a drpcmetrics.Counter backed by an atomic so the test can read
@@ -208,38 +207,6 @@ func TestManagerReceiveQueueMetrics(t *testing.T) {
 	assert.DeepEqual(t, data, []byte("x"))
 	assert.Equal(t, c.receiveQueueMessages.Load(), int64(queueCapacity-1))
 	assert.Equal(t, c.receiveQueueBytes.Load(), int64(queueCapacity-1))
-}
-
-func TestManagerReceiveQueueMetricsGated(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		enabled bool
-		want    int64
-	}{
-		{name: "disabled", enabled: false, want: 0},
-		{name: "enabled", enabled: true, want: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cconn, sconn := net.Pipe()
-			t.Cleanup(func() { _ = cconn.Close(); _ = sconn.Close() })
-			var c streamMetricCounters
-			m := NewWithOptions(cconn, Client, Options{
-				Metrics: c.bundle(func() bool { return tc.enabled }),
-			})
-			t.Cleanup(func() { _ = m.Close() })
-
-			enqueue := drpcopts.GetStreamOnReceiveQueueEnqueue(&m.opts.Stream.Internal)
-			dequeue := drpcopts.GetStreamOnReceiveQueueDequeue(&m.opts.Stream.Internal)
-
-			enqueue(10)
-			assert.Equal(t, c.receiveQueueMessages.Load(), tc.want)
-			assert.Equal(t, c.receiveQueueBytes.Load(), 10*tc.want)
-			dequeue(10)
-			assert.Equal(t, c.receiveQueueMessages.Load(), int64(0))
-			assert.Equal(t, c.receiveQueueBytes.Load(), int64(0))
-
-		})
-	}
 }
 
 // TestManagerWriteMetrics verifies that connection write pressure reaches the
