@@ -9,11 +9,13 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
+
+	"storj.io/drpc/drpcmetrics"
 )
 
 func TestRingBuffer_EnqueueDequeue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	rb.Enqueue([]byte("hello"))
 
@@ -24,7 +26,7 @@ func TestRingBuffer_EnqueueDequeue(t *testing.T) {
 
 func TestRingBuffer_FIFO(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	rb.Enqueue([]byte("first"))
 	rb.Enqueue([]byte("second"))
@@ -39,7 +41,7 @@ func TestRingBuffer_FIFO(t *testing.T) {
 
 func TestRingBuffer_DequeueBlocksUntilEnqueue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	got := make(chan []byte, 1)
 	go func() {
@@ -54,8 +56,7 @@ func TestRingBuffer_DequeueBlocksUntilEnqueue(t *testing.T) {
 
 func TestRingBuffer_EnqueueBlocksWhenFull(t *testing.T) {
 	var rb ringBuffer
-	rb.cond.L = &rb.mu
-	rb.pool = NewBufferPool()
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 	rb.buf = make([]*[]byte, 2) // capacity 2
 
 	rb.Enqueue([]byte("a"))
@@ -88,7 +89,7 @@ func TestRingBuffer_EnqueueBlocksWhenFull(t *testing.T) {
 
 func TestRingBuffer_CloseUnblocksDequeue(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	errch := make(chan error, 1)
 	go func() {
@@ -102,8 +103,7 @@ func TestRingBuffer_CloseUnblocksDequeue(t *testing.T) {
 
 func TestRingBuffer_CloseUnblocksEnqueue(t *testing.T) {
 	var rb ringBuffer
-	rb.cond.L = &rb.mu
-	rb.pool = NewBufferPool()
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 	rb.buf = make([]*[]byte, 1) // capacity 1
 
 	rb.Enqueue([]byte("fill"))
@@ -120,7 +120,7 @@ func TestRingBuffer_CloseUnblocksEnqueue(t *testing.T) {
 
 func TestRingBuffer_CloseDrainsQueued(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	rb.Enqueue([]byte("queued"))
 	rb.Close(io.EOF)
@@ -138,7 +138,7 @@ func TestRingBuffer_CloseDrainsQueued(t *testing.T) {
 
 func TestRingBuffer_CloseIdempotent(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	rb.Close(io.EOF)
 	rb.Close(io.ErrUnexpectedEOF) // should not overwrite
@@ -149,7 +149,7 @@ func TestRingBuffer_CloseIdempotent(t *testing.T) {
 
 func TestRingBuffer_EnqueueAfterClose(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	rb.Close(io.EOF)
 	rb.Enqueue([]byte("dropped")) // should not panic or block
@@ -157,8 +157,7 @@ func TestRingBuffer_EnqueueAfterClose(t *testing.T) {
 
 func TestRingBuffer_SlotReuse(t *testing.T) {
 	var rb ringBuffer
-	rb.cond.L = &rb.mu
-	rb.pool = NewBufferPool()
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 	rb.buf = make([]*[]byte, 2)
 
 	// Fill and drain a few rounds to exercise slot reuse.
@@ -172,7 +171,7 @@ func TestRingBuffer_SlotReuse(t *testing.T) {
 
 func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 	var rb ringBuffer
-	rb.init(NewBufferPool(), ringBufferHooks{})
+	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 
 	const n = 1000
 	var wg sync.WaitGroup
@@ -201,7 +200,7 @@ func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 func TestRingBuffer_WithPool(t *testing.T) {
 	pool := NewBufferPool()
 	var rb ringBuffer
-	rb.init(pool, ringBufferHooks{})
+	rb.init(pool, drpcmetrics.ConnectionMetrics{})
 
 	rb.Enqueue([]byte("pooled"))
 

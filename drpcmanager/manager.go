@@ -139,21 +139,6 @@ func NewWithOptions(tr drpc.Transport, kind ManagerKind, opts Options) *Manager 
 		metrics: opts.Metrics.WithDefaults(),
 	}
 
-	// Build the receive queue hooks once and copy them into every stream created
-	// by this manager. The ring buffer reports state transitions; the manager
-	// owns the connection-level aggregation and collection gate.
-	drpcopts.SetStreamOnReceiveQueueEnqueue(&m.opts.Stream.Internal, func(bytes int64) {
-		if m.metrics.ShouldRecord() {
-			m.metrics.ReceiveQueueMessages.Inc(1)
-			m.metrics.ReceiveQueueBytes.Inc(bytes)
-		}
-	})
-	drpcopts.SetStreamOnReceiveQueueDequeue(&m.opts.Stream.Internal, func(bytes int64) {
-		if m.metrics.ShouldRecord() {
-			m.metrics.ReceiveQueueMessages.Inc(-1)
-			m.metrics.ReceiveQueueBytes.Inc(-bytes)
-		}
-	})
 	m.wr = drpcwire.NewMuxWriterWithOptions(tr, m.terminate, m.metrics, opts.Writer)
 	// a buffer of size 1 allows NewServerStream to signal it is done creating a
 	// new server stream without having to coordinate with manageReader.
@@ -322,7 +307,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 		drpcopts.SetStreamStats(&opts.Internal, cb(rpc))
 	}
 
-	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, m.recvPool, opts)
+	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, m.recvPool, m.metrics, opts)
 
 	if err := m.streams.Add(sid, stream, &m.wg); err != nil {
 		return nil, err

@@ -7,6 +7,7 @@ import (
 	"github.com/zeebo/assert"
 
 	"storj.io/drpc"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
@@ -18,7 +19,7 @@ func TestHandlePacket_Decompress(t *testing.T) {
 	defer ctx.Close()
 
 	mw := testMuxWriter(t)
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), Options{Compression: drpc.CompressionSnappy})
+	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
 
 	original := []byte("hello compression")
 	compressed := drpcwire.Compress(drpc.CompressionSnappy, nil, original)
@@ -77,7 +78,7 @@ func TestRawRecv_DecompressionError(t *testing.T) {
 	defer ctx.Close()
 
 	mw := testMuxWriter(t)
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), Options{Compression: drpc.CompressionSnappy})
+	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
 
 	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
 		ID:   drpcwire.ID{Stream: 1, Message: 1},
@@ -99,7 +100,7 @@ func TestRawRecv_DecompressedDataIsCopied(t *testing.T) {
 	defer ctx.Close()
 
 	mw := testMuxWriter(t)
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), Options{Compression: drpc.CompressionSnappy})
+	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
 
 	msg1 := []byte("message one")
 	msg2 := []byte("message two")
@@ -141,7 +142,7 @@ func TestRawWrite_NoCompression(t *testing.T) {
 // compression is enabled on the stream.
 func TestRawWrite_WithCompression(t *testing.T) {
 	mw := testMuxWriter(t)
-	st := NewWithOptions(context.Background(), 1, mw, nil, Options{Compression: drpc.CompressionSnappy})
+	st := NewWithOptions(context.Background(), 1, mw, nil, drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
 	err := st.RawWrite(drpcwire.KindMessage, []byte("hello"))
 	assert.NoError(t, err)
 }
@@ -165,7 +166,7 @@ func TestRawRecv_DecompressionError_SendErrorReachesWire(t *testing.T) {
 	mw := drpcwire.NewMuxWriter(cw, func(error) {})
 	t.Cleanup(func() { mw.Stop(nil); <-mw.Done() })
 
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), Options{Compression: drpc.CompressionSnappy})
+	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
 
 	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
 		ID:   drpcwire.ID{Stream: 1, Message: 1},
