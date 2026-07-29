@@ -10,13 +10,14 @@ import (
 
 // sendWindow is a per-stream flow-control credit balance on the sender. It
 // tracks how many more bytes the stream may put on the wire. acquire spends
-// credit, blocking while the balance is negative (insufficient); grant adds
-// credit and wakes a blocked acquire once the deficit is repaid.
+// credit, blocking while the balance is negative (insufficient); debit spends
+// without blocking (the overdraft path); grant adds credit and wakes a blocked
+// acquire once the deficit is repaid.
 //
 // Termination is delegated to the done channel supplied at
 // construction -- the stream's send signal.
 type sendWindow struct {
-	avail atomic.Int64    // credit; negative means an acquire is waiting for repayment
+	avail atomic.Int64    // credit; goes negative from a parked acquire or an overdraft debit
 	ch    chan struct{}   // grant signals here, acquire waits on it
 	done  <-chan struct{} // closed to abort a blocked (or future) acquire
 	err   func() error    // terminal error, consulted only when done is closed
@@ -49,6 +50,18 @@ func (w *sendWindow) acquire(n int64) error {
 				return nil
 			}
 		}
+	}
+}
+
+// debit spends n credit without blocking, letting the balance go negative. It
+// is the overdraft path: once a sender has committed to a message (acquired
+// credit for its first frame), it debits the remaining frames without parking so
+// a message larger than the window completes instead of deadlocking. The
+// overdraft is repaid by later grants (applyGrant clears the deficit first) and
+// is bounded by the caller to MaxMessageSize. n <= 0 is a no-op.
+func (w *sendWindow) debit(n int64) {
+	if n > 0 {
+		w.avail.Add(-n)
 	}
 }
 

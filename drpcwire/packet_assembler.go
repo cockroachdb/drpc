@@ -16,6 +16,7 @@ type PacketAssembler struct {
 	pk                Packet
 	assembling        bool
 	streamInitialized bool
+	maxMessageSize    int64 // reject an assembling KindMessage beyond this; 0 = unbounded
 }
 
 // NewPacketAssembler returns a new PacketAssembler ready to assemble frames.
@@ -32,6 +33,14 @@ func NewPacketAssembler() PacketAssembler {
 func (pa *PacketAssembler) SetStreamID(streamID uint64) {
 	pa.pk.ID.Stream = streamID
 	pa.streamInitialized = true
+}
+
+// SetMaxMessageSize bounds the assembled wire size of a KindMessage packet: a
+// message whose frames accumulate beyond n is rejected with a MessageSizeError
+// rather than buffered whole. n <= 0 disables the bound. It persists across
+// Reset (it is per-stream configuration, not assembly state).
+func (pa *PacketAssembler) SetMaxMessageSize(n int64) {
+	pa.maxMessageSize = n
 }
 
 // Reset clears all assembly state, preparing the assembler for a new stream.
@@ -67,6 +76,16 @@ func (pa *PacketAssembler) AppendFrame(fr Frame) (packet Packet, packetReady boo
 	} else if fr.Kind != pa.pk.Kind {
 		return Packet{}, false, drpc.ProtocolError.New(
 			"frame kind changed mid-packet: got %v, expected %v", fr.Kind, pa.pk.Kind)
+	}
+
+	// Reject an oversized message during assembly, before buffering it whole, so
+	// a peer that ignores the bound fails fast instead of exhausting memory. This
+	// is MessageSizeError (not ProtocolError) so the stream fails on its own
+	// without tearing down the multiplexed connection.
+	if pa.maxMessageSize > 0 && fr.Kind == KindMessage &&
+		int64(len(pa.pk.Data))+int64(len(fr.Data)) > pa.maxMessageSize {
+		return Packet{}, false, drpc.MessageSizeError.New(
+			"message size exceeds maximum of %d bytes", pa.maxMessageSize)
 	}
 
 	// TODO(shubham): add buf reuse

@@ -39,6 +39,11 @@ var (
 	ProtocolError   = errs.Class("protocol error")
 	ConnectionError = errs.Class("connection error")
 	ClosedError     = errs.Class("closed")
+
+	// MessageSizeError is a per-stream policy violation, not a connection fault:
+	// a message exceeds the negotiated maximum size. It fails only the offending
+	// stream, and ToRPCErr maps it to codes.ResourceExhausted (as gRPC does).
+	MessageSizeError = errs.Class("message too large")
 )
 
 // Transport is an interface describing what is required for a drpc connection.

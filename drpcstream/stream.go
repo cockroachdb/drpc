@@ -40,16 +40,22 @@ type Options struct {
 }
 
 // validateFlowControl reports whether a flow-control configuration can make
-// progress: the window must be able to hold one frame plus the coalescing
-// reserve (GrantThreshold). splitSize is the bounded (positive) per-frame size.
+// progress. Only the first frame of a message acquires credit (later frames
+// overdraft), and a message is at most MaxMessageSize, so the largest first
+// frame is min(splitSize, MaxMessageSize).
 func validateFlowControl(fc drpcopts.FlowControl, splitSize int64) bool {
-	return fc.StreamWindow > 0 && fc.GrantThreshold > 0 &&
-		splitSize <= fc.StreamWindow &&
-		// Liveness check for grant coalescing. With G = GrantThreshold,
-		// W = StreamWindow, F = frame: once the receive side has consumed more than
-		// W − F of the window, the sender has < F credit left and halts; if G > W − F,
-		// the receiver cannot emit a grant to unblock it either, resulting in a deadlock.
-		fc.GrantThreshold <= fc.StreamWindow-splitSize
+	if fc.StreamWindow <= 0 || fc.GrantThreshold <= 0 || fc.MaxMessageSize <= 0 {
+		return false
+	}
+	frame := min(fc.MaxMessageSize, splitSize)
+	return frame <= fc.StreamWindow &&
+		// The liveness guarantee for grant coalescing:
+		//    Grant threshold (G) <= streamWindow (W) - frame size (F).
+		// When the receive-side has consumed > W - F of the window,
+		// the sender has < F of credit left and halts.
+		// If G > W - F, the receiver cannot send a grant either to unblock the
+		// sender, resulting in a deadlock.
+		fc.GrantThreshold <= fc.StreamWindow-frame
 }
 
 // Stream represents an rpc actively happening on a transport.
@@ -82,6 +88,10 @@ type Stream struct {
 	// recvw is the per-stream receive-side flow-control window. It is nil when
 	// flow control is not enabled, in which case no grants are emitted.
 	recvw *recvWindow
+
+	// maxMsgSize bounds a single message's wire size when flow control is
+	// enabled.
+	maxMsgSize int64
 
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
@@ -162,29 +172,32 @@ func (s *Stream) installFlowControl() {
 		return
 	}
 
-	// A non-positive SplitSize defaults to DefaultFrameSize as flow control
-	// cannot progress with an unbounded frame size. We change s.opts here so
-	// SplitData frames the same bounded size on the wire, not just in the sizing
-	// check below.
+	// A non-positive SplitSize defaults to DefaultFrameSize. We set it in s.
+	// opts here so SplitData uses the same size on the wire.
 	if s.opts.SplitSize <= 0 {
 		s.opts.SplitSize = drpcwire.DefaultFrameSize
 	}
-	// Keep window, threshold, and frame mutually consistent. If the config cannot
-	// fit a frame, fall back to default window and threshold -- and if the frame
-	// does not fit even those, default it too.
+	if fc.MaxMessageSize <= 0 {
+		fc.MaxMessageSize = drpcopts.DefaultMaxMessageSize
+	}
+	// Keep window, threshold, frame, and message bound mutually consistent. If the
+	// config cannot fit the first frame, fall back to default sizes -- and if the
+	// frame does not fit even those, default it too.
 	if !validateFlowControl(fc, int64(s.opts.SplitSize)) {
 		fc.SetDefaults()
 		if !validateFlowControl(fc, int64(s.opts.SplitSize)) {
 			s.opts.SplitSize = drpcwire.DefaultFrameSize
 		}
 		s.log("FLOWCTL", func() string {
-			return fmt.Sprintf("invalid flow-control config; using defaults: window=%d threshold=%d frame=%d",
-				fc.StreamWindow, fc.GrantThreshold, s.opts.SplitSize)
+			return fmt.Sprintf("invalid flow-control config; using defaults: window=%d threshold=%d frame=%d maxmsg=%d",
+				fc.StreamWindow, fc.GrantThreshold, s.opts.SplitSize, fc.MaxMessageSize)
 		})
 	}
 
 	s.sendw = newSendWindow(fc.StreamWindow, s.sigs.send.Signal(), s.sigs.send.Err)
 	s.recvw = newRecvWindow(fc.GrantThreshold)
+	s.maxMsgSize = fc.MaxMessageSize
+	s.pa.SetMaxMessageSize(fc.MaxMessageSize)
 }
 
 // String returns a string representation of the stream.
@@ -290,12 +303,55 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 
 	packet, packetReady, err := s.pa.AppendFrame(fr)
 	if err != nil {
-		return err
+		return s.handleAssembleError(err)
 	}
 	if !packetReady {
 		return nil
 	}
 	return s.handlePacket(packet)
+}
+
+// handleAssembleError decides how an error from the packet assembler fails the
+// stream, returning the error HandleFrame should hand back to the manager.
+//
+// An oversized message is a per-stream policy violation: it notifies the peer
+// with an abortive terminal error (so a credit-gated send there wakes instead of
+// hanging), terminates this stream, and returns nil so the manager keeps the
+// multiplexed connection -- and its other RPCs -- alive. Every other assembler
+// error is a framing fault, returned unchanged so the manager tears the
+// connection down (its close is the peer's signal).
+//
+// The abortive KindError is a control frame, so it bypasses write backpressure
+// and never blocks -- safe to call from the reader goroutine. Setting the send
+// signal before the write lock releases any send parked on credit (as in
+// SendCancel), and the wire error is ToRPCErr-mapped so the peer sees
+// ResourceExhausted.
+func (s *Stream) handleAssembleError(err error) error {
+	if !drpc.MessageSizeError.Has(err) {
+		return err
+	}
+
+	s.mu.Lock()
+	if s.sigs.term.IsSet() {
+		s.mu.Unlock()
+		return nil
+	}
+	defer s.checkFinished()
+
+	// Set the send signal first so a send parked on credit releases the write
+	// lock (as in SendCancel), then hold the write lock across terminate. With a
+	// write in progress, the checkFinished inside terminate cannot close Finished
+	// before the terminal error frame is sent, upholding the guarantee that no
+	// stream activity occurs after Finished. The deferred checkFinished (which
+	// runs after write.Unlock) fires it once the frame is out.
+	s.sigs.send.Set(io.EOF)
+	s.write.Lock()
+	defer s.write.Unlock()
+	s.terminate(err) // local reader sees err (MessageSizeError)
+	s.mu.Unlock()
+
+	_ = s.sendPacketLocked(drpcwire.KindError, true, drpcwire.MarshalError(drpc.ToRPCErr(err)))
+	return nil
 }
 
 // emitGrant sends a credit grant of delta bytes to the sender, unless delta is
@@ -487,6 +543,15 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 	fr := s.newFrameLocked(kind)
 	n := s.opts.SplitSize
 
+	// Fail fast on a message larger than the bound rather than deadlocking on
+	// credit it could never repay: with credit returned only on consume, a
+	// message must fit within the sender's overdraft ceiling to complete.
+	if kind == drpcwire.KindMessage && s.maxMsgSize > 0 && int64(len(data)) > s.maxMsgSize {
+		return drpc.MessageSizeError.New(
+			"message size %d exceeds maximum of %d bytes", len(data), s.maxMsgSize)
+	}
+
+	first := true
 	for {
 		switch {
 		case s.sigs.send.IsSet():
@@ -499,13 +564,21 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 		fr.Done = len(data) == 0
 
 		// Only data frames consume send credit; a nil window (flow control
-		// disabled) leaves sends ungated. acquire parks until credit arrives or
-		// the window closes (stream termination) -- the latter is the abort path.
+		// disabled) leaves sends ungated. Gate at the message boundary: the first
+		// frame acquires (parking until credit arrives, or the window closes on
+		// termination -- the abort path). Once committed, later frames overdraft
+		// without parking so a message larger than the window finishes instead of
+		// deadlocking; the overdraft is bounded by maxMsgSize and repaid by grants.
 		if kind == drpcwire.KindMessage && s.sendw != nil {
-			if err := s.sendw.acquire(int64(len(fr.Data))); err != nil {
-				return err
+			if first {
+				if err := s.sendw.acquire(int64(len(fr.Data))); err != nil {
+					return err
+				}
+			} else {
+				s.sendw.debit(int64(len(fr.Data)))
 			}
 		}
+		first = false
 
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
