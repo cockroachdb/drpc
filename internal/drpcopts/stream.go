@@ -10,12 +10,49 @@ import (
 
 // Stream contains internal options for the drpcstream package.
 type Stream struct {
-	transport drpc.Transport
-	fin       chan<- struct{}
-	kind      drpc.StreamKind
-	rpc       string
-	stats     *drpcstats.Stats
+	transport   drpc.Transport
+	fin         chan<- struct{}
+	kind        drpc.StreamKind
+	rpc         string
+	stats       *drpcstats.Stats
+	flowControl FlowControl
 }
+
+// FlowControl configures per-stream flow control. Internal-only until the
+// CockroachDB version-gated enablement is ready.
+type FlowControl struct {
+	// Enabled turns per-stream flow control on.
+	Enabled bool
+
+	// StreamWindow is the sender's initial and nominal per-stream credit.
+	StreamWindow int64
+
+	// GrantThreshold is the consumed-byte credit that must accrue before the
+	// receive side emits a grant, coalescing many consumes into one
+	// KindWindowUpdate.
+	GrantThreshold int64
+}
+
+// Default flow-control sizes, applied by SetDefaults to recover from an invalid
+// configuration.
+const (
+	defaultStreamWindow   = 2 << 20   // 2 MiB
+	defaultGrantThreshold = 512 << 10 // 512 KiB (a quarter of the default window)
+)
+
+// SetDefaults resets StreamWindow and GrantThreshold to their default values.
+// The installation site calls it to recover from an invalid configuration
+// instead of failing.
+func (fc *FlowControl) SetDefaults() {
+	fc.StreamWindow = defaultStreamWindow
+	fc.GrantThreshold = defaultGrantThreshold
+}
+
+// GetStreamFlowControl returns the FlowControl stored in the options.
+func GetStreamFlowControl(opts *Stream) FlowControl { return opts.flowControl }
+
+// SetStreamFlowControl sets the FlowControl stored in the options.
+func SetStreamFlowControl(opts *Stream, fc FlowControl) { opts.flowControl = fc }
 
 // GetStreamTransport returns the drpc.Transport stored in the options.
 func GetStreamTransport(opts *Stream) drpc.Transport { return opts.transport }
