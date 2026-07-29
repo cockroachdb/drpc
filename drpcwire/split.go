@@ -3,9 +3,10 @@
 
 package drpcwire
 
-const (
-	DefaultFrameSize = 64 * 1024
-)
+// DefaultFrameSize is the frame size SplitData and SplitN use when given a split
+// size of zero: large enough to amortize per-frame overhead, small enough to
+// bound the memory held per in-flight frame.
+const DefaultFrameSize = 64 * 1024
 
 // SplitN splits the marshaled form of the Packet into a number of
 // frames such that each frame is at most n bytes. It calls

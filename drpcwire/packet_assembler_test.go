@@ -233,3 +233,40 @@ func TestPacketAssembler_Reset(t *testing.T) {
 	assert.DeepEqual(t, pkt.Data, []byte("new"))
 	assert.Equal(t, pkt.ID.Stream, uint64(2))
 }
+
+// SetMaxMessageSize rejects an assembling message that grows past the bound,
+// during assembly, so an oversized message is not buffered whole.
+func TestPacketAssembler_MaxMessageSizeRejectsOversized(t *testing.T) {
+	pa := NewPacketAssembler()
+	pa.SetStreamID(1)
+	pa.SetMaxMessageSize(4)
+
+	// First frame within the bound accumulates.
+	_, ready, err := pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("ab"), Done: false,
+	})
+	assert.NoError(t, err)
+	assert.That(t, !ready)
+
+	// The frame that would push the message past 4 bytes is rejected.
+	_, _, err = pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("cde"), Done: true,
+	})
+	assert.Error(t, err)
+	assert.That(t, drpc.MessageSizeError.Has(err))
+	assert.That(t, strings.Contains(err.Error(), "exceeds maximum"))
+}
+
+// A message exactly at the bound is accepted.
+func TestPacketAssembler_MaxMessageSizeBoundary(t *testing.T) {
+	pa := NewPacketAssembler()
+	pa.SetStreamID(1)
+	pa.SetMaxMessageSize(4)
+
+	pkt, ready, err := pa.AppendFrame(Frame{
+		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("abcd"), Done: true,
+	})
+	assert.NoError(t, err)
+	assert.That(t, ready)
+	assert.DeepEqual(t, pkt.Data, []byte("abcd"))
+}

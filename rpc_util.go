@@ -12,8 +12,9 @@ import (
 // work in terms of gRPC status codes (for example grpcutil.IsClosedConnection).
 //
 // It is only a translator. It maps errors that were already classified where
-// they happened: the ConnectionError and ClosedError classes (matched even
-// through wrapping) and the context and EOF sentinels (matched by identity).
+// they happened: the ConnectionError and ClosedError classes (to Unavailable)
+// and the MessageSizeError class (to ResourceExhausted), all matched even
+// through wrapping, plus the context and EOF sentinels (matched by identity).
 // Anything else becomes codes.Unknown.
 //
 // The boundary has no way to recover intent that was never attached to the
@@ -37,6 +38,9 @@ func ToRPCErr(err error) error {
 	}
 	if ConnectionError.Has(err) || ClosedError.Has(err) {
 		return status.Error(codes.Unavailable, err.Error())
+	}
+	if MessageSizeError.Has(err) {
+		return status.Error(codes.ResourceExhausted, err.Error())
 	}
 	if _, ok := status.FromError(err); ok {
 		return err

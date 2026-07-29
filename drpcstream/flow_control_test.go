@@ -13,7 +13,10 @@ import (
 
 	"github.com/zeebo/assert"
 	"github.com/zeebo/errs"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"storj.io/drpc"
 	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcwire"
 	"storj.io/drpc/internal/drpcopts"
@@ -128,6 +131,7 @@ func TestStream_SendWindowTerminateWakesParkedWrite(t *testing.T) {
 
 // fcOptions returns stream Options with flow control enabled via the internal
 // option, the only way to enable it until it is promoted to a public option.
+// MaxMessageSize is left unset, so the install site defaults it.
 func fcOptions(window, threshold int64) Options {
 	opts := Options{SplitSize: 64 << 10}
 	drpcopts.SetStreamFlowControl(&opts.Internal, drpcopts.FlowControl{
@@ -136,6 +140,16 @@ func fcOptions(window, threshold int64) Options {
 		GrantThreshold: threshold,
 	})
 	return opts
+}
+
+// smallFCStream returns a stream with a tiny window so byte-level gating and
+// overdraft are easy to exercise. Frames are 2 bytes and the grant threshold 2.
+func smallFCStream(t *testing.T, window, maxMsg int64) *Stream {
+	opts := Options{SplitSize: 2}
+	drpcopts.SetStreamFlowControl(&opts.Internal, drpcopts.FlowControl{
+		Enabled: true, StreamWindow: window, GrantThreshold: 2, MaxMessageSize: maxMsg,
+	})
+	return NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
 }
 
 // Enabling flow control installs the send and receive windows, seeding the
@@ -164,9 +178,10 @@ func TestStream_FlowControlDefaultsOnInvalid(t *testing.T) {
 	const defaultWindow = int64(2 << 20) // drpcopts.defaultStreamWindow
 
 	defaulted := func(name string, opts Options) {
-		t.Helper()
-		st := NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
-		assert.Equal(t, st.sendw.available(), defaultWindow)
+		t.Run(name, func(t *testing.T) {
+			st := NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
+			assert.Equal(t, st.sendw.available(), defaultWindow)
+		})
 	}
 
 	defaulted("zero window", fcOptions(0, 128<<10))
@@ -180,7 +195,9 @@ func TestStream_FlowControlDefaultsOnInvalid(t *testing.T) {
 
 	// Flow control needs a bounded frame, so a non-positive SplitSize defaults to
 	// DefaultFrameSize -- applied to opts so SplitData frames the same size on the
-	// wire. The rest of each config is valid, so the window is kept.
+	// wire. A negative SplitSize, which SplitData alone would treat as unbounded,
+	// is defaulted too (not left unbounded) once flow control is enabled. The rest
+	// of each config is valid, so the window is kept.
 	def := fcOptions(128<<10, 64<<10)
 	def.SplitSize = 0 // unset
 	st := NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, def)
@@ -188,10 +205,10 @@ func TestStream_FlowControlDefaultsOnInvalid(t *testing.T) {
 	assert.Equal(t, st.opts.SplitSize, drpcwire.DefaultFrameSize) // defaulted
 
 	unbounded := fcOptions(256<<10, 64<<10)
-	unbounded.SplitSize = -1 // unbounded frames
+	unbounded.SplitSize = -1 // negative: SplitData alone would leave frames unbounded
 	st = NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, unbounded)
 	assert.Equal(t, st.sendw.available(), int64(256<<10))         // valid: kept
-	assert.Equal(t, st.opts.SplitSize, drpcwire.DefaultFrameSize) // defaulted from unbounded
+	assert.Equal(t, st.opts.SplitSize, drpcwire.DefaultFrameSize) // defaulted, not left unbounded
 
 	// A user SplitSize larger than its window is invalid, so window and threshold
 	// fall back to defaults -- but the 512 KiB frame still fits the 2 MiB default
@@ -211,33 +228,114 @@ func TestStream_FlowControlDefaultsOnInvalid(t *testing.T) {
 	assert.Equal(t, st.opts.SplitSize, drpcwire.DefaultFrameSize) // frame defaulted too
 }
 
-// End to end via the option: an option-installed window gates a data write
-// that exceeds the initial credit, and an incoming grant resumes it. SplitSize
-// 2 with a 4-byte window means "hello" (frames 2+2+1) parks on its last frame.
-func TestStream_FlowControlOptionGatesAndResumes(t *testing.T) {
-	mw := testMuxWriter(t)
-	opts := Options{SplitSize: 2}
+// A MaxMessageSize stricter than the window is valid (and safer -- the sender
+// never overdrafts past it), so it is kept, not silently expanded to the
+// default.
+func TestStream_FlowControlStricterBoundKept(t *testing.T) {
+	opts := Options{SplitSize: 64 << 10}
 	drpcopts.SetStreamFlowControl(&opts.Internal, drpcopts.FlowControl{
-		Enabled: true, StreamWindow: 4, GrantThreshold: 2,
+		Enabled: true, StreamWindow: 256 << 10, GrantThreshold: 64 << 10, MaxMessageSize: 128 << 10,
 	})
-	st := NewWithOptions(context.Background(), 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
+	st := NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
+	assert.Equal(t, st.sendw.available(), int64(256<<10)) // window kept
+	assert.Equal(t, st.maxMsgSize, int64(128<<10))        // stricter bound kept
+}
+
+// A message larger than the window completes by overdrafting once the sender has
+// committed to it, instead of parking for credit that consume-driven flow control
+// cannot return without a complete message. "hello" (5 bytes, frames 2+2+1)
+// exceeds the 4-byte window and drives the balance to -1.
+func TestStream_FlowControlOverdraftsToFinish(t *testing.T) {
+	st := smallFCStream(t, 4, 16)
+	assert.NoError(t, st.RawWrite(drpcwire.KindMessage, []byte("hello")))
+	assert.Equal(t, st.sendw.available(), int64(-1)) // 4 - 5
+}
+
+// Gating happens at the message boundary, not per frame: with the window
+// overdrawn by one message, the next message parks on its first frame until a
+// grant repays the deficit.
+func TestStream_FlowControlGatesNextMessage(t *testing.T) {
+	st := smallFCStream(t, 4, 16)
+	assert.NoError(t, st.RawWrite(drpcwire.KindMessage, []byte("hello"))) // avail -> -1
 
 	done := make(chan error, 1)
-	go func() { done <- st.RawWrite(drpcwire.KindMessage, []byte("hello")) }() // 5 bytes > 4
-
+	go func() { done <- st.RawWrite(drpcwire.KindMessage, []byte("x")) }()
 	select {
 	case <-done:
-		t.Fatal("write returned before sufficient credit")
+		t.Fatal("next message sent before credit was repaid")
 	case <-time.After(blockShort):
 	}
 
-	// A grant from the peer tops up the send window and resumes the write.
-	assert.NoError(t, st.HandleFrame(drpcwire.WindowUpdateFrame(st.ID(), 1)))
-
+	// Repay the overdraft and cover the next frame; the parked send resumes.
+	assert.NoError(t, st.HandleFrame(drpcwire.WindowUpdateFrame(st.ID(), 4)))
 	select {
 	case err := <-done:
 		assert.NoError(t, err)
 	case <-time.After(time.Second):
-		t.Fatal("write did not resume after grant")
+		t.Fatal("parked send did not resume after grant")
 	}
+}
+
+// A message exactly at MaxMessageSize completes (via overdraft); one byte over
+// fails fast with a MessageSizeError instead of overdrafting or parking.
+func TestStream_FlowControlBoundaryAndOversized(t *testing.T) {
+	st := smallFCStream(t, 4, 8)
+
+	assert.NoError(t, st.RawWrite(drpcwire.KindMessage, make([]byte, 8))) // == bound: ok
+
+	err := st.RawWrite(drpcwire.KindMessage, make([]byte, 9)) // > bound: fail fast
+	assert.Error(t, err)
+	assert.That(t, drpc.MessageSizeError.Has(err))
+}
+
+// An oversized incoming message fails only the receiving stream: HandleFrame
+// returns nil (so the manager keeps the multiplexed connection alive) while the
+// stream itself terminates and surfaces the size error to the reader.
+func TestStream_OversizedRecvFailsStreamNotConnection(t *testing.T) {
+	st := smallFCStream(t, 4, 8) // receive bound = 8 bytes
+
+	fr := drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: st.ID(), Message: 1},
+		Kind: drpcwire.KindMessage,
+		Data: make([]byte, 9), // exceeds the 8-byte bound
+		Done: true,
+	}
+	// Must not return an error: the manager treats a HandleFrame error as
+	// connection-fatal, which would tear down unrelated RPCs.
+	assert.NoError(t, st.HandleFrame(fr))
+
+	// The stream is terminated and the reader sees the size error.
+	_, err := st.RawRecv()
+	assert.That(t, drpc.MessageSizeError.Has(err))
+}
+
+// Rejecting an oversized receive must notify the peer with an abortive terminal
+// error, otherwise a credit-gated send there hangs forever. The KindError frame
+// carries ResourceExhausted, and the connection is preserved (HandleFrame
+// returns nil).
+func TestStream_OversizedRecvNotifiesPeer(t *testing.T) {
+	mw, frames := captureWriter(t)
+	opts := Options{SplitSize: 2}
+	drpcopts.SetStreamFlowControl(&opts.Internal, drpcopts.FlowControl{
+		Enabled: true, StreamWindow: 4, GrantThreshold: 2, MaxMessageSize: 8,
+	})
+	st := NewWithOptions(context.Background(), 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
+
+	fr := drpcwire.Frame{
+		ID:   drpcwire.ID{Stream: st.ID(), Message: 1},
+		Kind: drpcwire.KindMessage,
+		Data: make([]byte, 9), // exceeds the 8-byte bound
+		Done: true,
+	}
+	assert.NoError(t, st.HandleFrame(fr)) // connection preserved
+
+	// A terminal frame reaches the wire (the counterpart to "no terminal frame
+	// reaches the wire"), carrying ResourceExhausted for the peer.
+	got := waitFrame(t, frames)
+	assert.Equal(t, got.Kind, drpcwire.KindError)
+	assert.Equal(t, status.Code(drpcwire.UnmarshalError(got.Data)), codes.ResourceExhausted)
+
+	// The local reader still sees the size error.
+	_, err := st.RawRecv()
+	assert.That(t, drpc.MessageSizeError.Has(err))
 }
