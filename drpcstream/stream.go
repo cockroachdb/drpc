@@ -39,6 +39,19 @@ type Options struct {
 	Internal drpcopts.Stream
 }
 
+// validateFlowControl reports whether a flow-control configuration can make
+// progress: the window must be able to hold one frame plus the coalescing
+// reserve (GrantThreshold). splitSize is the bounded (positive) per-frame size.
+func validateFlowControl(fc drpcopts.FlowControl, splitSize int64) bool {
+	return fc.StreamWindow > 0 && fc.GrantThreshold > 0 &&
+		splitSize <= fc.StreamWindow &&
+		// Liveness check for grant coalescing. With G = GrantThreshold,
+		// W = StreamWindow, F = frame: once the receive side has consumed more than
+		// W − F of the window, the sender has < F credit left and halts; if G > W − F,
+		// the receiver cannot emit a grant to unblock it either, resulting in a deadlock.
+		fc.GrantThreshold <= fc.StreamWindow-splitSize
+}
+
 // Stream represents an rpc actively happening on a transport.
 type Stream struct {
 	ctx  streamCtx
@@ -135,7 +148,43 @@ func NewWithOptions(
 
 	s.recvQueue.init(pool, metrics)
 
+	s.installFlowControl()
+
 	return s
+}
+
+// installFlowControl installs the per-stream send and receive windows when flow
+// control is enabled, normalizing an invalid or unbounded configuration to
+// mutually consistent defaults first. It is a no-op when flow control is off.
+func (s *Stream) installFlowControl() {
+	fc := drpcopts.GetStreamFlowControl(&s.opts.Internal)
+	if !fc.Enabled {
+		return
+	}
+
+	// A non-positive SplitSize defaults to DefaultFrameSize as flow control
+	// cannot progress with an unbounded frame size. We change s.opts here so
+	// SplitData frames the same bounded size on the wire, not just in the sizing
+	// check below.
+	if s.opts.SplitSize <= 0 {
+		s.opts.SplitSize = drpcwire.DefaultFrameSize
+	}
+	// Keep window, threshold, and frame mutually consistent. If the config cannot
+	// fit a frame, fall back to default window and threshold -- and if the frame
+	// does not fit even those, default it too.
+	if !validateFlowControl(fc, int64(s.opts.SplitSize)) {
+		fc.SetDefaults()
+		if !validateFlowControl(fc, int64(s.opts.SplitSize)) {
+			s.opts.SplitSize = drpcwire.DefaultFrameSize
+		}
+		s.log("FLOWCTL", func() string {
+			return fmt.Sprintf("invalid flow-control config; using defaults: window=%d threshold=%d frame=%d",
+				fc.StreamWindow, fc.GrantThreshold, s.opts.SplitSize)
+		})
+	}
+
+	s.sendw = newSendWindow(fc.StreamWindow, s.sigs.send.Signal(), s.sigs.send.Err)
+	s.recvw = newRecvWindow(fc.GrantThreshold)
 }
 
 // String returns a string representation of the stream.
