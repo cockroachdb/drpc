@@ -15,6 +15,8 @@ require (
 require (
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
+	github.com/klauspost/compress v1.17.11 // indirect
+	github.com/minio/minlz v1.0.2-0.20260119185444-845e64f85661 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230525234030-28d5490b6b19 // indirect
 )
 

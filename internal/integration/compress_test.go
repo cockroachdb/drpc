@@ -24,35 +24,6 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
-// TestCompression_Unary verifies a simple unary RPC round-trips correctly
-// when Snappy compression is enabled on the connection.
-func TestCompression_Unary(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
-	cli, close := createConnection(t, standardImpl, drpc.CompressionSnappy)
-	defer close()
-
-	out, err := cli.Method1(ctx, &In{In: 1})
-	assert.NoError(t, err)
-	assert.True(t, Equal(out, &Out{Out: 1}))
-}
-
-// TestCompression_UnaryWithData sends a 1 KiB payload through a compressed
-// unary RPC and checks the data survives the compress/decompress round-trip.
-func TestCompression_UnaryWithData(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
-	cli, close := createConnection(t, standardImpl, drpc.CompressionSnappy)
-	defer close()
-
-	payload := data(1024)
-	out, err := cli.Method1(ctx, &In{In: 1, Data: payload})
-	assert.NoError(t, err)
-	assert.DeepEqual(t, out.Data, payload)
-}
-
 // TestCompression_ClientStream exercises a client-streaming RPC with Snappy,
 // sending two messages before closing and receiving the aggregated response.
 func TestCompression_ClientStream(t *testing.T) {
@@ -132,6 +103,31 @@ func TestCompression_BidiStream(t *testing.T) {
 	assert.NoError(t, stream.CloseSend())
 	_, err = stream.Recv()
 	assert.That(t, errors.Is(err, io.EOF))
+}
+
+// TestCompression_UnaryAllVariants runs a unary RPC with a payload for every
+// supported compression variant.
+func TestCompression_UnaryAllVariants(t *testing.T) {
+	for _, v := range []struct {
+		name string
+		c    drpc.Compression
+	}{
+		{"snappy", drpc.CompressionSnappy},
+		{"minlz-fastest", drpc.CompressionMinLZFastest},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			ctx := drpctest.NewTracker(t)
+			defer ctx.Close()
+
+			cli, close := createConnection(t, standardImpl, v.c)
+			defer close()
+
+			payload := data(4096)
+			out, err := cli.Method1(ctx, &In{In: 1, Data: payload})
+			assert.NoError(t, err)
+			assert.DeepEqual(t, out.Data, payload)
+		})
+	}
 }
 
 // TestCompression_NoCompressionBackwardCompat confirms that a client without

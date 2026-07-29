@@ -149,6 +149,10 @@ const (
 
 	// CompressionSnappy uses Snappy block-format compression.
 	CompressionSnappy Compression = 1
+
+	// CompressionMinLZFastest uses MinLZ block-format compression at its
+	// fastest level.
+	CompressionMinLZFastest Compression = 2
 )
 
 // Encoding represents a way to marshal/unmarshal Message types.

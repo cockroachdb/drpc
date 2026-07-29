@@ -12,34 +12,48 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
-// TestHandlePacket_Decompress verifies that a Snappy-compressed message frame
-// is transparently decompressed before being returned by RawRecv.
-func TestHandlePacket_Decompress(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
+var compressionVariants = []struct {
+	name string
+	c    drpc.Compression
+}{
+	{"snappy", drpc.CompressionSnappy},
+	{"minlz-fastest", drpc.CompressionMinLZFastest},
+}
 
-	mw := testMuxWriter(t)
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
+// TestHandlePacket_DecompressAllVariants runs the compressed receive path for
+// every supported compression variant.
+func TestHandlePacket_DecompressAllVariants(t *testing.T) {
+	for _, v := range compressionVariants {
+		t.Run(v.name, func(t *testing.T) {
+			ctx := drpctest.NewTracker(t)
+			defer ctx.Close()
 
-	original := []byte("hello compression")
-	compressed := drpcwire.Compress(drpc.CompressionSnappy, nil, original)
+			mw := testMuxWriter(t)
+			st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: v.c})
 
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		data, err := st.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
+			original := []byte("hello compression across all variants")
+			compressed := drpcwire.Compress(v.c, nil, original)
 
-	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
-		ID:   drpcwire.ID{Stream: 1, Message: 1},
-		Kind: drpcwire.KindMessage,
-		Data: compressed,
-		Done: true,
-	}))
+			recv := make(chan []byte, 1)
+			ctx.Run(func(ctx context.Context) {
+				data, err := st.RawRecv()
+				assert.NoError(t, err)
+				recv <- data
+			})
 
-	got := <-recv
-	assert.DeepEqual(t, got, original)
+			assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+				ID:   drpcwire.ID{Stream: 1, Message: 1},
+				Kind: drpcwire.KindMessage,
+				Data: compressed,
+				Done: true,
+			}))
+
+			got := <-recv
+			assert.DeepEqual(t, got, original)
+
+			assert.NoError(t, st.RawWrite(drpcwire.KindMessage, original))
+		})
+	}
 }
 
 // TestHandlePacket_NoCompression confirms that a stream without compression
@@ -74,59 +88,67 @@ func TestHandlePacket_NoCompression(t *testing.T) {
 // TestRawRecv_DecompressionError verifies that receiving invalid compressed
 // data returns a ProtocolError rather than silently delivering garbage.
 func TestRawRecv_DecompressionError(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
+	for _, v := range compressionVariants {
+		t.Run(v.name, func(t *testing.T) {
+			ctx := drpctest.NewTracker(t)
+			defer ctx.Close()
 
-	mw := testMuxWriter(t)
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
+			mw := testMuxWriter(t)
+			st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: v.c})
 
-	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
-		ID:   drpcwire.ID{Stream: 1, Message: 1},
-		Kind: drpcwire.KindMessage,
-		Data: []byte("not valid snappy data"),
-		Done: true,
-	}))
+			assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+				ID:   drpcwire.ID{Stream: 1, Message: 1},
+				Kind: drpcwire.KindMessage,
+				Data: []byte("\xff\xfe\xfd not valid compressed data"),
+				Done: true,
+			}))
 
-	_, err := st.RawRecv()
-	assert.Error(t, err)
-	assert.That(t, drpc.ProtocolError.Has(err))
+			_, err := st.RawRecv()
+			assert.Error(t, err)
+			assert.That(t, drpc.ProtocolError.Has(err))
+		})
+	}
 }
 
 // TestRawRecv_DecompressedDataIsCopied ensures each decompressed message gets
 // its own copy, so the internal decompression buffer can be safely reused
 // without corrupting previously received data.
 func TestRawRecv_DecompressedDataIsCopied(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
+	for _, v := range compressionVariants {
+		t.Run(v.name, func(t *testing.T) {
+			ctx := drpctest.NewTracker(t)
+			defer ctx.Close()
 
-	mw := testMuxWriter(t)
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
+			mw := testMuxWriter(t)
+			st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: v.c})
 
-	msg1 := []byte("message one")
-	msg2 := []byte("message two")
-	compressed1 := drpcwire.Compress(drpc.CompressionSnappy, nil, msg1)
-	compressed2 := drpcwire.Compress(drpc.CompressionSnappy, nil, msg2)
+			msg1 := []byte("message one")
+			msg2 := []byte("message two")
+			compressed1 := drpcwire.Compress(v.c, nil, msg1)
+			compressed2 := drpcwire.Compress(v.c, nil, msg2)
 
-	recv := make(chan []byte, 2)
-	ctx.Run(func(ctx context.Context) {
-		for i := 0; i < 2; i++ {
-			data, err := st.RawRecv()
-			assert.NoError(t, err)
-			recv <- data
-		}
-	})
+			recv := make(chan []byte, 2)
+			ctx.Run(func(ctx context.Context) {
+				for i := 0; i < 2; i++ {
+					data, err := st.RawRecv()
+					assert.NoError(t, err)
+					recv <- data
+				}
+			})
 
-	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
-		ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: compressed1, Done: true,
-	}))
-	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
-		ID: drpcwire.ID{Stream: 1, Message: 2}, Kind: drpcwire.KindMessage, Data: compressed2, Done: true,
-	}))
+			assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+				ID: drpcwire.ID{Stream: 1, Message: 1}, Kind: drpcwire.KindMessage, Data: compressed1, Done: true,
+			}))
+			assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+				ID: drpcwire.ID{Stream: 1, Message: 2}, Kind: drpcwire.KindMessage, Data: compressed2, Done: true,
+			}))
 
-	got1 := <-recv
-	got2 := <-recv
-	assert.DeepEqual(t, got1, msg1)
-	assert.DeepEqual(t, got2, msg2)
+			got1 := <-recv
+			got2 := <-recv
+			assert.DeepEqual(t, got1, msg1)
+			assert.DeepEqual(t, got2, msg2)
+		})
+	}
 }
 
 // TestRawWrite_NoCompression verifies that RawWrite succeeds on a stream
@@ -159,34 +181,34 @@ func (w *chanWriter) Write(p []byte) (int, error) {
 // decompression failure the stream remains open long enough for SendError to
 // transmit a KindError frame to the peer, rather than silently terminating.
 func TestRawRecv_DecompressionError_SendErrorReachesWire(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
+	for _, v := range compressionVariants {
+		t.Run(v.name, func(t *testing.T) {
+			ctx := drpctest.NewTracker(t)
+			defer ctx.Close()
 
-	cw := &chanWriter{wrote: make(chan []byte, 16)}
-	mw := drpcwire.NewMuxWriter(cw, func(error) {})
-	t.Cleanup(func() { mw.Stop(nil); <-mw.Done() })
+			cw := &chanWriter{wrote: make(chan []byte, 16)}
+			mw := drpcwire.NewMuxWriter(cw, func(error) {})
+			t.Cleanup(func() { mw.Stop(nil); <-mw.Done() })
 
-	st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: drpc.CompressionSnappy})
+			st := NewWithOptions(ctx, 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{Compression: v.c})
 
-	assert.NoError(t, st.HandleFrame(drpcwire.Frame{
-		ID:   drpcwire.ID{Stream: 1, Message: 1},
-		Kind: drpcwire.KindMessage,
-		Data: []byte("not valid snappy data"),
-		Done: true,
-	}))
+			assert.NoError(t, st.HandleFrame(drpcwire.Frame{
+				ID:   drpcwire.ID{Stream: 1, Message: 1},
+				Kind: drpcwire.KindMessage,
+				Data: []byte("\xff\xfe\xfd not valid compressed data"),
+				Done: true,
+			}))
 
-	_, recvErr := st.RawRecv()
-	assert.Error(t, recvErr)
-	assert.That(t, drpc.ProtocolError.Has(recvErr))
+			_, recvErr := st.RawRecv()
+			assert.Error(t, recvErr)
+			assert.That(t, drpc.ProtocolError.Has(recvErr))
 
-	// The stream must not be terminated yet — otherwise SendError is a no-op
-	// and no error frame reaches the client.
-	assert.That(t, !st.IsTerminated())
+			assert.That(t, !st.IsTerminated())
 
-	// Simulate what handleRPC does: send the error back to the client.
-	sendErr := st.SendError(recvErr)
-	assert.NoError(t, sendErr)
+			sendErr := st.SendError(recvErr)
+			assert.NoError(t, sendErr)
 
-	// Verify the KindError frame actually reached the wire.
-	waitForKind(t, cw.wrote, drpcwire.KindError)
+			waitForKind(t, cw.wrote, drpcwire.KindError)
+		})
+	}
 }
