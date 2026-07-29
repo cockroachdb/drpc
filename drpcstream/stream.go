@@ -66,6 +66,10 @@ type Stream struct {
 	// flow control is not enabled, in which case data writes are ungated.
 	sendw *sendWindow
 
+	// recvw is the per-stream receive-side flow-control window. It is nil when
+	// flow control is not enabled, in which case no grants are emitted.
+	recvw *recvWindow
+
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
 		send drpcsignal.Signal // set when done sending messages
@@ -223,6 +227,18 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 		return nil
 	}
 
+	// A flow-control grant is out-of-band signaling: intercept it before the
+	// assembler so one arriving mid-message cannot disturb reassembly, and apply
+	// it to the send window.
+	if fr.Kind == drpcwire.KindWindowUpdate {
+		if s.sendw != nil {
+			if _, delta, ok := drpcwire.ParseWindowUpdate(fr); ok {
+				s.sendw.grant(delta)
+			}
+		}
+		return nil
+	}
+
 	packet, packetReady, err := s.pa.AppendFrame(fr)
 	if err != nil {
 		return err
@@ -231,6 +247,15 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 		return nil
 	}
 	return s.handlePacket(packet)
+}
+
+// emitGrant sends a credit grant of delta bytes to the sender, unless delta is
+// nonpositive or the stream has terminated.
+func (s *Stream) emitGrant(delta int64) {
+	if delta <= 0 || s.sigs.term.IsSet() {
+		return
+	}
+	_ = s.wr.WriteFrame(drpcwire.WindowUpdateFrame(s.id.Stream, uint64(delta)), nil)
 }
 
 // handlePacket advances the stream state machine by inspecting the packet. It
@@ -461,6 +486,14 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 	}
 	defer s.recvQueue.Done()
 
+	// Return receive credit for the consumed wire bytes, coalesced at the
+	// window's threshold. n captures len(b) now, before decompression reassigns
+	// b.
+	if s.recvw != nil {
+		n := int64(len(b))
+		s.emitGrant(s.recvw.consumed(n))
+	}
+
 	if s.opts.Compression != drpc.CompressionNone {
 		s.dbuf, err = drpcwire.Decompress(s.opts.Compression, s.dbuf[:0], b)
 		if err != nil {
@@ -512,6 +545,14 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 		return err
 	}
 	defer s.recvQueue.Done()
+
+	// Return receive credit for the consumed wire bytes, coalesced at the
+	// window's threshold. n captures len(b) now, before decompression reassigns
+	// b.
+	if s.recvw != nil {
+		n := int64(len(b))
+		s.emitGrant(s.recvw.consumed(n))
+	}
 
 	if s.opts.Compression != drpc.CompressionNone {
 		s.dbuf, err = drpcwire.Decompress(s.opts.Compression, s.dbuf[:0], b)
