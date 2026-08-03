@@ -13,9 +13,9 @@ import (
 //
 // It is only a translator. It maps errors that were already classified where
 // they happened: the ConnectionError and ClosedError classes (to Unavailable)
-// and the MessageSizeError class (to ResourceExhausted), all matched even
-// through wrapping, plus the context and EOF sentinels (matched by identity).
-// Anything else becomes codes.Unknown.
+// and the MessageSizeError and ReceiveCapError classes (to ResourceExhausted),
+// all matched even through wrapping, plus the context and EOF sentinels (matched
+// by identity). Anything else becomes codes.Unknown.
 //
 // The boundary has no way to recover intent that was never attached to the
 // error. So every place that builds an error, or gets one from a library it
@@ -39,7 +39,7 @@ func ToRPCErr(err error) error {
 	if ConnectionError.Has(err) || ClosedError.Has(err) {
 		return status.Error(codes.Unavailable, err.Error())
 	}
-	if MessageSizeError.Has(err) {
+	if MessageSizeError.Has(err) || ReceiveCapError.Has(err) {
 		return status.Error(codes.ResourceExhausted, err.Error())
 	}
 	if _, ok := status.FromError(err); ok {

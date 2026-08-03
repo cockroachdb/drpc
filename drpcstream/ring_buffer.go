@@ -102,20 +102,29 @@ func (rb *ringBuffer) grow() {
 	rb.tail = 0
 }
 
-// Enqueue blocks until the message is admitted -- a free slot, or room in the
-// byte budget for its length -- or the buffer is closed, then copies data into a
-// pooled buffer in the next write slot.
-func (rb *ringBuffer) Enqueue(data []byte) {
+// Enqueue copies data into a pooled buffer in the next write slot and reports
+// whether it was admitted. Under a byte budget it does not block: a message that
+// would exceed the budget returns false, signalling a receive-cap overrun by a
+// non-compliant sender that the caller must fail-stop -- so the shared reader is
+// never blocked. Without a budget it blocks until a slot frees (legacy). A closed
+// buffer drops the message and returns true (nothing to fail-stop).
+func (rb *ringBuffer) Enqueue(data []byte) (admitted bool) {
 	n := int64(len(data))
 
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	for !rb.admits(n) && rb.err == nil {
-		rb.cond.Wait()
+	if rb.maxBytes <= 0 {
+		// Legacy slot mode: block until a slot frees or the buffer closes.
+		for !rb.admits(n) && rb.err == nil {
+			rb.cond.Wait()
+		}
 	}
 	if rb.err != nil {
-		return
+		return true // closed: drop, not an overrun
+	}
+	if !rb.admits(n) {
+		return false // byte-budget overrun (non-compliant sender)
 	}
 
 	b := rb.pool.Get()
@@ -134,6 +143,7 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 		rb.metrics.ReceiveQueueBytes.Inc(n)
 	}
 	rb.cond.Broadcast()
+	return true
 }
 
 // Dequeue returns the data from the next buffered message and advances the

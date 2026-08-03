@@ -44,6 +44,12 @@ var (
 	// a message exceeds the negotiated maximum size. It fails only the offending
 	// stream, and ToRPCErr maps it to codes.ResourceExhausted (as gRPC does).
 	MessageSizeError = errs.Class("message too large")
+
+	// ReceiveCapError is a per-stream policy violation, not a connection fault: a
+	// peer overran the receive-window cap (only possible if it ignores flow
+	// control). It fails only the offending stream -- so a bug cannot wedge the
+	// shared connection reader -- and ToRPCErr maps it to codes.ResourceExhausted.
+	ReceiveCapError = errs.Class("receive queue cap exceeded")
 )
 
 // Transport is an interface describing what is required for a drpc connection.

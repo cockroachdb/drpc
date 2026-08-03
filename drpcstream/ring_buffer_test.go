@@ -7,7 +7,6 @@ import (
 	"io"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/zeebo/assert"
 
@@ -198,36 +197,25 @@ func TestRingBuffer_ConcurrentProducerConsumer(t *testing.T) {
 	rb.Close(io.EOF)
 }
 
-// When a byte budget is set (flow control on), the producer blocks on buffered
-// bytes rather than slot count, and a Dequeue that drops below the budget wakes
-// it.
-func TestRingBuffer_ByteBudgetBlocksProducer(t *testing.T) {
+// Under a byte budget the producer is not blocked on overrun: a message that
+// would exceed the budget is rejected (Enqueue returns false) so the caller can
+// fail-stop instead of stalling the shared reader. A dispatch frees room again.
+func TestRingBuffer_ByteBudgetRejectsOverrun(t *testing.T) {
 	var rb ringBuffer
 	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 	rb.setMaxBytes(8) // room for two 4-byte messages
 
-	rb.Enqueue([]byte("aaaa")) // bytes = 4
-	rb.Enqueue([]byte("bbbb")) // bytes = 8, now at budget
+	assert.That(t, rb.Enqueue([]byte("aaaa"))) // bytes = 4
+	assert.That(t, rb.Enqueue([]byte("bbbb"))) // bytes = 8, at budget
 
-	// Third enqueue must block until a dispatch frees bytes.
-	done := make(chan struct{})
-	go func() {
-		rb.Enqueue([]byte("cccc"))
-		close(done)
-	}()
+	// Third message overruns the budget: rejected, not blocked.
+	assert.That(t, !rb.Enqueue([]byte("cccc")))
 
-	select {
-	case <-done:
-		t.Fatal("Enqueue returned while over byte budget")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	// Dispatch one message: bytes drops to 4, below the budget.
+	// Dispatching one message frees room, and the message is admitted.
 	data, err := rb.Dequeue()
 	assert.NoError(t, err)
 	assert.DeepEqual(t, data, []byte("aaaa"))
-
-	<-done // blocked Enqueue now completes
+	assert.That(t, rb.Enqueue([]byte("cccc")))
 
 	for _, want := range []string{"bbbb", "cccc"} {
 		data, err := rb.Dequeue()
@@ -236,33 +224,24 @@ func TestRingBuffer_ByteBudgetBlocksProducer(t *testing.T) {
 	}
 }
 
-// The incoming message's length is part of the admission check, so the queue
-// never overshoots its budget by a message.
+// The incoming message's length is part of the admission check, so a message is
+// rejected before the queue overshoots its budget.
 func TestRingBuffer_ByteBudgetIncludesIncomingLength(t *testing.T) {
 	var rb ringBuffer
 	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 	rb.setMaxBytes(8)
 
-	rb.Enqueue([]byte("aaaaaaa")) // 7 bytes, queue empty -> accepted
+	assert.That(t, rb.Enqueue([]byte("aaaaaaa"))) // 7 bytes, empty -> accepted
 	assert.Equal(t, rb.bytes, int64(7))
 
-	// 7 + 4 = 11 > 8, so the 4-byte message must block even though the 7 bytes
+	// 7 + 4 = 11 > 8, so the 4-byte message is rejected even though the 7 bytes
 	// already queued are under budget.
-	done := make(chan struct{})
-	go func() {
-		rb.Enqueue([]byte("bbbb"))
-		close(done)
-	}()
-	select {
-	case <-done:
-		t.Fatal("Enqueue admitted a message that overshoots the budget")
-	case <-time.After(50 * time.Millisecond):
-	}
+	assert.That(t, !rb.Enqueue([]byte("bbbb")))
 
 	data, err := rb.Dequeue() // frees 7 bytes
 	assert.NoError(t, err)
 	assert.DeepEqual(t, data, []byte("aaaaaaa"))
-	<-done // now 0 + 4 <= 8, admitted
+	assert.That(t, rb.Enqueue([]byte("bbbb"))) // now 0 + 4 <= 8, admitted
 }
 
 // Byte accounting is released on dispatch (Dequeue), matching where credit
@@ -290,25 +269,16 @@ func TestRingBuffer_ByteBudgetAcceptsOversizedOnEmpty(t *testing.T) {
 	rb.init(NewBufferPool(), drpcmetrics.ConnectionMetrics{})
 	rb.setMaxBytes(4)
 
-	rb.Enqueue([]byte("0123456789")) // 10 bytes > budget, accepted (queue empty)
+	assert.That(t, rb.Enqueue([]byte("0123456789"))) // 10 > budget, empty -> accepted
 	assert.Equal(t, rb.bytes, int64(10))
 
-	done := make(chan struct{})
-	go func() {
-		rb.Enqueue([]byte("x"))
-		close(done)
-	}()
-	select {
-	case <-done:
-		t.Fatal("Enqueue returned while over byte budget")
-	case <-time.After(50 * time.Millisecond):
-	}
+	assert.That(t, !rb.Enqueue([]byte("x"))) // over budget -> rejected
 
 	data, err := rb.Dequeue()
 	assert.NoError(t, err)
 	assert.DeepEqual(t, data, []byte("0123456789"))
 
-	<-done // now under budget, blocked Enqueue completes
+	assert.That(t, rb.Enqueue([]byte("x"))) // empty again -> accepted
 }
 
 // Under a byte budget the ring grows past its initial slot count instead of

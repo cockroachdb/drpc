@@ -336,7 +336,15 @@ func (s *Stream) handleAssembleError(err error) error {
 	if !drpc.MessageSizeError.Has(err) {
 		return err
 	}
+	return s.sendAbortiveError(err)
+}
 
+// sendAbortiveError terminates the stream locally with err and notifies the peer
+// with an abortive KindError, leaving the connection and its other streams
+// alive. It always returns nil so the shared reader keeps running. It is the
+// fail-stop path for per-stream policy violations (oversized message, receive
+// cap overrun).
+func (s *Stream) sendAbortiveError(err error) error {
 	s.mu.Lock()
 	if s.sigs.term.IsSet() {
 		s.mu.Unlock()
@@ -353,7 +361,7 @@ func (s *Stream) handleAssembleError(err error) error {
 	s.sigs.send.Set(io.EOF)
 	s.write.Lock()
 	defer s.write.Unlock()
-	s.terminate(err) // local reader sees err (MessageSizeError)
+	s.terminate(err) // local reader sees err
 	s.mu.Unlock()
 
 	_ = s.sendPacketLocked(drpcwire.KindError, true, drpcwire.MarshalError(drpc.ToRPCErr(err)))
@@ -378,7 +386,13 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 	s.log("HANDLE", pkt.String)
 
 	if pkt.Kind == drpcwire.KindMessage {
-		s.recvQueue.Enqueue(pkt.Data)
+		if !s.recvQueue.Enqueue(pkt.Data) {
+			// The sender overran the receive-window cap (only possible if it
+			// ignores flow control). Fail just this stream instead of blocking the
+			// shared reader, keeping the connection and its other streams alive.
+			return s.sendAbortiveError(drpc.ReceiveCapError.New(
+				"receive queue exceeded its %d-byte cap", s.recvQueue.maxBytes))
+		}
 		return nil
 	}
 

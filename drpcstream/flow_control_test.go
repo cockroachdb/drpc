@@ -357,3 +357,41 @@ func TestStream_OversizedRecvNotifiesPeer(t *testing.T) {
 	_, err := st.RawRecv()
 	assert.That(t, drpc.MessageSizeError.Has(err))
 }
+
+// A sender that overruns the receive-window cap (only possible by ignoring flow
+// control) fails only its own stream: HandleFrame keeps the connection alive (it
+// never returns an error and never blocks), the peer gets an abortive
+// ResourceExhausted, and the local reader sees the cap error after the already
+// queued messages drain.
+func TestStream_ReceiveCapOverrunFailsStream(t *testing.T) {
+	mw, frames := captureWriter(t)
+	opts := Options{SplitSize: 2}
+	drpcopts.SetStreamFlowControl(&opts.Internal, drpcopts.FlowControl{
+		Enabled: true, StreamWindow: 4, GrantThreshold: 2, MaxMessageSize: 4,
+	})
+	st := NewWithOptions(context.Background(), 1, mw, NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
+	// Receive-queue cap = StreamWindow + MaxMessageSize = 8 bytes.
+
+	// Two 4-byte messages fill the cap without being consumed; both are accepted
+	// and HandleFrame returns promptly (the reader is never blocked).
+	for mid := uint64(1); mid <= 2; mid++ {
+		assert.NoError(t, st.HandleFrame(msgFrame(st.ID(), mid, make([]byte, 4), true)))
+	}
+
+	// The third 4-byte message overruns the 8-byte cap. The stream fails, but the
+	// connection is preserved: HandleFrame returns nil rather than blocking.
+	assert.NoError(t, st.HandleFrame(msgFrame(st.ID(), 3, make([]byte, 4), true)))
+
+	// An abortive terminal frame reaches the peer with ResourceExhausted.
+	got := waitFrame(t, frames)
+	assert.Equal(t, got.Kind, drpcwire.KindError)
+	assert.Equal(t, status.Code(drpcwire.UnmarshalError(got.Data)), codes.ResourceExhausted)
+
+	// The two queued messages drain first, then the reader sees the cap error.
+	for i := 0; i < 2; i++ {
+		_, err := st.RawRecv()
+		assert.NoError(t, err)
+	}
+	_, err := st.RawRecv()
+	assert.That(t, drpc.ReceiveCapError.Has(err))
+}
