@@ -198,6 +198,12 @@ func (s *Stream) installFlowControl() {
 	s.recvw = newRecvWindow(fc.GrantThreshold)
 	s.maxMsgSize = fc.MaxMessageSize
 	s.pa.SetMaxMessageSize(fc.MaxMessageSize)
+
+	// Bound the receive queue by the per-stream receive peak: a window of
+	// un-granted bytes plus one message overdrafting to finish. The budget is in
+	// payload bytes, matching what the sender debits and grants return, so a
+	// conforming sender never fills the queue and blocks the shared reader.
+	s.recvQueue.setMaxBytes(saturatedAdd(fc.StreamWindow, fc.MaxMessageSize))
 }
 
 // String returns a string representation of the stream.

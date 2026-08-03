@@ -9,10 +9,11 @@ import (
 	"storj.io/drpc/drpcmetrics"
 )
 
-// defaultRingBufferCapacity is the number of messages the ring buffer can
-// hold before the producer blocks. This decouples the transport reader
-// (manageReader) from the consumer (RPC handler), preventing a slow handler
-// from blocking frame delivery to other streams.
+// defaultRingBufferCapacity is the initial number of message slots. When no
+// byte budget is set (flow control off) it is also the fixed bound at which the
+// producer blocks; under a byte budget the ring grows past it. Either way it
+// decouples the transport reader (manageReader) from the consumer (RPC handler),
+// preventing a slow handler from blocking frame delivery to other streams.
 //
 // TODO: benchmark whether power-of-2 masking improves performance over modulo.
 const defaultRingBufferCapacity = 256
@@ -26,6 +27,13 @@ const defaultRingBufferCapacity = 256
 // immediately, and Done releases the buffer back to the pool. Keeping the
 // pool behind Dequeue/Done means the consumer does not need to know whether
 // the queue is backed by a pool or by fixed buffers.
+//
+// The producer is bound either by a payload-byte budget (setMaxBytes,
+// installed with flow control) or, when no budget is set, by a fixed slot count.
+// Under a byte budget the ring grows to hold more messages and blocks a message
+// whose bytes would exceed the budget. The budget is in payload bytes -- the
+// same unit the sender debits and grants return -- so a conforming sender never
+// blocks the shared reader.
 //
 // After Close, Dequeue drains any queued messages before returning the close
 // error. This ensures graceful shutdown (KindClose/KindCloseSend) delivers
@@ -42,6 +50,10 @@ type ringBuffer struct {
 	head  int       // next write position (producer)
 	tail  int       // next read position (consumer)
 	count int       // number of occupied slots
+	bytes int64     // buffered data bytes (sum of queued message lengths)
+
+	// maxBytes is the byte budget installed with flow control.
+	maxBytes int64
 
 	held *[]byte // buffer from the last Dequeue, released by Done
 	err  error   // terminal error, set by Close
@@ -56,30 +68,70 @@ func (rb *ringBuffer) init(pool *BufferPool, metrics drpcmetrics.ConnectionMetri
 	rb.metrics = metrics.WithDefaults()
 }
 
-// Enqueue copies data into a pooled buffer and places it in the next write
-// slot. If the buffer is full, it blocks until a slot is freed or the buffer
-// is closed. If the buffer is closed, Enqueue returns silently.
+// setMaxBytes installs the payload-byte budget that bounds the producer when
+// flow control is enabled. It must be called during stream construction, before
+// any Enqueue.
+func (rb *ringBuffer) setMaxBytes(n int64) {
+	rb.maxBytes = n
+}
+
+// admits reports whether a message of n data bytes can be enqueued now. Under a
+// byte budget, the queued bytes plus this message must fit. An empty queue always
+// accepts one message, so an oversized message is still delivered. Without a
+// budget the bound is the fixed slot count.
+func (rb *ringBuffer) admits(n int64) bool {
+	if rb.maxBytes <= 0 {
+		return rb.count < len(rb.buf)
+	}
+	if rb.count == 0 {
+		return true
+	}
+	return rb.bytes+n <= rb.maxBytes
+}
+
+// grow doubles the ring's slot capacity, re-linearizing the occupied slots from
+// tail. It is only reached under a byte budget, where slot count no longer
+// bounds the producer.
+func (rb *ringBuffer) grow() {
+	newBuf := make([]*[]byte, 2*len(rb.buf))
+	for i := 0; i < rb.count; i++ {
+		newBuf[i] = rb.buf[(rb.tail+i)%len(rb.buf)]
+	}
+	rb.buf = newBuf
+	rb.head = rb.count
+	rb.tail = 0
+}
+
+// Enqueue blocks until the message is admitted -- a free slot, or room in the
+// byte budget for its length -- or the buffer is closed, then copies data into a
+// pooled buffer in the next write slot.
 func (rb *ringBuffer) Enqueue(data []byte) {
-	b := rb.pool.Get()
-	*b = append(*b, data...)
+	n := int64(len(data))
 
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	for rb.count == len(rb.buf) && rb.err == nil {
+	for !rb.admits(n) && rb.err == nil {
 		rb.cond.Wait()
 	}
 	if rb.err != nil {
-		rb.pool.Put(b)
 		return
+	}
+
+	b := rb.pool.Get()
+	*b = append(*b, data...)
+
+	if rb.count == len(rb.buf) {
+		rb.grow() // only reached under a byte budget; slot mode blocks above
 	}
 
 	rb.buf[rb.head] = b
 	rb.head = (rb.head + 1) % len(rb.buf)
 	rb.count++
+	rb.bytes += n
 	if rb.metrics.ShouldRecord() {
 		rb.metrics.ReceiveQueueMessages.Inc(1)
-		rb.metrics.ReceiveQueueBytes.Inc(int64(len(*b)))
+		rb.metrics.ReceiveQueueBytes.Inc(n)
 	}
 	rb.cond.Broadcast()
 }
@@ -103,6 +155,7 @@ func (rb *ringBuffer) Dequeue() ([]byte, error) {
 	rb.buf[rb.tail] = nil
 	rb.tail = (rb.tail + 1) % len(rb.buf)
 	rb.count--
+	rb.bytes -= int64(len(*b))
 	rb.held = b
 	if rb.metrics.ShouldRecord() {
 		rb.metrics.ReceiveQueueMessages.Inc(-1)

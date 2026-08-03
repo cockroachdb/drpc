@@ -94,6 +94,15 @@ func (w *sendWindow) grant(n uint64) {
 	}
 }
 
+// saturatedAdd returns a + b for non-negative a and b, saturating at
+// math.MaxInt64 instead of overflowing.
+func saturatedAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
 // applyGrant returns avail + n with an upper bound of math.MaxInt64.
 // n is the wire delta (unsigned), so the result never drops below avail.
 func applyGrant(avail int64, n uint64) int64 {

@@ -241,6 +241,24 @@ func TestStream_FlowControlStricterBoundKept(t *testing.T) {
 	assert.Equal(t, st.maxMsgSize, int64(128<<10))        // stricter bound kept
 }
 
+// The receive queue's byte budget is StreamWindow + MaxMessageSize -- the
+// documented per-stream receive peak (a window of un-granted bytes plus one
+// message overdrafting to finish) -- so the queue never blocks the shared reader
+// under a well-behaved peer. With flow control off, no budget is installed and
+// the queue stays slot-bounded.
+func TestStream_RecvQueueByteBudget(t *testing.T) {
+	opts := Options{SplitSize: 64 << 10}
+	drpcopts.SetStreamFlowControl(&opts.Internal, drpcopts.FlowControl{
+		Enabled: true, StreamWindow: 256 << 10, GrantThreshold: 64 << 10, MaxMessageSize: 128 << 10,
+	})
+	st := NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, opts)
+	assert.Equal(t, st.recvQueue.maxBytes, int64(256<<10)+int64(128<<10))
+
+	// Flow control off: no byte budget, legacy slot bound.
+	off := NewWithOptions(context.Background(), 1, testMuxWriter(t), NewBufferPool(), drpcmetrics.ConnectionMetrics{}, Options{SplitSize: 64 << 10})
+	assert.Equal(t, off.recvQueue.maxBytes, int64(0))
+}
+
 // A message larger than the window completes by overdrafting once the sender has
 // committed to it, instead of parking for credit that consume-driven flow control
 // cannot return without a complete message. "hello" (5 bytes, frames 2+2+1)
