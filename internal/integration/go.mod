@@ -1,6 +1,6 @@
 module storj.io/drpc/internal/integration
 
-go 1.25.0
+go 1.26.5
 
 require (
 	github.com/gogo/protobuf v1.3.2

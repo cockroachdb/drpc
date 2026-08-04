@@ -1,6 +1,6 @@
 module storj.io/drpc/examples/drpc
 
-go 1.19
+go 1.26.5
 
 require (
 	google.golang.org/protobuf v1.27.1
